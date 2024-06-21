@@ -1,11 +1,16 @@
+import re
+
 import aiohttp
 from responses.errors import responses
 
 
-def checkMessage(message_content):
-    for key in responses.keys():
-        if key.lower() in message_content.lower():
-            return responses[key]
+def checkMessage(messageContent):
+    for pattern, responseTemplate in responses.items():
+        compiledPattern = re.compile(pattern)
+        match = compiledPattern.search(messageContent)
+        if match:
+            response = responseTemplate.format(*match.groups())
+            return response
 
 
 async def readFileContent(url):
