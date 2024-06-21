@@ -7,12 +7,14 @@ def checkMessage(message_content):
         if key.lower() in message_content.lower():
             return responses[key]
 
+
 async def readFileContent(url):
     async with aiohttp.ClientSession() as session:
         async with session.get(url) as response:
             if response.status == 200:
                 return await response.text()
     return None
+
 
 async def uploadMclogs(fileContent):
     upload_url = 'https://api.mclo.gs/1/log'
