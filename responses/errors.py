@@ -5,7 +5,7 @@ responses = {
     r"Could not load 'plugins/([^']*)' in 'plugins'.*?Unknown/missing dependency plugins: \[([^\]]*)\]":
     "Não foi possível carregar o plugin `{0}` devido à dependência ausente `{1}`.",
     r"Unable to access jarfile ([^']*)":
-    "Não foi possível acessar o arquivo jar `{0}` do servidor, verifique nos seus parâmetros de startup e as permissões",
+    "Não foi possível acessar o arquivo jar `{0}` do servidor, verifique nos seus parâmetros de inicialização e as permissões",
     r"Current Java is ([^']*) but we require at least ([^']*)":
     "O seu servidor pede a versão Java `{1}`, porém está configurado para iniciar com a versão `{0}`",
     # Sem caos do Regex
