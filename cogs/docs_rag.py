@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY')
 EMBEDDING_MODEL = os.getenv('EMBEDDING_MODEL', 'qwen/qwen3-embedding-8b')
 RERANK_MODEL = os.getenv('RERANK_MODEL', 'cohere/rerank-4-fast')
-CHAT_MODEL = os.getenv('CHAT_MODEL', 'openai/gpt-oss-120b')
+CHAT_MODEL = os.getenv('CHAT_MODEL', 'google/gemini-2.5-flash-lite')
 DOCS_REPO = 'MinersRefuge/docs'
 DOCS_BRANCH = 'main'
 DOCS_BASE_URL = 'https://docs.minersrefuge.com.br'
@@ -30,11 +30,8 @@ SYSTEM_PROMPT = (
     "de servidores Minecraft. Responda em português brasileiro, de forma clara e concisa. "
     "Use APENAS as informações fornecidas no contexto da documentação abaixo. "
     "Se a resposta não estiver no contexto, diga que não encontrou na documentação "
-    f"e sugira visitar {DOCS_BASE_URL}.\n\n"
-    "IMPORTANTE: Sempre cite as fontes no final da resposta, incluindo o título da página "
-    "e a URL completa. Use o formato:\n"
-    "📄 **Fontes:**\n"
-    "- [Título](URL)\n"
+    f"e sugira visitar {DOCS_BASE_URL}. "
+    "NÃO inclua uma seção de fontes na sua resposta — as fontes são exibidas automaticamente."
 )
 
 
@@ -176,7 +173,7 @@ class DocsRAG(commands.Cog):
         match = re.search(r'^#\s+(.+)', content, re.MULTILINE)
         return match.group(1).strip() if match else ''
 
-    def _chunk_text(self, text: str, path: str, chunk_size: int = 800) -> list[dict]:
+    def _chunk_text(self, text: str, path: str, chunk_size: int = 1500) -> list[dict]:
         """Split markdown into chunks by headings, falling back to size-based splits."""
         title = self._extract_title(text)
         sections = re.split(r'(?=^##?\s)', text, flags=re.MULTILINE)
@@ -301,7 +298,7 @@ class DocsRAG(commands.Cog):
         # Fallback: return documents as-is (already sorted by cosine similarity)
         return documents[:top_n]
 
-    async def search(self, query: str, top_k: int = 8) -> list[dict]:
+    async def search(self, query: str, top_k: int = 12) -> list[dict]:
         if not self.chunks:
             return []
 
@@ -328,13 +325,30 @@ class DocsRAG(commands.Cog):
     # --- Slash Commands ---
 
     @app_commands.command(name='ask', description='Pergunte algo sobre administração de servidores Minecraft')
-    @app_commands.describe(pergunta='Sua pergunta')
-    async def ask(self, interaction: discord.Interaction, pergunta: str):
+    @app_commands.describe(
+        pergunta='Sua pergunta',
+        imagem='Imagem/screenshot para análise (opcional)',
+    )
+    async def ask(
+        self,
+        interaction: discord.Interaction,
+        pergunta: str,
+        imagem: discord.Attachment | None = None,
+    ):
         if not OPENROUTER_API_KEY:
             await interaction.response.send_message(
                 '⚠️ Comando indisponível: chave de API não configurada.', ephemeral=True
             )
             return
+
+        image_url = None
+        if imagem:
+            if not imagem.content_type or not imagem.content_type.startswith('image/'):
+                await interaction.response.send_message(
+                    'O arquivo enviado não é uma imagem válida.', ephemeral=True
+                )
+                return
+            image_url = imagem.url
 
         await interaction.response.defer(thinking=True)
 
@@ -348,7 +362,7 @@ class DocsRAG(commands.Cog):
                 )
                 return
 
-            answer, embed = await self._build_answer(pergunta, results)
+            answer, embed = await self._build_answer(pergunta, results, image_url=image_url)
             msg = await interaction.followup.send(embed=embed, wait=True)
 
             # Store conversation for follow-ups
@@ -365,6 +379,7 @@ class DocsRAG(commands.Cog):
         question: str,
         results: list[dict],
         history: list[dict] | None = None,
+        image_url: str | None = None,
     ) -> tuple[str, discord.Embed]:
         """Generate an answer from search results and return (raw_answer, embed)."""
         context_parts = []
@@ -383,9 +398,19 @@ class DocsRAG(commands.Cog):
                 messages.append({'role': 'user', 'content': h['question']})
                 messages.append({'role': 'assistant', 'content': h['answer']})
 
-        messages.append(
-            {'role': 'user', 'content': f"Contexto da documentação:\n{context}\n\nPergunta: {question}"}
-        )
+        user_text = f"Contexto da documentação:\n{context}\n\nPergunta: {question}"
+
+        if image_url:
+            # Vision format: content as list of parts
+            messages.append({
+                'role': 'user',
+                'content': [
+                    {'type': 'text', 'text': user_text},
+                    {'type': 'image_url', 'image_url': {'url': image_url}},
+                ],
+            })
+        else:
+            messages.append({'role': 'user', 'content': user_text})
 
         response = await self.client.chat.completions.create(
             model=CHAT_MODEL,
@@ -452,8 +477,18 @@ class DocsRAG(commands.Cog):
 
         # User is replying to one of our /ask responses
         follow_up_question = message.content.strip()
-        if not follow_up_question:
+        if not follow_up_question and not message.attachments:
             return
+
+        # Check for image attachments
+        image_url = None
+        for att in message.attachments:
+            if att.content_type and att.content_type.startswith('image/'):
+                image_url = att.url
+                break
+
+        if not follow_up_question:
+            follow_up_question = 'Analise esta imagem.'
 
         async with message.channel.typing():
             try:
@@ -470,7 +505,7 @@ class DocsRAG(commands.Cog):
                     return
 
                 answer, embed = await self._build_answer(
-                    follow_up_question, results, history=history
+                    follow_up_question, results, history=history, image_url=image_url
                 )
                 reply = await message.reply(embed=embed)
 

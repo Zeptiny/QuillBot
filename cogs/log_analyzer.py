@@ -13,7 +13,7 @@ from responses.errors import patterns
 logger = logging.getLogger(__name__)
 
 OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY')
-CHAT_MODEL = os.getenv('CHAT_MODEL', 'openai/gpt-oss-120b')
+CHAT_MODEL = os.getenv('CHAT_MODEL', 'google/gemini-2.5-flash-lite')
 
 MCLO_GS_PATTERN = re.compile(r'https://mclo\.gs/\w+')
 PASTEBIN_PATTERN = re.compile(r'https://pastebin\.com/(\w+)')
@@ -145,27 +145,44 @@ class LogAnalyzer(commands.Cog):
 
     # --- AI Log Analysis ---
 
-    async def _analyze_with_ai(self, log_content: str) -> str | None:
-        """Send log content to the LLM for analysis."""
+    async def _analyze_with_ai(self, log_content: str | None = None, image_url: str | None = None) -> str | None:
+        """Send log content and/or image to the LLM for analysis."""
         if not self.ai_client:
             return None
 
-        # Truncate if too long, keeping start and end (most useful parts)
-        if len(log_content) > MAX_LOG_CONTEXT:
-            half = MAX_LOG_CONTEXT // 2
-            log_content = (
-                log_content[:half]
-                + '\n\n[... log truncado ...]\n\n'
-                + log_content[-half:]
-            )
+        messages = [{'role': 'system', 'content': ANALYZE_SYSTEM_PROMPT}]
+
+        user_parts = []
+
+        if log_content:
+            # Truncate if too long, keeping start and end (most useful parts)
+            if len(log_content) > MAX_LOG_CONTEXT:
+                half = MAX_LOG_CONTEXT // 2
+                log_content = (
+                    log_content[:half]
+                    + '\n\n[... log truncado ...]\n\n'
+                    + log_content[-half:]
+                )
+            user_parts.append({'type': 'text', 'text': f"Analise este log:\n\n```\n{log_content}\n```"})
+
+        if image_url:
+            if not user_parts:
+                user_parts.append({'type': 'text', 'text': 'Analise esta imagem de log/erro de servidor Minecraft:'})
+            user_parts.append({'type': 'image_url', 'image_url': {'url': image_url}})
+
+        if not user_parts:
+            return None
+
+        # Use vision format (list of content parts) when image is present
+        if image_url:
+            messages.append({'role': 'user', 'content': user_parts})
+        else:
+            messages.append({'role': 'user', 'content': user_parts[0]['text']})
 
         try:
             response = await self.ai_client.chat.completions.create(
                 model=CHAT_MODEL,
-                messages=[
-                    {'role': 'system', 'content': ANALYZE_SYSTEM_PROMPT},
-                    {'role': 'user', 'content': f"Analise este log:\n\n```\n{log_content}\n```"},
-                ],
+                messages=messages,
                 max_tokens=1500,
             )
             return response.choices[0].message.content
@@ -177,12 +194,14 @@ class LogAnalyzer(commands.Cog):
     @app_commands.describe(
         log_link='Link do mclo.gs ou pastebin com o log',
         log_file='Arquivo .log ou .txt para analisar',
+        imagem='Screenshot de erro/log para análise visual (opcional)',
     )
     async def analyze(
         self,
         interaction: discord.Interaction,
         log_link: str | None = None,
         log_file: discord.Attachment | None = None,
+        imagem: discord.Attachment | None = None,
     ):
         if not self.ai_client:
             await interaction.response.send_message(
@@ -190,15 +209,25 @@ class LogAnalyzer(commands.Cog):
             )
             return
 
-        if not log_link and not log_file:
+        if not log_link and not log_file and not imagem:
             await interaction.response.send_message(
-                'Forneça um link (mclo.gs/pastebin) ou um arquivo (.log/.txt).', ephemeral=True
+                'Forneça um link (mclo.gs/pastebin), um arquivo (.log/.txt), ou uma imagem.', ephemeral=True
             )
             return
+
+        image_url = None
+        if imagem:
+            if not imagem.content_type or not imagem.content_type.startswith('image/'):
+                await interaction.response.send_message(
+                    'O arquivo enviado não é uma imagem válida.', ephemeral=True
+                )
+                return
+            image_url = imagem.url
 
         await interaction.response.defer(thinking=True)
 
         log_content = None
+        mclogs_url = None
 
         if log_file:
             if not log_file.filename.endswith(('.txt', '.log')):
@@ -225,11 +254,11 @@ class LogAnalyzer(commands.Cog):
                 return
             log_content = await self.read_file_content(url)
 
-        if not log_content:
+        if not log_content and not image_url:
             await interaction.followup.send('Não foi possível ler o conteúdo do log.')
             return
 
-        analysis = await self._analyze_with_ai(log_content)
+        analysis = await self._analyze_with_ai(log_content=log_content, image_url=image_url)
 
         if not analysis:
             await interaction.followup.send('Ocorreu um erro ao analisar o log. Tente novamente.')
@@ -247,7 +276,9 @@ class LogAnalyzer(commands.Cog):
 
         if log_file:
             embed.add_field(name='Arquivo', value=log_file.filename, inline=True)
-        if 'mclogs_url' in locals() and mclogs_url:
+        if imagem:
+            embed.set_thumbnail(url=imagem.url)
+        if mclogs_url:
             embed.add_field(name='mclo.gs', value=f'[Ver log]({mclogs_url})', inline=True)
 
         embed.set_footer(text='Análise gerada por IA • Sempre verifique manualmente')
