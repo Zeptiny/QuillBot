@@ -583,8 +583,7 @@ class DocsRAG(commands.Cog):
             inline=False,
         )
         embed.set_footer(
-            text="Miners' Refuge Docs • " + DOCS_BASE_URL +
-            " • 💬 Responda a esta mensagem para continuar a conversa"
+            text=f"Miners' Refuge Docs • {DOCS_BASE_URL} • 💬 Responda a esta mensagem para continuar a conversa"
         )
 
         return answer, embed
