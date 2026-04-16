@@ -16,12 +16,11 @@ from config import (
     CHAT_MODEL,
     COOLDOWN_PER,
     COOLDOWN_RATE,
+    DOC_SOURCES,
     DOCS_BASE_URL,
     DOCS_BRANCH,
-    DOCS_REPO,
     EMBEDDING_MODEL,
     GITHUB_API,
-    GITHUB_RAW,
     OPENROUTER_API_KEY,
     REINDEX_INTERVAL_HOURS,
     RERANK_MODEL,
@@ -49,11 +48,17 @@ def cosine_similarity(a: list[float], b: list[float]) -> float:
     return dot / (norm_a * norm_b)
 
 
-def path_to_docs_url(path: str) -> str:
+def _compute_doc_url(path: str, base_url: str, url_strip_prefix: str = '') -> str:
     """Convert a repo file path to its docs website URL."""
-    url = path.replace('.md', '').replace('README', '')
-    url = url.rstrip('/')
-    return f"{DOCS_BASE_URL}/{url}" if url else DOCS_BASE_URL
+    if url_strip_prefix and path.startswith(url_strip_prefix):
+        path = path[len(url_strip_prefix):]
+    url = path.replace('.md', '').replace('.mdx', '').replace('README', '').rstrip('/')
+    return f'{base_url}/{url}' if url else base_url
+
+
+def path_to_docs_url(path: str) -> str:
+    """Convert a MinersRefuge repo file path to its docs URL (backward compat)."""
+    return _compute_doc_url(path, DOCS_BASE_URL)
 
 
 def _truncate_safe(text: str, limit: int = 3800) -> str:
@@ -78,7 +83,7 @@ class DocsRAG(commands.Cog):
                 api_key=OPENROUTER_API_KEY,
             )
         self.session: aiohttp.ClientSession | None = None
-        self.chunks: list[dict] = []  # {content, path, title, embedding}
+        self.chunks: list[dict] = []  # {content, path, title, embedding, source, doc_url}
         self._last_commit_sha: str | None = None
         self._indexing: bool = False
         # TTL cache: max 200 conversations, each expires after 30 min
@@ -122,6 +127,8 @@ class DocsRAG(commands.Cog):
                     'path': c['path'],
                     'title': c['title'],
                     'embedding': c['embedding'],
+                    'source': c.get('source', "Miners' Refuge"),
+                    'doc_url': c.get('doc_url', path_to_docs_url(c['path'])),
                 }
                 for c in self.chunks
             ],
@@ -137,7 +144,12 @@ class DocsRAG(commands.Cog):
         try:
             with open(VECTOR_STORE_PATH, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-            self.chunks = data.get('chunks', [])
+            chunks = data.get('chunks', [])
+            # Backfill fields absent in older vector store formats
+            for chunk in chunks:
+                chunk.setdefault('source', "Miners' Refuge")
+                chunk.setdefault('doc_url', path_to_docs_url(chunk['path']))
+            self.chunks = chunks
             self._last_commit_sha = data.get('commit_sha')
             logger.info(
                 "Loaded %d vectors from disk (commit: %s)",
@@ -153,12 +165,12 @@ class DocsRAG(commands.Cog):
 
     @tasks.loop(hours=REINDEX_INTERVAL_HOURS)
     async def periodic_reindex(self):
-        """Check for doc updates and reindex if the repo has new commits."""
+        """Check for doc updates and reindex if the primary repo has new commits."""
         try:
             latest_sha = await self._get_latest_commit_sha()
             if latest_sha and latest_sha != self._last_commit_sha:
                 logger.info(
-                    "New commit detected (%s → %s), reindexing...",
+                    "New commit detected (%s -> %s), reindexing...",
                     self._last_commit_sha,
                     latest_sha,
                 )
@@ -173,7 +185,7 @@ class DocsRAG(commands.Cog):
         await self.bot.wait_until_ready()
 
     async def _get_latest_commit_sha(self) -> str | None:
-        """Fetch the latest commit SHA from the docs repo."""
+        """Fetch the latest commit SHA from the primary docs repo (MinersRefuge/docs)."""
         url = f'{GITHUB_API}/commits/{DOCS_BRANCH}'
         try:
             async with self.session.get(url) as resp:
@@ -196,7 +208,7 @@ class DocsRAG(commands.Cog):
         return None
 
     def _extract_paths(self, summary: str) -> list[str]:
-        # Exclude external URLs (http/https) — only match relative .md paths
+        # Exclude external URLs (http/https) -- only match relative .md paths
         paths = re.findall(r'\((?!https?://)([^)]+\.md)\)', summary)
         return list(dict.fromkeys(paths))  # deduplicate preserving order
 
@@ -250,14 +262,91 @@ class DocsRAG(commands.Cog):
         )
         return [d.embedding for d in response.data]
 
-    async def _fetch_doc(self, path: str, semaphore: asyncio.Semaphore) -> tuple[str, str | None]:
-        """Fetch a single doc file, respecting the concurrency semaphore."""
+    async def _fetch_doc(
+        self, path: str, github_raw: str, semaphore: asyncio.Semaphore
+    ) -> tuple[str, str | None]:
+        """Fetch a single doc file from the given GitHub raw base URL."""
         async with semaphore:
-            content = await self._fetch(f'{GITHUB_RAW}/{path}')
+            content = await self._fetch(f'{github_raw}/{path}')
         return path, content
 
+    async def _get_paths_from_tree(
+        self, repo: str, branch: str, path_prefix: str = ''
+    ) -> list[str]:
+        """Use the GitHub tree API to discover .md/.mdx files under an optional prefix."""
+        url = f'https://api.github.com/repos/{repo}/git/trees/{branch}?recursive=1'
+        try:
+            async with self.session.get(url) as resp:
+                if resp.status != 200:
+                    logger.warning("Tree API returned %d for %s", resp.status, repo)
+                    return []
+                data = await resp.json()
+                tree = data.get('tree', [])
+                return [
+                    entry['path'] for entry in tree
+                    if entry.get('type') == 'blob'
+                    and (entry['path'].endswith('.md') or entry['path'].endswith('.mdx'))
+                    and (not path_prefix or entry['path'].startswith(path_prefix))
+                ]
+        except Exception:
+            logger.exception("Failed to get file tree for %s", repo)
+            return []
+
+    async def _index_source(
+        self, source: dict, semaphore: asyncio.Semaphore
+    ) -> list[dict]:
+        """Index one documentation source and return its text chunks (no embeddings yet)."""
+        repo = source['repo']
+        branch = source['branch']
+        base_url = source['base_url']
+        label = source['label']
+        github_raw = f'https://raw.githubusercontent.com/{repo}/{branch}'
+        url_strip_prefix = source.get('url_strip_prefix', '')
+        max_files = source.get('max_files', 200)
+
+        # Discover file paths
+        summary_path = source.get('summary')
+        if summary_path:
+            summary = await self._fetch(f'{github_raw}/{summary_path}')
+            if not summary:
+                logger.error(
+                    "Failed to fetch %s from %s -- skipping source", summary_path, repo
+                )
+                return []
+            paths = self._extract_paths(summary)
+            paths.insert(0, 'README.md')
+        else:
+            path_prefix = source.get('path_prefix', '')
+            paths = await self._get_paths_from_tree(repo, branch, path_prefix)
+
+        paths = paths[:max_files]
+        if not paths:
+            logger.warning("No paths found for source '%s'", label)
+            return []
+
+        # Fetch documents concurrently (bounded by the shared semaphore)
+        fetch_tasks = [self._fetch_doc(p, github_raw, semaphore) for p in paths]
+        results = await asyncio.gather(*fetch_tasks)
+
+        chunks = []
+        fetched = 0
+        for path, content in results:
+            if content:
+                doc_url = _compute_doc_url(path, base_url, url_strip_prefix)
+                for chunk in self._chunk_text(content, path):
+                    chunk['source'] = label
+                    chunk['doc_url'] = doc_url
+                    chunks.append(chunk)
+                fetched += 1
+
+        logger.info(
+            "Source '%s': fetched %d/%d docs, %d chunks",
+            label, fetched, len(paths), len(chunks),
+        )
+        return chunks
+
     async def index_docs(self):
-        """Fetch all docs from GitHub and create embeddings."""
+        """Fetch all docs from all configured sources and create embeddings."""
         self._indexing = True
         try:
             await self._index_docs_inner()
@@ -265,31 +354,21 @@ class DocsRAG(commands.Cog):
             self._indexing = False
 
     async def _index_docs_inner(self):
-        logger.info("Indexing documentation from %s...", DOCS_REPO)
+        logger.info("Indexing %d documentation source(s)...", len(DOC_SOURCES))
 
-        summary = await self._fetch(f'{GITHUB_RAW}/SUMMARY.md')
-        if not summary:
-            logger.error("Failed to fetch SUMMARY.md — skipping indexing")
-            return
-
-        paths = self._extract_paths(summary)
-        paths.insert(0, 'README.md')
-
-        # Fetch documents concurrently (up to 5 at a time)
+        # All sources share a semaphore to cap total concurrent HTTP fetches
         semaphore = asyncio.Semaphore(5)
-        tasks_list = [self._fetch_doc(p, semaphore) for p in paths]
-        results = await asyncio.gather(*tasks_list)
+        source_tasks = [self._index_source(src, semaphore) for src in DOC_SOURCES]
+        source_results = await asyncio.gather(*source_tasks, return_exceptions=True)
 
         all_chunks = []
-        fetched = 0
-        for path, content in results:
-            if content:
-                chunks = self._chunk_text(content, path)
-                all_chunks.extend(chunks)
-                fetched += 1
+        for src, result in zip(DOC_SOURCES, source_results):
+            if isinstance(result, Exception):
+                logger.error("Error indexing source '%s': %s", src['label'], result)
+            else:
+                all_chunks.extend(result)
 
-        logger.info("Fetched %d/%d docs, created %d chunks", fetched, len(paths), len(all_chunks))
-
+        logger.info("Total chunks before embedding: %d", len(all_chunks))
         if not all_chunks:
             return
 
@@ -308,7 +387,7 @@ class DocsRAG(commands.Cog):
         self.chunks = [c for c in all_chunks if 'embedding' in c]
         logger.info("Documentation indexed: %d chunks with embeddings", len(self.chunks))
 
-        # Save commit SHA and persist vectors
+        # Track primary source commit SHA and persist
         self._last_commit_sha = await self._get_latest_commit_sha()
         self._save_vectors()
 
@@ -443,9 +522,9 @@ class DocsRAG(commands.Cog):
         """Generate an answer from search results and return (raw_answer, embed)."""
         context_parts = []
         for r in results:
-            url = path_to_docs_url(r['path'])
+            doc_url = r.get('doc_url', path_to_docs_url(r['path']))
             context_parts.append(
-                f"[Fonte: {r['title']} — {url}]\n{r['content']}"
+                f"[Fonte: {r['title']} -- {doc_url}]\n{r['content']}"
             )
         context = '\n\n---\n\n'.join(context_parts)
 
@@ -491,9 +570,10 @@ class DocsRAG(commands.Cog):
         for r in results:
             if r['path'] not in seen_paths:
                 seen_paths.add(r['path'])
-                url = path_to_docs_url(r['path'])
+                doc_url = r.get('doc_url', path_to_docs_url(r['path']))
                 title = r['title'] or r['path']
-                source_lines.append(f'• [{title}]({url})')
+                source_label = r.get('source', "Miners' Refuge")
+                source_lines.append(f'• [{title}]({doc_url}) — {source_label}')
             if len(source_lines) >= 8:
                 break
 
@@ -503,7 +583,8 @@ class DocsRAG(commands.Cog):
             inline=False,
         )
         embed.set_footer(
-            text=f'Miners\' Refuge Docs • {DOCS_BASE_URL} • 💬 Responda a esta mensagem para continuar a conversa'
+            text="Miners' Refuge Docs • " + DOCS_BASE_URL +
+            " • 💬 Responda a esta mensagem para continuar a conversa"
         )
 
         return answer, embed
@@ -591,6 +672,6 @@ class DocsRAG(commands.Cog):
 
 async def setup(bot: commands.Bot):
     if not OPENROUTER_API_KEY:
-        logger.warning("OPENROUTER_API_KEY not set — DocsRAG cog will not be loaded")
+        logger.warning("OPENROUTER_API_KEY not set -- DocsRAG cog will not be loaded")
         return
     await bot.add_cog(DocsRAG(bot))

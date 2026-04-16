@@ -132,6 +132,65 @@ class Commands(commands.Cog):
         embed.set_footer(text=f"Miners' Refuge • {DOCS_BASE_URL}")
         await interaction.response.send_message(embed=embed)
 
+    @app_commands.command(name="flags", description="Gera as flags JVM de Aikar para o seu servidor Minecraft")
+    @app_commands.describe(ram="Quantidade de RAM em MB (ex: 4096 para 4 GB)")
+    async def jvm_flags(self, interaction: discord.Interaction, ram: int):
+        if ram < 512:
+            await interaction.response.send_message(
+                'Recomendamos pelo menos 512 MB de RAM para um servidor Minecraft.',
+                ephemeral=True,
+            )
+            return
+        if ram > 65536:
+            await interaction.response.send_message(
+                'Valor muito alto. Insira a quantidade em MB (ex: 4096 para 4 GB).',
+                ephemeral=True,
+            )
+            return
+
+        # Aikar's flags — adjusted thresholds for RAM >= 12 GB
+        large = ram >= 12288
+        g1_new = 40 if large else 30
+        g1_max_new = 50 if large else 40
+        g1_region = '16M' if large else '8M'
+        g1_reserve = 15 if large else 20
+
+        flags = (
+            f'-Xms{ram}M -Xmx{ram}M '
+            f'-XX:+UseG1GC -XX:+ParallelRefProcEnabled -XX:MaxGCPauseMillis=200 '
+            f'-XX:+UnlockExperimentalVMOptions -XX:+DisableExplicitGC -XX:+AlwaysPreTouch '
+            f'-XX:G1NewSizePercent={g1_new} -XX:G1MaxNewSizePercent={g1_max_new} '
+            f'-XX:G1HeapRegionSize={g1_region} -XX:G1ReservePercent={g1_reserve} '
+            f'-XX:G1HeapWastePercent=5 -XX:G1MixedGCCountTarget=4 '
+            f'-XX:InitiatingHeapOccupancyPercent=15 -XX:G1MixedGCLiveThresholdPercent=90 '
+            f'-XX:G1RSetUpdatingPauseTimePercent=5 -XX:SurvivorRatio=32 '
+            f'-XX:+PerfDisableSharedMem -XX:MaxTenuringThreshold=1 '
+            f'-Dusing.aikars.flags=https://mcflags.emc.gs -Daikars.new.flags=true'
+        )
+
+        ram_label = f'{ram} MB ({ram // 1024} GB)' if ram >= 1024 else f'{ram} MB'
+        embed = discord.Embed(
+            title='⚙️ Flags JVM de Aikar',
+            color=discord.Color.dark_green(),
+        )
+        embed.add_field(
+            name=f'RAM: {ram_label}',
+            value=f'```\n{flags}\n```',
+            inline=False,
+        )
+        embed.add_field(
+            name='Como usar',
+            value='Adicione essas flags ao script de inicialização, antes do `-jar`.',
+            inline=False,
+        )
+        footer = (
+            'Configuração RAM alta (>= 12 GB) • flags.sh.emc.gs'
+            if large else
+            'Baseado em flags.sh.emc.gs • Recomendado para servidores Minecraft'
+        )
+        embed.set_footer(text=footer)
+        await interaction.response.send_message(embed=embed)
+
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(Commands(bot))

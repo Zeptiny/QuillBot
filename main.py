@@ -21,7 +21,7 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 # Load order matters: log_analyzer's on_message (pattern matching) runs before
 # docs_rag's on_message (follow-up replies). Do not reorder without reviewing
 # listener interactions.
-COGS = ['cogs.log_analyzer', 'cogs.commands', 'cogs.docs_rag']
+COGS = ['cogs.log_analyzer', 'cogs.commands', 'cogs.plugins', 'cogs.docs_rag']
 
 
 @bot.event

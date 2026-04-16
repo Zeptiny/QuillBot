@@ -34,6 +34,32 @@ REINDEX_INTERVAL_HOURS: Final[int] = int(os.getenv('REINDEX_INTERVAL_HOURS', '6'
 MAX_CONTENT_SIZE: Final[int] = 5 * 1024 * 1024  # 5 MB
 MAX_LOG_CONTEXT: Final[int] = 12000  # Max characters sent to the LLM
 
+# --- Documentation Sources ---
+# Each entry must have: repo, branch, base_url, label
+# Optional:
+#   summary         — path to SUMMARY.md (mdBook); absent means GitHub tree API is used
+#   path_prefix     — only index files whose path starts with this prefix (tree discovery)
+#   url_strip_prefix— strip this from the repo path before building the docs website URL
+#   max_files       — maximum number of files to index per source (default 200)
+DOC_SOURCES: Final[list[dict]] = [
+    {
+        'repo': 'MinersRefuge/docs',
+        'branch': 'main',
+        'base_url': 'https://docs.minersrefuge.com.br',
+        'label': "Miners' Refuge",
+        'summary': 'SUMMARY.md',
+    },
+    {
+        'repo': 'PaperMC/docs',
+        'branch': 'main',
+        'base_url': 'https://docs.papermc.io',
+        'label': 'PaperMC',
+        'path_prefix': 'docs/paper/admin',
+        'url_strip_prefix': 'docs/',
+        'max_files': 30,
+    },
+]
+
 
 def validate_config() -> None:
     """Validate required configuration at startup. Exits on failure."""
