@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import math
@@ -6,23 +7,28 @@ import re
 
 import aiohttp
 import discord
+from cachetools import TTLCache
 from discord import app_commands
 from discord.ext import commands, tasks
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, RateLimitError
+
+from config import (
+    CHAT_MODEL,
+    COOLDOWN_PER,
+    COOLDOWN_RATE,
+    DOCS_BASE_URL,
+    DOCS_BRANCH,
+    DOCS_REPO,
+    EMBEDDING_MODEL,
+    GITHUB_API,
+    GITHUB_RAW,
+    OPENROUTER_API_KEY,
+    REINDEX_INTERVAL_HOURS,
+    RERANK_MODEL,
+    VECTOR_STORE_PATH,
+)
 
 logger = logging.getLogger(__name__)
-
-OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY')
-EMBEDDING_MODEL = os.getenv('EMBEDDING_MODEL', 'qwen/qwen3-embedding-8b')
-RERANK_MODEL = os.getenv('RERANK_MODEL', 'cohere/rerank-4-fast')
-CHAT_MODEL = os.getenv('CHAT_MODEL', 'google/gemini-2.5-flash-lite')
-DOCS_REPO = 'MinersRefuge/docs'
-DOCS_BRANCH = 'main'
-DOCS_BASE_URL = 'https://docs.minersrefuge.com.br'
-GITHUB_RAW = f'https://raw.githubusercontent.com/{DOCS_REPO}/{DOCS_BRANCH}'
-GITHUB_API = f'https://api.github.com/repos/{DOCS_REPO}'
-VECTOR_STORE_PATH = os.getenv('VECTOR_STORE_PATH', 'data/vectors.json')
-REINDEX_INTERVAL_HOURS = int(os.getenv('REINDEX_INTERVAL_HOURS', '6'))
 
 SYSTEM_PROMPT = (
     "Você é o assistente do Miners' Refuge, uma comunidade brasileira de administradores "
@@ -50,21 +56,33 @@ def path_to_docs_url(path: str) -> str:
     return f"{DOCS_BASE_URL}/{url}" if url else DOCS_BASE_URL
 
 
+def _truncate_safe(text: str, limit: int = 3800) -> str:
+    """Truncate text at the last newline before *limit* to avoid breaking markdown."""
+    if len(text) <= limit:
+        return text
+    idx = text.rfind('\n', 0, limit)
+    if idx == -1:
+        idx = limit
+    return text[:idx] + '\n\n...'
+
+
 class DocsRAG(commands.Cog):
     """RAG-powered documentation search and Q&A with vector storage and reranking."""
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        self.client = AsyncOpenAI(
-            base_url='https://openrouter.ai/api/v1',
-            api_key=OPENROUTER_API_KEY,
-        )
+        self.client: AsyncOpenAI | None = None
+        if OPENROUTER_API_KEY:
+            self.client = AsyncOpenAI(
+                base_url='https://openrouter.ai/api/v1',
+                api_key=OPENROUTER_API_KEY,
+            )
         self.session: aiohttp.ClientSession | None = None
         self.chunks: list[dict] = []  # {content, path, title, embedding}
         self._last_commit_sha: str | None = None
-        # Conversation history: message_id -> {question, answer, sources}
-        # Used for follow-up replies. Limited to last 100 entries.
-        self._conversations: dict[int, dict] = {}
+        self._indexing: bool = False
+        # TTL cache: max 200 conversations, each expires after 30 min
+        self._conversations: TTLCache = TTLCache(maxsize=200, ttl=1800)
 
     async def cog_load(self):
         self.session = aiohttp.ClientSession()
@@ -77,6 +95,19 @@ class DocsRAG(commands.Cog):
         self.periodic_reindex.cancel()
         if self.session:
             await self.session.close()
+
+    # --- Cooldown error handler ---
+
+    async def cog_app_command_error(
+        self, interaction: discord.Interaction, error: app_commands.AppCommandError
+    ):
+        if isinstance(error, app_commands.CommandOnCooldown):
+            await interaction.response.send_message(
+                f'⏳ Aguarde {error.retry_after:.0f}s antes de usar este comando novamente.',
+                ephemeral=True,
+            )
+        else:
+            raise error
 
     # --- Vector Storage ---
 
@@ -165,7 +196,8 @@ class DocsRAG(commands.Cog):
         return None
 
     def _extract_paths(self, summary: str) -> list[str]:
-        paths = re.findall(r'\(([^)]+\.md)\)', summary)
+        # Exclude external URLs (http/https) — only match relative .md paths
+        paths = re.findall(r'\((?!https?://)([^)]+\.md)\)', summary)
         return list(dict.fromkeys(paths))  # deduplicate preserving order
 
     def _extract_title(self, content: str) -> str:
@@ -218,8 +250,21 @@ class DocsRAG(commands.Cog):
         )
         return [d.embedding for d in response.data]
 
+    async def _fetch_doc(self, path: str, semaphore: asyncio.Semaphore) -> tuple[str, str | None]:
+        """Fetch a single doc file, respecting the concurrency semaphore."""
+        async with semaphore:
+            content = await self._fetch(f'{GITHUB_RAW}/{path}')
+        return path, content
+
     async def index_docs(self):
         """Fetch all docs from GitHub and create embeddings."""
+        self._indexing = True
+        try:
+            await self._index_docs_inner()
+        finally:
+            self._indexing = False
+
+    async def _index_docs_inner(self):
         logger.info("Indexing documentation from %s...", DOCS_REPO)
 
         summary = await self._fetch(f'{GITHUB_RAW}/SUMMARY.md')
@@ -230,11 +275,14 @@ class DocsRAG(commands.Cog):
         paths = self._extract_paths(summary)
         paths.insert(0, 'README.md')
 
-        # Fetch all documents
+        # Fetch documents concurrently (up to 5 at a time)
+        semaphore = asyncio.Semaphore(5)
+        tasks_list = [self._fetch_doc(p, semaphore) for p in paths]
+        results = await asyncio.gather(*tasks_list)
+
         all_chunks = []
         fetched = 0
-        for path in paths:
-            content = await self._fetch(f'{GITHUB_RAW}/{path}')
+        for path, content in results:
             if content:
                 chunks = self._chunk_text(content, path)
                 all_chunks.extend(chunks)
@@ -324,35 +372,43 @@ class DocsRAG(commands.Cog):
     # --- Slash Commands ---
 
     @app_commands.command(name='ask', description='Pergunte algo sobre administração de servidores Minecraft')
+    @app_commands.checks.cooldown(COOLDOWN_RATE, COOLDOWN_PER)
     @app_commands.describe(
-        pergunta='Sua pergunta',
-        imagem='Imagem/screenshot para análise (opcional)',
+        question='Sua pergunta',
+        image='Imagem/screenshot para análise (opcional)',
     )
     async def ask(
         self,
         interaction: discord.Interaction,
-        pergunta: str,
-        imagem: discord.Attachment | None = None,
+        question: str,
+        image: discord.Attachment | None = None,
     ):
-        if not OPENROUTER_API_KEY:
+        if not self.client:
             await interaction.response.send_message(
                 '⚠️ Comando indisponível: chave de API não configurada.', ephemeral=True
             )
             return
 
+        if self._indexing:
+            await interaction.response.send_message(
+                '📚 A documentação está sendo indexada, tente novamente em alguns instantes.',
+                ephemeral=True,
+            )
+            return
+
         image_url = None
-        if imagem:
-            if not imagem.content_type or not imagem.content_type.startswith('image/'):
+        if image:
+            if not image.content_type or not image.content_type.startswith('image/'):
                 await interaction.response.send_message(
                     'O arquivo enviado não é uma imagem válida.', ephemeral=True
                 )
                 return
-            image_url = imagem.url
+            image_url = image.url
 
         await interaction.response.defer(thinking=True)
 
         try:
-            results = await self.search(pergunta)
+            results = await self.search(question)
 
             if not results:
                 await interaction.followup.send(
@@ -361,12 +417,16 @@ class DocsRAG(commands.Cog):
                 )
                 return
 
-            answer, embed = await self._build_answer(pergunta, results, image_url=image_url)
+            answer, embed = await self._build_answer(question, results, image_url=image_url)
             msg = await interaction.followup.send(embed=embed, wait=True)
 
             # Store conversation for follow-ups
-            self._store_conversation(msg.id, pergunta, answer, results)
+            self._store_conversation(msg.id, question, answer, results)
 
+        except RateLimitError:
+            await interaction.followup.send(
+                '⏳ Limite de requisições atingido. Tente novamente em alguns minutos.'
+            )
         except Exception:
             logger.exception("Error in /ask command")
             await interaction.followup.send(
@@ -418,8 +478,7 @@ class DocsRAG(commands.Cog):
         )
 
         answer = response.choices[0].message.content
-        if len(answer) > 3800:
-            answer = answer[:3800] + '...'
+        answer = _truncate_safe(answer)
 
         embed = discord.Embed(
             title=f'❓ {question}',
@@ -443,18 +502,14 @@ class DocsRAG(commands.Cog):
             value='\n'.join(source_lines),
             inline=False,
         )
-        embed.set_footer(text=f'Miners\' Refuge Docs • {DOCS_BASE_URL} • Responda a esta mensagem para continuar')
+        embed.set_footer(
+            text=f'Miners\' Refuge Docs • {DOCS_BASE_URL} • 💬 Responda a esta mensagem para continuar a conversa'
+        )
 
         return answer, embed
 
     def _store_conversation(self, message_id: int, question: str, answer: str, results: list[dict]):
         """Store a conversation exchange for follow-up replies."""
-        # Evict old entries if cache is too large
-        if len(self._conversations) > 100:
-            oldest = sorted(self._conversations.keys())[:50]
-            for k in oldest:
-                del self._conversations[k]
-
         self._conversations[message_id] = {
             'question': question,
             'answer': answer,
@@ -514,6 +569,10 @@ class DocsRAG(commands.Cog):
                     'answer': answer,
                     'history': history,
                 }
+            except RateLimitError:
+                await message.reply(
+                    '⏳ Limite de requisições atingido. Tente novamente em alguns minutos.'
+                )
             except Exception:
                 logger.exception("Error in follow-up reply")
                 await message.reply(

@@ -2,6 +2,8 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+from config import DOCS_BASE_URL
+
 
 class Commands(commands.Cog):
     """Slash commands for server administration help."""
@@ -10,7 +12,7 @@ class Commands(commands.Cog):
         self.bot = bot
 
     @app_commands.command(name="plov", description="Informações necessárias para escolher um serviço de hospedagem")
-    async def plov(self, interaction: discord.Interaction):
+    async def hosting_info(self, interaction: discord.Interaction):
         embed = discord.Embed(
             title="PLOV - Informações para Hospedagem",
             color=discord.Color.blue(),
@@ -23,7 +25,7 @@ class Commands(commands.Cog):
         await interaction.response.send_message(embed=embed)
 
     @app_commands.command(name="plano", description="Informações para recomendar um plano adequado")
-    async def plano(self, interaction: discord.Interaction):
+    async def plan_info(self, interaction: discord.Interaction):
         embed = discord.Embed(
             title="Informações para Recomendação de Plano",
             color=discord.Color.green(),
@@ -34,29 +36,63 @@ class Commands(commands.Cog):
         embed.add_field(name="Modo", value="Qual o modo de jogo do server", inline=False)
         await interaction.response.send_message(embed=embed)
 
-    @app_commands.command(name="docs", description="Link para a documentação do Miners' Refuge")
-    @app_commands.describe(busca="Termo para pesquisar na documentação (opcional)")
-    async def docs(self, interaction: discord.Interaction, busca: str | None = None):
-        base_url = "https://docs.minersrefuge.com.br"
-        embed = discord.Embed(
-            title="Documentação - Miners' Refuge",
-            color=discord.Color.gold(),
-        )
-        if busca:
-            embed.description = (
-                f"Pesquise por **{busca}** na documentação:\n"
-                f"[Abrir documentação]({base_url})\n\n"
-                f"Use `CTRL+K` no site para pesquisar diretamente!"
+    @app_commands.command(name="docs", description="Pesquisar ou acessar a documentação do Miners' Refuge")
+    @app_commands.describe(query="Termo para pesquisar na documentação (opcional)")
+    async def docs_search(self, interaction: discord.Interaction, query: str | None = None):
+        if query:
+            # Delegate to RAG search if available
+            docs_rag = self.bot.cogs.get('DocsRAG')
+            if docs_rag and hasattr(docs_rag, 'search') and docs_rag.chunks:
+                await interaction.response.defer(thinking=True)
+                results = await docs_rag.search(query, top_k=5)
+                if results:
+                    embed = discord.Embed(
+                        title=f"🔍 Resultados para: {query}",
+                        color=discord.Color.gold(),
+                    )
+                    seen_paths = set()
+                    lines = []
+                    for r in results:
+                        if r['path'] not in seen_paths:
+                            seen_paths.add(r['path'])
+                            from cogs.docs_rag import path_to_docs_url
+                            url = path_to_docs_url(r['path'])
+                            title = r['title'] or r['path']
+                            # Show a snippet of the content
+                            snippet = r['content'][:120].replace('\n', ' ').strip()
+                            lines.append(f'**[{title}]({url})**\n{snippet}…')
+                    embed.description = '\n\n'.join(lines)
+                    embed.set_footer(text=f'Use /ask para perguntas detalhadas • {DOCS_BASE_URL}')
+                    await interaction.followup.send(embed=embed)
+                    return
+            # Fallback: no RAG available
+            embed = discord.Embed(
+                title="Documentação - Miners' Refuge",
+                color=discord.Color.gold(),
+                description=(
+                    f"Pesquise por **{query}** na documentação:\n"
+                    f"[Abrir documentação]({DOCS_BASE_URL})\n\n"
+                    f"Use `CTRL+K` no site para pesquisar diretamente!"
+                ),
             )
+            embed.set_footer(text="Contribua abrindo um PR no GitHub!")
+            if interaction.response.is_done():
+                await interaction.followup.send(embed=embed)
+            else:
+                await interaction.response.send_message(embed=embed)
         else:
-            embed.description = (
-                f"Acesse a documentação completa:\n"
-                f"[docs.minersrefuge.com.br]({base_url})\n\n"
-                f"Encontre guias sobre administração de servidores Minecraft, "
-                f"dicas de otimização e muito mais!"
+            embed = discord.Embed(
+                title="Documentação - Miners' Refuge",
+                color=discord.Color.gold(),
+                description=(
+                    f"Acesse a documentação completa:\n"
+                    f"[docs.minersrefuge.com.br]({DOCS_BASE_URL})\n\n"
+                    f"Encontre guias sobre administração de servidores Minecraft, "
+                    f"dicas de otimização e muito mais!"
+                ),
             )
-        embed.set_footer(text="Contribua abrindo um PR no GitHub!")
-        await interaction.response.send_message(embed=embed)
+            embed.set_footer(text="Contribua abrindo um PR no GitHub!")
+            await interaction.response.send_message(embed=embed)
 
     @app_commands.command(name="help", description="Lista todos os comandos disponíveis do bot")
     async def help_command(self, interaction: discord.Interaction):
@@ -65,29 +101,24 @@ class Commands(commands.Cog):
             description="Todos os comandos disponíveis:",
             color=discord.Color.purple(),
         )
-        embed.add_field(
-            name="🔧 Utilidades",
-            value=(
-                "**/plov** — Informações para escolher hospedagem (PLOV)\n"
-                "**/plano** — Informações para recomendação de plano\n"
-                "**/docs** `[busca]` — Link para a documentação\n"
-                "**/help** — Esta mensagem"
-            ),
-            inline=False,
-        )
-        embed.add_field(
-            name="🤖 Inteligência Artificial",
-            value=(
-                "**/ask** `pergunta` — Pergunte algo sobre servidores Minecraft (busca na documentação)\n"
-                "**/analyze** `log_link` ou `log_file` — Análise de logs com IA"
-            ),
-            inline=False,
-        )
-        embed.add_field(
-            name="⚙️ Administração",
-            value="**/reindex** — Re-indexar a documentação (apenas admins)",
-            inline=False,
-        )
+
+        # Dynamically list all registered slash commands
+        cmds = self.bot.tree.get_commands()
+        cmd_lines = []
+        for cmd in sorted(cmds, key=lambda c: c.name):
+            params = ''
+            if hasattr(cmd, 'parameters') and cmd.parameters:
+                param_parts = []
+                for p in cmd.parameters:
+                    if p.required:
+                        param_parts.append(f'`{p.name}`')
+                    else:
+                        param_parts.append(f'`[{p.name}]`')
+                params = ' ' + ' '.join(param_parts)
+            cmd_lines.append(f'**/{cmd.name}**{params} — {cmd.description}')
+
+        embed.description = '\n'.join(cmd_lines)
+
         embed.add_field(
             name="📝 Detecção Automática",
             value=(
@@ -98,7 +129,7 @@ class Commands(commands.Cog):
             ),
             inline=False,
         )
-        embed.set_footer(text="Miners' Refuge • docs.minersrefuge.com.br")
+        embed.set_footer(text=f"Miners' Refuge • {DOCS_BASE_URL}")
         await interaction.response.send_message(embed=embed)
 
 
