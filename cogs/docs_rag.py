@@ -3,6 +3,7 @@ import logging
 import math
 import os
 import re
+from collections import defaultdict
 
 import aiohttp
 import discord
@@ -65,6 +66,9 @@ class DocsRAG(commands.Cog):
         self.session: aiohttp.ClientSession | None = None
         self.chunks: list[dict] = []  # {content, path, title, embedding}
         self._last_commit_sha: str | None = None
+        # Conversation history: message_id -> {question, answer, sources}
+        # Used for follow-up replies. Limited to last 100 entries.
+        self._conversations: dict[int, dict] = {}
 
     async def cog_load(self):
         self.session = aiohttp.ClientSession()
@@ -297,7 +301,7 @@ class DocsRAG(commands.Cog):
         # Fallback: return documents as-is (already sorted by cosine similarity)
         return documents[:top_n]
 
-    async def search(self, query: str, top_k: int = 5) -> list[dict]:
+    async def search(self, query: str, top_k: int = 8) -> list[dict]:
         if not self.chunks:
             return []
 
@@ -335,7 +339,7 @@ class DocsRAG(commands.Cog):
         await interaction.response.defer(thinking=True)
 
         try:
-            results = await self.search(pergunta, top_k=5)
+            results = await self.search(pergunta)
 
             if not results:
                 await interaction.followup.send(
@@ -344,62 +348,143 @@ class DocsRAG(commands.Cog):
                 )
                 return
 
-            # Build context with source URLs for the LLM
-            context_parts = []
-            for r in results:
-                url = path_to_docs_url(r['path'])
-                context_parts.append(
-                    f"[Fonte: {r['title']} — {url}]\n{r['content']}"
-                )
-            context = '\n\n---\n\n'.join(context_parts)
+            answer, embed = await self._build_answer(pergunta, results)
+            msg = await interaction.followup.send(embed=embed, wait=True)
 
-            response = await self.client.chat.completions.create(
-                model=CHAT_MODEL,
-                messages=[
-                    {'role': 'system', 'content': SYSTEM_PROMPT},
-                    {'role': 'user', 'content': f"Contexto da documentação:\n{context}\n\nPergunta: {pergunta}"},
-                ],
-                max_tokens=1024,
-            )
-
-            answer = response.choices[0].message.content
-
-            # Truncate answer if too long for embed description (4096 limit)
-            if len(answer) > 3800:
-                answer = answer[:3800] + '...'
-
-            embed = discord.Embed(
-                title=f'❓ {pergunta}',
-                description=answer,
-                color=discord.Color.blue(),
-            )
-
-            # Source links with titles and URLs (deduplicated)
-            seen_paths = set()
-            source_lines = []
-            for r in results:
-                if r['path'] not in seen_paths:
-                    seen_paths.add(r['path'])
-                    url = path_to_docs_url(r['path'])
-                    title = r['title'] or r['path']
-                    source_lines.append(f'• [{title}]({url})')
-                if len(source_lines) >= 5:
-                    break
-
-            embed.add_field(
-                name='📄 Fontes da Documentação',
-                value='\n'.join(source_lines),
-                inline=False,
-            )
-            embed.set_footer(text=f'Miners\' Refuge Docs • {DOCS_BASE_URL}')
-
-            await interaction.followup.send(embed=embed)
+            # Store conversation for follow-ups
+            self._store_conversation(msg.id, pergunta, answer, results)
 
         except Exception:
             logger.exception("Error in /ask command")
             await interaction.followup.send(
                 'Ocorreu um erro ao processar sua pergunta. Tente novamente mais tarde.'
             )
+
+    async def _build_answer(
+        self,
+        question: str,
+        results: list[dict],
+        history: list[dict] | None = None,
+    ) -> tuple[str, discord.Embed]:
+        """Generate an answer from search results and return (raw_answer, embed)."""
+        context_parts = []
+        for r in results:
+            url = path_to_docs_url(r['path'])
+            context_parts.append(
+                f"[Fonte: {r['title']} — {url}]\n{r['content']}"
+            )
+        context = '\n\n---\n\n'.join(context_parts)
+
+        messages = [{'role': 'system', 'content': SYSTEM_PROMPT}]
+
+        # Include conversation history for follow-ups
+        if history:
+            for h in history[-3:]:  # Last 3 exchanges max
+                messages.append({'role': 'user', 'content': h['question']})
+                messages.append({'role': 'assistant', 'content': h['answer']})
+
+        messages.append(
+            {'role': 'user', 'content': f"Contexto da documentação:\n{context}\n\nPergunta: {question}"}
+        )
+
+        response = await self.client.chat.completions.create(
+            model=CHAT_MODEL,
+            messages=messages,
+            max_tokens=1024,
+        )
+
+        answer = response.choices[0].message.content
+        if len(answer) > 3800:
+            answer = answer[:3800] + '...'
+
+        embed = discord.Embed(
+            title=f'❓ {question}',
+            description=answer,
+            color=discord.Color.blue(),
+        )
+
+        seen_paths = set()
+        source_lines = []
+        for r in results:
+            if r['path'] not in seen_paths:
+                seen_paths.add(r['path'])
+                url = path_to_docs_url(r['path'])
+                title = r['title'] or r['path']
+                source_lines.append(f'• [{title}]({url})')
+            if len(source_lines) >= 8:
+                break
+
+        embed.add_field(
+            name='📄 Fontes da Documentação',
+            value='\n'.join(source_lines),
+            inline=False,
+        )
+        embed.set_footer(text=f'Miners\' Refuge Docs • {DOCS_BASE_URL} • Responda a esta mensagem para continuar')
+
+        return answer, embed
+
+    def _store_conversation(self, message_id: int, question: str, answer: str, results: list[dict]):
+        """Store a conversation exchange for follow-up replies."""
+        # Evict old entries if cache is too large
+        if len(self._conversations) > 100:
+            oldest = sorted(self._conversations.keys())[:50]
+            for k in oldest:
+                del self._conversations[k]
+
+        self._conversations[message_id] = {
+            'question': question,
+            'answer': answer,
+            'history': [],
+        }
+
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message):
+        """Handle reply-based follow-up conversations."""
+        if message.author.bot:
+            return
+        if not message.reference or not message.reference.message_id:
+            return
+
+        ref_id = message.reference.message_id
+        conv = self._conversations.get(ref_id)
+        if not conv:
+            return
+
+        # User is replying to one of our /ask responses
+        follow_up_question = message.content.strip()
+        if not follow_up_question:
+            return
+
+        async with message.channel.typing():
+            try:
+                # Build history from previous exchanges
+                history = conv.get('history', []).copy()
+                history.append({'question': conv['question'], 'answer': conv['answer']})
+
+                results = await self.search(follow_up_question)
+                if not results:
+                    await message.reply(
+                        'Não encontrei informações relevantes na documentação. '
+                        f'Tente pesquisar diretamente em {DOCS_BASE_URL}'
+                    )
+                    return
+
+                answer, embed = await self._build_answer(
+                    follow_up_question, results, history=history
+                )
+                reply = await message.reply(embed=embed)
+
+                # Store new conversation entry so the chain can continue
+                self._conversations[reply.id] = {
+                    'question': follow_up_question,
+                    'answer': answer,
+                    'history': history,
+                }
+            except Exception:
+                logger.exception("Error in follow-up reply")
+                await message.reply(
+                    'Ocorreu um erro ao processar sua pergunta. Tente novamente.'
+                )
 
     @app_commands.command(name='reindex', description='Re-indexar a documentação (Admin)')
     @app_commands.checks.has_permissions(administrator=True)

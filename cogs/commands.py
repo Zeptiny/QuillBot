@@ -58,6 +58,49 @@ class Commands(commands.Cog):
         embed.set_footer(text="Contribua abrindo um PR no GitHub!")
         await interaction.response.send_message(embed=embed)
 
+    @app_commands.command(name="help", description="Lista todos os comandos disponíveis do bot")
+    async def help_command(self, interaction: discord.Interaction):
+        embed = discord.Embed(
+            title="📋 Comandos do QuillBot",
+            description="Todos os comandos disponíveis:",
+            color=discord.Color.purple(),
+        )
+        embed.add_field(
+            name="🔧 Utilidades",
+            value=(
+                "**/plov** — Informações para escolher hospedagem (PLOV)\n"
+                "**/plano** — Informações para recomendação de plano\n"
+                "**/docs** `[busca]` — Link para a documentação\n"
+                "**/help** — Esta mensagem"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="🤖 Inteligência Artificial",
+            value=(
+                "**/ask** `pergunta` — Pergunte algo sobre servidores Minecraft (busca na documentação)\n"
+                "**/analyze** `log_link` ou `log_file` — Análise de logs com IA"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="⚙️ Administração",
+            value="**/reindex** — Re-indexar a documentação (apenas admins)",
+            inline=False,
+        )
+        embed.add_field(
+            name="📝 Detecção Automática",
+            value=(
+                "O bot também analisa automaticamente logs e erros enviados no chat:\n"
+                "• Links do **mclo.gs** e **pastebin.com**\n"
+                "• Arquivos **.log** e **.txt** anexados\n"
+                "• Mensagens com erros conhecidos de Minecraft"
+            ),
+            inline=False,
+        )
+        embed.set_footer(text="Miners' Refuge • docs.minersrefuge.com.br")
+        await interaction.response.send_message(embed=embed)
+
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(Commands(bot))
