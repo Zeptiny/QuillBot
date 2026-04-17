@@ -69,7 +69,7 @@ DOC_SOURCES: Final[list[dict]] = [
     },
     {
         'repo': 'lucko/spark-docs',
-        'branch': 'main',
+        'branch': 'master',
         'base_url': 'https://spark.lucko.me/docs/',
         'label': 'Spark',
         'path_prefix': 'docs/',
