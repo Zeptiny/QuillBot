@@ -40,28 +40,11 @@ if history and len(history) > 1:
 max_tokens=2048
 ```
 
-### 1.5 Anthropic Best Practices Checklist
-
-| Principle | Status | Action Needed |
-|---|---|---|
-| Clear and direct instructions | ✅ Good | — |
-| Give Claude a role | ✅ Good | — |
-| XML tags for structure | ❌ Missing | Wrap in `<role>`, `<instructions>`, `<response_format>` |
-| Few-shot examples | ❌ Missing | Add 1-2 examples of ideal answers |
-| Positive instructions over "don't" | ⚠️ Partial | Rephrase "NÃO inclua" → "Omita" |
-| Tool descriptions: when NOT to use | ⚠️ Partial | Add negative guidance to tool descriptions |
-
 ---
 
 ## 2. Feature Roadmap
 
 ### 2.1 Interactive Timings/Spark Analysis (High Impact)
-
-Add `/timings` command:
-- Accept Spark report URL (`spark.lucko.me`)
-- Parse heap summary, tick stats, top plugins from the Spark JSON API
-- Feed structured data to the LLM for diagnosis
-- Most commonly shared artifact in MC admin channels
 
 ### 2.2 Server Configuration Wizard (Medium Impact)
 

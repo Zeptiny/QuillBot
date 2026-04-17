@@ -24,22 +24,29 @@ MCLO_GS_PATTERN = re.compile(r'https://mclo\.gs/(\w+)')
 PASTEBIN_PATTERN = re.compile(r'https://pastebin\.com/(\w+)')
 
 ANALYZE_SYSTEM_PROMPT = (
+    "<role>\n"
     "Você é um especialista em administração de servidores Minecraft. "
-    "Analise o log/crash report fornecido e responda em português brasileiro.\n\n"
-    "Sua resposta DEVE seguir este formato:\n\n"
+    "Analise o log/crash report fornecido e responda em português brasileiro.\n"
+    "</role>\n\n"
+    "<instructions>\n"
+    "Identifique erros, avisos e oportunidades de melhoria no log. "
+    "Baseie-se exclusivamente no conteúdo fornecido — omita problemas que não estejam presentes no log.\n"
+    "</instructions>\n\n"
+    "<response_format>\n"
+    "Sua resposta DEVE seguir exatamente este formato:\n\n"
     "## 🔍 Resumo\n"
     "Uma frase resumindo o estado geral do servidor.\n\n"
     "## ❌ Erros Encontrados\n"
-    "Liste cada erro encontrado com:\n"
+    "Liste cada erro com:\n"
     "- **Erro**: Descrição do erro\n"
     "- **Causa provável**: O que pode estar causando\n"
     "- **Solução**: Passos para resolver\n\n"
     "## ⚠️ Avisos\n"
-    "Avisos que não são críticos mas merecem atenção.\n\n"
+    "Avisos não críticos que merecem atenção.\n\n"
     "## 💡 Recomendações\n"
-    "Sugestões de otimização ou melhorias baseadas no log.\n\n"
-    "Se o log estiver limpo sem erros, diga isso claramente. "
-    "Seja direto e prático. Não invente problemas que não existem no log."
+    "Sugestões de otimização baseadas no log.\n\n"
+    "Se o log estiver limpo, diga isso claramente. Seja direto e prático.\n"
+    "</response_format>"
 )
 
 # Minimum message length to run pattern matching against (skip trivial messages)
