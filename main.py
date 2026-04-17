@@ -1,12 +1,12 @@
 import logging
-import os
 
 import discord
 from discord.ext import commands
-from dotenv import load_dotenv
 
-load_dotenv()
-BOT_TOKEN = os.getenv('BOT_TOKEN')
+from config import BOT_TOKEN, validate_config
+
+validate_config()
+assert BOT_TOKEN is not None  # narrowed by validate_config()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -19,7 +19,10 @@ intents.message_content = True
 
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-COGS = ['cogs.log_analyzer', 'cogs.commands', 'cogs.docs_rag']
+# Load order matters: log_analyzer's on_message (pattern matching) runs before
+# docs_rag's on_message (follow-up replies). Do not reorder without reviewing
+# listener interactions.
+COGS = ['cogs.log_analyzer', 'cogs.commands', 'cogs.plugins', 'cogs.docs_rag']
 
 
 @bot.event

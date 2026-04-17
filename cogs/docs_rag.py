@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import math
@@ -6,23 +7,27 @@ import re
 
 import aiohttp
 import discord
+from cachetools import TTLCache
 from discord import app_commands
 from discord.ext import commands, tasks
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, RateLimitError
+
+from config import (
+    CHAT_MODEL,
+    COOLDOWN_PER,
+    COOLDOWN_RATE,
+    DOC_SOURCES,
+    DOCS_BASE_URL,
+    DOCS_BRANCH,
+    EMBEDDING_MODEL,
+    GITHUB_API,
+    OPENROUTER_API_KEY,
+    REINDEX_INTERVAL_HOURS,
+    RERANK_MODEL,
+    VECTOR_STORE_PATH,
+)
 
 logger = logging.getLogger(__name__)
-
-OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY')
-EMBEDDING_MODEL = os.getenv('EMBEDDING_MODEL', 'qwen/qwen3-embedding-8b')
-RERANK_MODEL = os.getenv('RERANK_MODEL', 'cohere/rerank-4-fast')
-CHAT_MODEL = os.getenv('CHAT_MODEL', 'google/gemini-2.5-flash-lite')
-DOCS_REPO = 'MinersRefuge/docs'
-DOCS_BRANCH = 'main'
-DOCS_BASE_URL = 'https://docs.minersrefuge.com.br'
-GITHUB_RAW = f'https://raw.githubusercontent.com/{DOCS_REPO}/{DOCS_BRANCH}'
-GITHUB_API = f'https://api.github.com/repos/{DOCS_REPO}'
-VECTOR_STORE_PATH = os.getenv('VECTOR_STORE_PATH', 'data/vectors.json')
-REINDEX_INTERVAL_HOURS = int(os.getenv('REINDEX_INTERVAL_HOURS', '6'))
 
 SYSTEM_PROMPT = (
     "Você é o assistente do Miners' Refuge, uma comunidade brasileira de administradores "
@@ -43,11 +48,53 @@ def cosine_similarity(a: list[float], b: list[float]) -> float:
     return dot / (norm_a * norm_b)
 
 
-def path_to_docs_url(path: str) -> str:
+def _parse_frontmatter(content: str) -> dict:
+    """Extract key-value pairs from YAML frontmatter (between --- delimiters)."""
+    if not content.startswith('---'):
+        return {}
+    end = content.find('\n---', 3)
+    if end == -1:
+        return {}
+    fm_text = content[3:end]
+    result = {}
+    for line in fm_text.splitlines():
+        m = re.match(r'^(\w+)\s*:\s*(.+)$', line)
+        if m:
+            result[m.group(1)] = m.group(2).strip().strip('"\'')
+    return result
+
+
+def _compute_doc_url(path: str, base_url: str, url_strip_prefix: str = '') -> str:
     """Convert a repo file path to its docs website URL."""
-    url = path.replace('.md', '').replace('README', '')
-    url = url.rstrip('/')
-    return f"{DOCS_BASE_URL}/{url}" if url else DOCS_BASE_URL
+    if url_strip_prefix and path.startswith(url_strip_prefix):
+        path = path[len(url_strip_prefix):]
+    # Strip extension (suffix only, longest first to avoid .mdx -> x)
+    for ext in ('.mdx', '.md'):
+        if path.endswith(ext):
+            path = path[:-len(ext)]
+            break
+    # Strip README only from the final path segment
+    if path.endswith('/README'):
+        path = path[:-len('/README')]
+    elif path == 'README':
+        path = ''
+    url = path.rstrip('/')
+    return f'{base_url}/{url}' if url else base_url
+
+
+def path_to_docs_url(path: str) -> str:
+    """Convert a MinersRefuge repo file path to its docs URL (backward compat)."""
+    return _compute_doc_url(path, DOCS_BASE_URL)
+
+
+def _truncate_safe(text: str, limit: int = 3800) -> str:
+    """Truncate text at the last newline before *limit* to avoid breaking markdown."""
+    if len(text) <= limit:
+        return text
+    idx = text.rfind('\n', 0, limit)
+    if idx == -1:
+        idx = limit
+    return text[:idx] + '\n\n...'
 
 
 class DocsRAG(commands.Cog):
@@ -55,16 +102,18 @@ class DocsRAG(commands.Cog):
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        self.client = AsyncOpenAI(
-            base_url='https://openrouter.ai/api/v1',
-            api_key=OPENROUTER_API_KEY,
-        )
+        self.client: AsyncOpenAI | None = None
+        if OPENROUTER_API_KEY:
+            self.client = AsyncOpenAI(
+                base_url='https://openrouter.ai/api/v1',
+                api_key=OPENROUTER_API_KEY,
+            )
         self.session: aiohttp.ClientSession | None = None
-        self.chunks: list[dict] = []  # {content, path, title, embedding}
+        self.chunks: list[dict] = []  # {content, path, title, embedding, source, doc_url}
         self._last_commit_sha: str | None = None
-        # Conversation history: message_id -> {question, answer, sources}
-        # Used for follow-up replies. Limited to last 100 entries.
-        self._conversations: dict[int, dict] = {}
+        self._indexing: bool = False
+        # TTL cache: max 200 conversations, each expires after 30 min
+        self._conversations: TTLCache = TTLCache(maxsize=200, ttl=1800)
 
     async def cog_load(self):
         self.session = aiohttp.ClientSession()
@@ -77,6 +126,19 @@ class DocsRAG(commands.Cog):
         self.periodic_reindex.cancel()
         if self.session:
             await self.session.close()
+
+    # --- Cooldown error handler ---
+
+    async def cog_app_command_error(
+        self, interaction: discord.Interaction, error: app_commands.AppCommandError
+    ):
+        if isinstance(error, app_commands.CommandOnCooldown):
+            await interaction.response.send_message(
+                f'⏳ Aguarde {error.retry_after:.0f}s antes de usar este comando novamente.',
+                ephemeral=True,
+            )
+        else:
+            raise error
 
     # --- Vector Storage ---
 
@@ -91,6 +153,8 @@ class DocsRAG(commands.Cog):
                     'path': c['path'],
                     'title': c['title'],
                     'embedding': c['embedding'],
+                    'source': c.get('source', "Miners' Refuge"),
+                    'doc_url': c.get('doc_url', path_to_docs_url(c['path'])),
                 }
                 for c in self.chunks
             ],
@@ -106,7 +170,12 @@ class DocsRAG(commands.Cog):
         try:
             with open(VECTOR_STORE_PATH, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-            self.chunks = data.get('chunks', [])
+            chunks = data.get('chunks', [])
+            # Backfill fields absent in older vector store formats
+            for chunk in chunks:
+                chunk.setdefault('source', "Miners' Refuge")
+                chunk.setdefault('doc_url', path_to_docs_url(chunk['path']))
+            self.chunks = chunks
             self._last_commit_sha = data.get('commit_sha')
             logger.info(
                 "Loaded %d vectors from disk (commit: %s)",
@@ -122,12 +191,12 @@ class DocsRAG(commands.Cog):
 
     @tasks.loop(hours=REINDEX_INTERVAL_HOURS)
     async def periodic_reindex(self):
-        """Check for doc updates and reindex if the repo has new commits."""
+        """Check for doc updates and reindex if the primary repo has new commits."""
         try:
             latest_sha = await self._get_latest_commit_sha()
             if latest_sha and latest_sha != self._last_commit_sha:
                 logger.info(
-                    "New commit detected (%s → %s), reindexing...",
+                    "New commit detected (%s -> %s), reindexing...",
                     self._last_commit_sha,
                     latest_sha,
                 )
@@ -142,7 +211,7 @@ class DocsRAG(commands.Cog):
         await self.bot.wait_until_ready()
 
     async def _get_latest_commit_sha(self) -> str | None:
-        """Fetch the latest commit SHA from the docs repo."""
+        """Fetch the latest commit SHA from the primary docs repo (MinersRefuge/docs)."""
         url = f'{GITHUB_API}/commits/{DOCS_BRANCH}'
         try:
             async with self.session.get(url) as resp:
@@ -165,10 +234,14 @@ class DocsRAG(commands.Cog):
         return None
 
     def _extract_paths(self, summary: str) -> list[str]:
-        paths = re.findall(r'\(([^)]+\.md)\)', summary)
+        # Exclude external URLs (http/https) -- only match relative .md paths
+        paths = re.findall(r'\((?!https?://)([^)]+\.md)\)', summary)
         return list(dict.fromkeys(paths))  # deduplicate preserving order
 
     def _extract_title(self, content: str) -> str:
+        fm = _parse_frontmatter(content)
+        if fm.get('title'):
+            return fm['title']
         match = re.search(r'^#\s+(.+)', content, re.MULTILINE)
         return match.group(1).strip() if match else ''
 
@@ -218,30 +291,121 @@ class DocsRAG(commands.Cog):
         )
         return [d.embedding for d in response.data]
 
-    async def index_docs(self):
-        """Fetch all docs from GitHub and create embeddings."""
-        logger.info("Indexing documentation from %s...", DOCS_REPO)
+    async def _fetch_doc(
+        self, path: str, github_raw: str, semaphore: asyncio.Semaphore
+    ) -> tuple[str, str | None]:
+        """Fetch a single doc file from the given GitHub raw base URL."""
+        async with semaphore:
+            content = await self._fetch(f'{github_raw}/{path}')
+        return path, content
 
-        summary = await self._fetch(f'{GITHUB_RAW}/SUMMARY.md')
-        if not summary:
-            logger.error("Failed to fetch SUMMARY.md — skipping indexing")
-            return
+    async def _get_paths_from_tree(
+        self, repo: str, branch: str, path_prefix: str = ''
+    ) -> list[str]:
+        """Use the GitHub tree API to discover .md/.mdx files under an optional prefix."""
+        url = f'https://api.github.com/repos/{repo}/git/trees/{branch}?recursive=1'
+        try:
+            async with self.session.get(url) as resp:
+                if resp.status != 200:
+                    logger.warning("Tree API returned %d for %s", resp.status, repo)
+                    return []
+                data = await resp.json()
+                tree = data.get('tree', [])
+                return [
+                    entry['path'] for entry in tree
+                    if entry.get('type') == 'blob'
+                    and (entry['path'].endswith('.md') or entry['path'].endswith('.mdx'))
+                    and (not path_prefix or entry['path'].startswith(path_prefix))
+                ]
+        except Exception:
+            logger.exception("Failed to get file tree for %s", repo)
+            return []
 
-        paths = self._extract_paths(summary)
-        paths.insert(0, 'README.md')
+    async def _index_source(
+        self, source: dict, semaphore: asyncio.Semaphore
+    ) -> list[dict]:
+        """Index one documentation source and return its text chunks (no embeddings yet)."""
+        repo = source['repo']
+        branch = source['branch']
+        base_url = source['base_url']
+        label = source['label']
+        github_raw = f'https://raw.githubusercontent.com/{repo}/{branch}'
+        url_strip_prefix = source.get('url_strip_prefix', '')
+        max_files = source.get('max_files', 200)
 
-        # Fetch all documents
-        all_chunks = []
+        # Discover file paths
+        summary_path = source.get('summary')
+        if summary_path:
+            summary = await self._fetch(f'{github_raw}/{summary_path}')
+            if not summary:
+                logger.error(
+                    "Failed to fetch %s from %s -- skipping source", summary_path, repo
+                )
+                return []
+            paths = self._extract_paths(summary)
+            paths.insert(0, 'README.md')
+        else:
+            path_prefix = source.get('path_prefix', '')
+            paths = await self._get_paths_from_tree(repo, branch, path_prefix)
+
+        paths = paths[:max_files]
+        if not paths:
+            logger.warning("No paths found for source '%s'", label)
+            return []
+
+        # Fetch documents concurrently (bounded by the shared semaphore)
+        fetch_tasks = [self._fetch_doc(p, github_raw, semaphore) for p in paths]
+        results = await asyncio.gather(*fetch_tasks)
+
+        chunks = []
         fetched = 0
-        for path in paths:
-            content = await self._fetch(f'{GITHUB_RAW}/{path}')
+        for path, content in results:
             if content:
-                chunks = self._chunk_text(content, path)
-                all_chunks.extend(chunks)
+                fm = _parse_frontmatter(content)
+                slug = fm.get('slug')
+                if slug:
+                    doc_url = f'{base_url}/{slug}'
+                else:
+                    doc_url = _compute_doc_url(path, base_url, url_strip_prefix)
+                for chunk in self._chunk_text(content, path):
+                    chunk['source'] = label
+                    chunk['doc_url'] = doc_url
+                    chunks.append(chunk)
                 fetched += 1
 
-        logger.info("Fetched %d/%d docs, created %d chunks", fetched, len(paths), len(all_chunks))
+        logger.info(
+            "Source '%s': fetched %d/%d docs, %d chunks",
+            label, fetched, len(paths), len(chunks),
+        )
+        return chunks
 
+    async def index_docs(self):
+        """Fetch all docs from all configured sources and create embeddings."""
+        if self._indexing:
+            logger.info("index_docs() called while already indexing; skipping")
+            return
+        self._indexing = True
+        try:
+            await self._index_docs_inner()
+        finally:
+            self._indexing = False
+
+    async def _index_docs_inner(self):
+        logger.info("Indexing %d documentation source(s)...", len(DOC_SOURCES))
+
+        # All sources share a semaphore to cap total concurrent HTTP fetches
+        semaphore = asyncio.Semaphore(5)
+        source_tasks = [self._index_source(src, semaphore) for src in DOC_SOURCES]
+        source_results = await asyncio.gather(*source_tasks, return_exceptions=True)
+
+        all_chunks = []
+        for src, result in zip(DOC_SOURCES, source_results, strict=True):
+            if isinstance(result, Exception):
+                logger.error("Error indexing source '%s': %s", src['label'], result)
+            else:
+                all_chunks.extend(result)
+
+        logger.info("Total chunks before embedding: %d", len(all_chunks))
         if not all_chunks:
             return
 
@@ -260,7 +424,7 @@ class DocsRAG(commands.Cog):
         self.chunks = [c for c in all_chunks if 'embedding' in c]
         logger.info("Documentation indexed: %d chunks with embeddings", len(self.chunks))
 
-        # Save commit SHA and persist vectors
+        # Track primary source commit SHA and persist
         self._last_commit_sha = await self._get_latest_commit_sha()
         self._save_vectors()
 
@@ -324,35 +488,43 @@ class DocsRAG(commands.Cog):
     # --- Slash Commands ---
 
     @app_commands.command(name='ask', description='Pergunte algo sobre administração de servidores Minecraft')
+    @app_commands.checks.cooldown(COOLDOWN_RATE, COOLDOWN_PER)
     @app_commands.describe(
-        pergunta='Sua pergunta',
-        imagem='Imagem/screenshot para análise (opcional)',
+        question='Sua pergunta',
+        image='Imagem/screenshot para análise (opcional)',
     )
     async def ask(
         self,
         interaction: discord.Interaction,
-        pergunta: str,
-        imagem: discord.Attachment | None = None,
+        question: str,
+        image: discord.Attachment | None = None,
     ):
-        if not OPENROUTER_API_KEY:
+        if not self.client:
             await interaction.response.send_message(
                 '⚠️ Comando indisponível: chave de API não configurada.', ephemeral=True
             )
             return
 
+        if self._indexing:
+            await interaction.response.send_message(
+                '📚 A documentação está sendo indexada, tente novamente em alguns instantes.',
+                ephemeral=True,
+            )
+            return
+
         image_url = None
-        if imagem:
-            if not imagem.content_type or not imagem.content_type.startswith('image/'):
+        if image:
+            if not image.content_type or not image.content_type.startswith('image/'):
                 await interaction.response.send_message(
                     'O arquivo enviado não é uma imagem válida.', ephemeral=True
                 )
                 return
-            image_url = imagem.url
+            image_url = image.url
 
         await interaction.response.defer(thinking=True)
 
         try:
-            results = await self.search(pergunta)
+            results = await self.search(question)
 
             if not results:
                 await interaction.followup.send(
@@ -361,12 +533,16 @@ class DocsRAG(commands.Cog):
                 )
                 return
 
-            answer, embed = await self._build_answer(pergunta, results, image_url=image_url)
+            answer, embed = await self._build_answer(question, results, image_url=image_url)
             msg = await interaction.followup.send(embed=embed, wait=True)
 
             # Store conversation for follow-ups
-            self._store_conversation(msg.id, pergunta, answer, results)
+            self._store_conversation(msg.id, question, answer, results)
 
+        except RateLimitError:
+            await interaction.followup.send(
+                '⏳ Limite de requisições atingido. Tente novamente em alguns minutos.'
+            )
         except Exception:
             logger.exception("Error in /ask command")
             await interaction.followup.send(
@@ -383,9 +559,9 @@ class DocsRAG(commands.Cog):
         """Generate an answer from search results and return (raw_answer, embed)."""
         context_parts = []
         for r in results:
-            url = path_to_docs_url(r['path'])
+            doc_url = r.get('doc_url', path_to_docs_url(r['path']))
             context_parts.append(
-                f"[Fonte: {r['title']} — {url}]\n{r['content']}"
+                f"[Fonte: {r['title']} -- {doc_url}]\n{r['content']}"
             )
         context = '\n\n---\n\n'.join(context_parts)
 
@@ -418,8 +594,7 @@ class DocsRAG(commands.Cog):
         )
 
         answer = response.choices[0].message.content
-        if len(answer) > 3800:
-            answer = answer[:3800] + '...'
+        answer = _truncate_safe(answer)
 
         embed = discord.Embed(
             title=f'❓ {question}',
@@ -432,9 +607,10 @@ class DocsRAG(commands.Cog):
         for r in results:
             if r['path'] not in seen_paths:
                 seen_paths.add(r['path'])
-                url = path_to_docs_url(r['path'])
+                doc_url = r.get('doc_url', path_to_docs_url(r['path']))
                 title = r['title'] or r['path']
-                source_lines.append(f'• [{title}]({url})')
+                source_label = r.get('source', "Miners' Refuge")
+                source_lines.append(f'• [{title}]({doc_url}) — {source_label}')
             if len(source_lines) >= 8:
                 break
 
@@ -443,18 +619,14 @@ class DocsRAG(commands.Cog):
             value='\n'.join(source_lines),
             inline=False,
         )
-        embed.set_footer(text=f'Miners\' Refuge Docs • {DOCS_BASE_URL} • Responda a esta mensagem para continuar')
+        embed.set_footer(
+            text=f"Documentação • {DOCS_BASE_URL} • 💬 Responda a esta mensagem para continuar a conversa"
+        )
 
         return answer, embed
 
     def _store_conversation(self, message_id: int, question: str, answer: str, results: list[dict]):
         """Store a conversation exchange for follow-up replies."""
-        # Evict old entries if cache is too large
-        if len(self._conversations) > 100:
-            oldest = sorted(self._conversations.keys())[:50]
-            for k in oldest:
-                del self._conversations[k]
-
         self._conversations[message_id] = {
             'question': question,
             'answer': answer,
@@ -514,6 +686,10 @@ class DocsRAG(commands.Cog):
                     'answer': answer,
                     'history': history,
                 }
+            except RateLimitError:
+                await message.reply(
+                    '⏳ Limite de requisições atingido. Tente novamente em alguns minutos.'
+                )
             except Exception:
                 logger.exception("Error in follow-up reply")
                 await message.reply(
@@ -523,6 +699,12 @@ class DocsRAG(commands.Cog):
     @app_commands.command(name='reindex', description='Re-indexar a documentação (Admin)')
     @app_commands.checks.has_permissions(administrator=True)
     async def reindex(self, interaction: discord.Interaction):
+        if self._indexing:
+            await interaction.response.send_message(
+                '📚 Já há uma indexação em andamento, aguarde a conclusão.',
+                ephemeral=True,
+            )
+            return
         await interaction.response.defer(thinking=True)
         await self.index_docs()
         await interaction.followup.send(
@@ -532,6 +714,6 @@ class DocsRAG(commands.Cog):
 
 async def setup(bot: commands.Bot):
     if not OPENROUTER_API_KEY:
-        logger.warning("OPENROUTER_API_KEY not set — DocsRAG cog will not be loaded")
+        logger.warning("OPENROUTER_API_KEY not set -- DocsRAG cog will not be loaded")
         return
     await bot.add_cog(DocsRAG(bot))

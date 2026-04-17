@@ -4,6 +4,8 @@ import re
 # Each tuple: (compiled_regex, response_template)
 patterns = []
 
+# Order matters: the first matching pattern wins. More specific patterns should
+# appear before generic ones within each category.
 _raw_patterns = {
     # === Plugin Errors ===
     r"Ambiguous plugin name `(\S+)' for files `(plugins\/[^\']+)' and `(plugins\/[^\']+)' in `plugins'":

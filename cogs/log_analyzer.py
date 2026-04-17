@@ -1,24 +1,26 @@
 import logging
-import os
 import re
 
 import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import commands
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, RateLimitError
 
+from config import (
+    CHAT_MODEL,
+    COOLDOWN_PER,
+    COOLDOWN_RATE,
+    MAX_CONTENT_SIZE,
+    MAX_LOG_CONTEXT,
+    OPENROUTER_API_KEY,
+)
 from responses.errors import patterns
 
 logger = logging.getLogger(__name__)
 
-OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY')
-CHAT_MODEL = os.getenv('CHAT_MODEL', 'google/gemini-2.5-flash-lite')
-
-MCLO_GS_PATTERN = re.compile(r'https://mclo\.gs/\w+')
+MCLO_GS_PATTERN = re.compile(r'https://mclo\.gs/(\w+)')
 PASTEBIN_PATTERN = re.compile(r'https://pastebin\.com/(\w+)')
-MAX_CONTENT_SIZE = 5 * 1024 * 1024  # 5MB limit
-MAX_LOG_CONTEXT = 12000  # Max characters sent to the LLM
 
 ANALYZE_SYSTEM_PROMPT = (
     "Você é um especialista em administração de servidores Minecraft. "
@@ -39,6 +41,55 @@ ANALYZE_SYSTEM_PROMPT = (
     "Seja direto e prático. Não invente problemas que não existem no log."
 )
 
+# Minimum message length to run pattern matching against (skip trivial messages)
+_MIN_PATTERN_LENGTH = 20
+
+# Lines matching these patterns are kept when filtering large logs
+_LOG_ERROR_PATTERN = re.compile(
+    r'\b(ERROR|WARN|Exception|Caused by|at [a-z][\w.$]+\()',
+    re.IGNORECASE,
+)
+# Number of header lines (startup info: version, plugins) always kept
+_LOG_HEADER_LINES = 60
+
+
+def _sanitize_log_content(text: str) -> str:
+    """Strip non-printable characters from log content, keeping newlines and tabs."""
+    return re.sub(r'[^\x09\x0a\x0d\x20-\x7e\x80-\uffff]', '', text)
+
+
+def _extract_relevant_lines(text: str, limit: int = MAX_LOG_CONTEXT) -> str:
+    """Extract meaningful lines from an oversized log.
+
+    Keeps the first ``_LOG_HEADER_LINES`` lines (server startup, plugin list)
+    plus every line that matches an error/warning/exception pattern.  This
+    gives the LLM more signal per token than naive head+tail truncation.
+    Falls back to head+tail if the filtered result still exceeds ``limit``.
+    """
+    lines = text.splitlines(keepends=True)
+    header = lines[:_LOG_HEADER_LINES]
+    relevant = [l for l in lines[_LOG_HEADER_LINES:] if _LOG_ERROR_PATTERN.search(l)]
+    filtered = (
+        ''.join(header)
+        + '\n[... linhas informativas omitidas — exibindo apenas erros e avisos ...]\n\n'
+        + ''.join(relevant)
+    )
+    if len(filtered) <= limit:
+        return filtered
+    # Filtered result is still too large: head + tail of *filtered* text
+    half = limit // 2
+    return filtered[:half] + '\n\n[... truncado ...]\n\n' + filtered[-half:]
+
+
+def _truncate_safe(text: str, limit: int = 3800) -> str:
+    """Truncate text at the last newline before *limit* to avoid breaking markdown."""
+    if len(text) <= limit:
+        return text
+    idx = text.rfind('\n', 0, limit)
+    if idx == -1:
+        idx = limit
+    return text[:idx] + '\n\n*...análise truncada*'
+
 
 def check_message(content: str) -> str | None:
     """Check message content against known error patterns."""
@@ -47,6 +98,21 @@ def check_message(content: str) -> str | None:
         if match:
             return response_template.format(*match.groups())
     return None
+
+
+def _parse_link(text: str) -> tuple[str | None, str | None]:
+    """Parse a paste-service URL and return (fetch_url, display_url).
+
+    For mclo.gs links the fetch URL points to the raw API endpoint.
+    """
+    mclogs_match = MCLO_GS_PATTERN.search(text)
+    if mclogs_match:
+        paste_id = mclogs_match.group(1)
+        return f'https://api.mclo.gs/1/raw/{paste_id}', mclogs_match.group(0)
+    pastebin_match = PASTEBIN_PATTERN.search(text)
+    if pastebin_match:
+        return f'https://pastebin.com/raw/{pastebin_match.group(1)}', None
+    return None, None
 
 
 class LogAnalyzer(commands.Cog):
@@ -69,20 +135,53 @@ class LogAnalyzer(commands.Cog):
         if self.session:
             await self.session.close()
 
-    async def read_file_content(self, url: str) -> str | None:
-        """Fetch text content from a URL with size limit."""
+    # --- Cooldown error handler ---
+
+    async def cog_app_command_error(
+        self, interaction: discord.Interaction, error: app_commands.AppCommandError
+    ):
+        if isinstance(error, app_commands.CommandOnCooldown):
+            await interaction.response.send_message(
+                f'⏳ Aguarde {error.retry_after:.0f}s antes de usar este comando novamente.',
+                ephemeral=True,
+            )
+        else:
+            raise error
+
+    # --- HTTP helpers ---
+
+    async def read_file_content(self, url: str) -> tuple[str | None, bool]:
+        """Fetch text content from a URL, streaming up to MAX_CONTENT_SIZE.
+
+        Returns ``(content, truncated)``.
+        *content* is ``None`` only on a genuine fetch failure (non-200, network
+        error).  When the source is larger than the limit the first
+        ``MAX_CONTENT_SIZE`` bytes are returned and *truncated* is ``True``.
+        """
         try:
             async with self.session.get(url) as resp:
                 if resp.status != 200:
-                    return None
-                content_length = resp.headers.get('Content-Length')
-                if content_length and int(content_length) > MAX_CONTENT_SIZE:
-                    logger.warning("Content too large from %s (%s bytes)", url, content_length)
-                    return None
-                return await resp.text()
+                    return None, False
+                chunks: list[bytes] = []
+                total = 0
+                truncated = False
+                async for chunk in resp.content.iter_chunked(64 * 1024):
+                    remaining = MAX_CONTENT_SIZE - total
+                    if remaining <= 0:
+                        truncated = True
+                        break
+                    if len(chunk) > remaining:
+                        chunks.append(chunk[:remaining])
+                        truncated = True
+                        break
+                    chunks.append(chunk)
+                    total += len(chunk)
+                if truncated:
+                    logger.warning("Content from %s truncated at %d bytes", url, MAX_CONTENT_SIZE)
+                return b''.join(chunks).decode('utf-8', errors='replace'), truncated
         except Exception:
             logger.exception("Failed to fetch content from %s", url)
-            return None
+            return None, False
 
     async def upload_mclogs(self, content: str) -> str | None:
         """Upload log content to mclo.gs and return the URL."""
@@ -98,45 +197,56 @@ class LogAnalyzer(commands.Cog):
             logger.exception("Failed to upload to mclo.gs")
         return None
 
+    # --- Passive message listener ---
+
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
         if message.author.bot:
             return
 
-        response = check_message(message.content)
+        has_attachments = bool(message.attachments)
+        content = message.content
+
+        # Quick pre-filter: skip short messages without attachments or URLs
+        if len(content) < _MIN_PATTERN_LENGTH and not has_attachments:
+            if 'mclo.gs/' not in content and 'pastebin.com/' not in content:
+                return
+
+        response = check_message(content)
 
         # Check for paste service links
-        link = None
-        mclogs_match = MCLO_GS_PATTERN.search(message.content)
-        pastebin_match = PASTEBIN_PATTERN.search(message.content)
+        fetch_url, mclogs_url = _parse_link(content)
 
-        if mclogs_match:
-            link = mclogs_match.group(0)
-        elif pastebin_match:
-            link = f'https://pastebin.com/raw/{pastebin_match.group(1)}'
-
-        if link:
+        if fetch_url:
             await message.add_reaction('👀')
-            link_content = await self.read_file_content(link)
+            link_content, _ = await self.read_file_content(fetch_url)
             if link_content and not response:
                 response = check_message(link_content)
 
         # Check file attachments
-        if message.attachments:
+        if has_attachments:
             for attachment in message.attachments:
                 if attachment.filename.endswith(('.txt', '.log')):
-                    file_content = await self.read_file_content(attachment.url)
+                    file_content, was_truncated = await self.read_file_content(attachment.url)
                     if file_content:
                         if not response:
                             response = check_message(file_content)
-                        upload_link = await self.upload_mclogs(file_content)
-                        if upload_link:
+                        mclogs_url = await self.upload_mclogs(file_content)
+                        if mclogs_url:
+                            note = (
+                                ' ⚠️ O arquivo era muito grande — apenas os primeiros '
+                                f'{MAX_CONTENT_SIZE // (1024 * 1024)} MB foram lidos.'
+                                if was_truncated else ''
+                            )
                             await message.reply(
                                 f'Na próxima vez busque utilizar um serviço para enviar suas logs, '
-                                f'como o mclo.gs, fiz o upload para você <3:\n<{upload_link}>'
+                                f'como o mclo.gs, fiz o upload para você <3:\n<{mclogs_url}>{note}'
                             )
                         else:
-                            await message.reply('Algo deu errado ao tentar fazer o upload para o mclo.gs.')
+                            await message.reply(
+                                'Não consegui fazer o upload para o mclo.gs. '
+                                'Você pode enviar manualmente em https://mclo.gs'
+                            )
                         if response:
                             break
 
@@ -155,14 +265,9 @@ class LogAnalyzer(commands.Cog):
         user_parts = []
 
         if log_content:
-            # Truncate if too long, keeping start and end (most useful parts)
+            log_content = _sanitize_log_content(log_content)
             if len(log_content) > MAX_LOG_CONTEXT:
-                half = MAX_LOG_CONTEXT // 2
-                log_content = (
-                    log_content[:half]
-                    + '\n\n[... log truncado ...]\n\n'
-                    + log_content[-half:]
-                )
+                log_content = _extract_relevant_lines(log_content, MAX_LOG_CONTEXT)
             user_parts.append({'type': 'text', 'text': f"Analise este log:\n\n```\n{log_content}\n```"})
 
         if image_url:
@@ -179,29 +284,26 @@ class LogAnalyzer(commands.Cog):
         else:
             messages.append({'role': 'user', 'content': user_parts[0]['text']})
 
-        try:
-            response = await self.ai_client.chat.completions.create(
-                model=CHAT_MODEL,
-                messages=messages,
-                max_tokens=1500,
-            )
-            return response.choices[0].message.content
-        except Exception:
-            logger.exception("AI log analysis failed")
-            return None
+        response = await self.ai_client.chat.completions.create(
+            model=CHAT_MODEL,
+            messages=messages,
+            max_tokens=1500,
+        )
+        return response.choices[0].message.content
 
     @app_commands.command(name='analyze', description='Analisa um log de servidor Minecraft com IA')
+    @app_commands.checks.cooldown(COOLDOWN_RATE, COOLDOWN_PER)
     @app_commands.describe(
         log_link='Link do mclo.gs ou pastebin com o log',
         log_file='Arquivo .log ou .txt para analisar',
-        imagem='Screenshot de erro/log para análise visual (opcional)',
+        image='Screenshot de erro/log para análise visual (opcional)',
     )
     async def analyze(
         self,
         interaction: discord.Interaction,
         log_link: str | None = None,
         log_file: discord.Attachment | None = None,
-        imagem: discord.Attachment | None = None,
+        image: discord.Attachment | None = None,
     ):
         if not self.ai_client:
             await interaction.response.send_message(
@@ -209,64 +311,71 @@ class LogAnalyzer(commands.Cog):
             )
             return
 
-        if not log_link and not log_file and not imagem:
+        if not log_link and not log_file and not image:
             await interaction.response.send_message(
                 'Forneça um link (mclo.gs/pastebin), um arquivo (.log/.txt), ou uma imagem.', ephemeral=True
             )
             return
 
         image_url = None
-        if imagem:
-            if not imagem.content_type or not imagem.content_type.startswith('image/'):
+        if image:
+            if not image.content_type or not image.content_type.startswith('image/'):
                 await interaction.response.send_message(
                     'O arquivo enviado não é uma imagem válida.', ephemeral=True
                 )
                 return
-            image_url = imagem.url
+            image_url = image.url
+
+        # Validate link format *before* deferring so invalid links fail fast
+        fetch_url = None
+        mclogs_url = None
+        if log_link:
+            fetch_url, mclogs_url = _parse_link(log_link)
+            if not fetch_url:
+                await interaction.response.send_message(
+                    'Link não reconhecido. Use um link do mclo.gs ou pastebin.com.',
+                    ephemeral=True,
+                )
+                return
 
         await interaction.response.defer(thinking=True)
 
         log_content = None
-        mclogs_url = None
+        content_truncated = False
 
         if log_file:
             if not log_file.filename.endswith(('.txt', '.log')):
-                await interaction.followup.send('Formato não suportado. Envie um arquivo `.log` ou `.txt`.')
-                return
-            log_content = await self.read_file_content(log_file.url)
-            # Also upload to mclo.gs for reference
-            if log_content:
-                mclogs_url = await self.upload_mclogs(log_content)
-        elif log_link:
-            # Parse the link
-            mclogs_match = MCLO_GS_PATTERN.search(log_link)
-            pastebin_match = PASTEBIN_PATTERN.search(log_link)
-            if mclogs_match:
-                url = mclogs_match.group(0)
-                mclogs_url = url
-            elif pastebin_match:
-                url = f'https://pastebin.com/raw/{pastebin_match.group(1)}'
-                mclogs_url = None
-            else:
                 await interaction.followup.send(
-                    'Link não reconhecido. Use um link do mclo.gs ou pastebin.com.'
+                    'Formato não suportado. Envie um arquivo `.log` ou `.txt`.', ephemeral=True
                 )
                 return
-            log_content = await self.read_file_content(url)
+            log_content, content_truncated = await self.read_file_content(log_file.url)
+            if log_content:
+                mclogs_url = await self.upload_mclogs(log_content)
+        elif fetch_url:
+            log_content, content_truncated = await self.read_file_content(fetch_url)
 
         if not log_content and not image_url:
             await interaction.followup.send('Não foi possível ler o conteúdo do log.')
             return
 
-        analysis = await self._analyze_with_ai(log_content=log_content, image_url=image_url)
+        try:
+            analysis = await self._analyze_with_ai(log_content=log_content, image_url=image_url)
+        except RateLimitError:
+            await interaction.followup.send(
+                '⏳ Limite de requisições atingido. Tente novamente em alguns minutos.'
+            )
+            return
+        except Exception:
+            logger.exception("AI log analysis failed")
+            await interaction.followup.send('Ocorreu um erro ao analisar o log. Tente novamente.')
+            return
 
         if not analysis:
             await interaction.followup.send('Ocorreu um erro ao analisar o log. Tente novamente.')
             return
 
-        # Truncate if too long for embed
-        if len(analysis) > 3800:
-            analysis = analysis[:3800] + '\n\n*...análise truncada*'
+        analysis = _truncate_safe(analysis)
 
         embed = discord.Embed(
             title='🔬 Análise de Log',
@@ -276,10 +385,19 @@ class LogAnalyzer(commands.Cog):
 
         if log_file:
             embed.add_field(name='Arquivo', value=log_file.filename, inline=True)
-        if imagem:
-            embed.set_thumbnail(url=imagem.url)
+        if image:
+            embed.set_thumbnail(url=image.url)
         if mclogs_url:
             embed.add_field(name='mclo.gs', value=f'[Ver log]({mclogs_url})', inline=True)
+        if content_truncated:
+            embed.add_field(
+                name='⚠️ Log muito grande',
+                value=(
+                    f'O arquivo excede {MAX_CONTENT_SIZE // (1024 * 1024)} MB. '
+                    'A análise foi feita sobre os erros e avisos extraídos do início do log.'
+                ),
+                inline=False,
+            )
 
         embed.set_footer(text='Análise gerada por IA • Sempre verifique manualmente')
         await interaction.followup.send(embed=embed)
