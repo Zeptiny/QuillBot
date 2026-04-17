@@ -58,6 +58,15 @@ DOC_SOURCES: Final[list[dict]] = [
         'url_strip_prefix': 'src/content/docs/',
         'max_files': 400,
     },
+    {
+        'repo': 'PurpurMC/PurpurDocs',
+        'branch': 'main',
+        'base_url': 'https://purpurmc.org/docs/purpur/',
+        'label': 'PurpurMC',
+        'path_prefix': 'mkdocs/purpur/',
+        'url_strip_prefix': 'mkdocs/purpur/',
+        'max_files': 400,
+    },
 ]
 
 

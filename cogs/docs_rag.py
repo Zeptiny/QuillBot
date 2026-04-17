@@ -64,8 +64,17 @@ def _parse_frontmatter(content: str) -> dict:
     return result
 
 
+def _title_from_path(path: str) -> str:
+    """Derive a human-readable title from a file path as a last resort."""
+    name = path.rsplit('/', 1)[-1]
+    name = re.sub(r'\.(md|mdx)$', '', name)
+    name = re.sub(r'[-_]', ' ', name)
+    return name.title()
+
+
 def _compute_doc_url(path: str, base_url: str, url_strip_prefix: str = '') -> str:
     """Convert a repo file path to its docs website URL."""
+    base_url = base_url.rstrip('/')
     if url_strip_prefix and path.startswith(url_strip_prefix):
         path = path[len(url_strip_prefix):]
     # Strip extension (suffix only, longest first to avoid .mdx -> x)
@@ -73,10 +82,12 @@ def _compute_doc_url(path: str, base_url: str, url_strip_prefix: str = '') -> st
         if path.endswith(ext):
             path = path[:-len(ext)]
             break
-    # Strip README only from the final path segment
-    if path.endswith('/README'):
-        path = path[:-len('/README')]
-    elif path == 'README':
+    # Strip README and index from the final path segment (mdBook / MkDocs conventions)
+    for index_name in ('/README', '/index'):
+        if path.endswith(index_name):
+            path = path[:-len(index_name)]
+            break
+    if path in ('README', 'index'):
         path = ''
     url = path.rstrip('/')
     return f'{base_url}/{url}' if url else base_url
@@ -608,7 +619,7 @@ class DocsRAG(commands.Cog):
             if r['path'] not in seen_paths:
                 seen_paths.add(r['path'])
                 doc_url = r.get('doc_url', path_to_docs_url(r['path']))
-                title = r['title'] or r['path']
+                title = r['title'] or _title_from_path(r['path'])
                 source_label = r.get('source', "Miners' Refuge")
                 source_lines.append(f'• [{title}]({doc_url}) — {source_label}')
             if len(source_lines) >= 8:
