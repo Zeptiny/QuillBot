@@ -4,6 +4,7 @@ import logging
 import math
 import os
 import re
+import urllib.parse
 
 import aiohttp
 import discord
@@ -29,14 +30,70 @@ from config import (
 
 logger = logging.getLogger(__name__)
 
+MODRINTH_API = 'https://api.modrinth.com/v2'
+HANGAR_API = 'https://hangar.papermc.io/api/v1'
+SPIGET_API = 'https://api.spiget.org/v2'
+_HTTP_HEADERS = {'User-Agent': 'QuillBot/1.0 (github.com/Zeptiny/QuillBot)'}
+
+MAX_TOOL_ROUNDS = 4  # Safety cap on tool-calling iterations
+
 SYSTEM_PROMPT = (
     "Você é o assistente do Miners' Refuge, uma comunidade brasileira de administradores "
-    "de servidores Minecraft. Responda em português brasileiro, de forma clara e concisa. "
-    "Use APENAS as informações fornecidas no contexto da documentação abaixo. "
-    "Se a resposta não estiver no contexto, diga que não encontrou na documentação "
-    f"e sugira visitar {DOCS_BASE_URL}. "
-    "NÃO inclua uma seção de fontes na sua resposta — as fontes são exibidas automaticamente."
+    "de servidores Minecraft. Responda em português brasileiro, de forma clara e concisa.\n\n"
+    "REGRAS:\n"
+    "1. Use as ferramentas disponíveis para buscar informações antes de responder.\n"
+    "2. Se a pergunta for vaga ou ambígua, responda diretamente pedindo esclarecimentos "
+    "— NÃO chame ferramentas.\n"
+    "3. Use APENAS informações retornadas pelas ferramentas. Se nenhuma ferramenta retornar "
+    f"dados relevantes, diga que não encontrou e sugira visitar {DOCS_BASE_URL}.\n"
+    "4. NÃO inclua uma seção de fontes na sua resposta — as fontes são exibidas automaticamente.\n"
+    "5. Se for útil, termine sua resposta com uma sugestão de pergunta de acompanhamento "
+    "na linha final, prefixada com '💡 '."
 )
+
+# --- Tool definitions for the LLM (OpenAI function-calling format) ---
+TOOLS = [
+    {
+        'type': 'function',
+        'function': {
+            'name': 'search_docs',
+            'description': (
+                'Pesquisa na documentação do Miners\' Refuge, PaperMC e PurpurMC. '
+                'Use para qualquer pergunta sobre configuração, administração ou setup de servidores Minecraft.'
+            ),
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'query': {
+                        'type': 'string',
+                        'description': 'A consulta de busca em linguagem natural.',
+                    },
+                },
+                'required': ['query'],
+            },
+        },
+    },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'search_plugins',
+            'description': (
+                'Pesquisa plugins no Modrinth, Hangar e SpigotMC. '
+                'Use quando o usuário perguntar sobre plugins, recomendações de plugins ou alternativas.'
+            ),
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'query': {
+                        'type': 'string',
+                        'description': 'Nome ou descrição do plugin a pesquisar.',
+                    },
+                },
+                'required': ['query'],
+            },
+        },
+    },
+]
 
 
 def cosine_similarity(a: list[float], b: list[float]) -> float:
@@ -535,20 +592,9 @@ class DocsRAG(commands.Cog):
         await interaction.response.defer(thinking=True)
 
         try:
-            results = await self.search(question)
-
-            if not results:
-                await interaction.followup.send(
-                    'Não encontrei informações relevantes na documentação. '
-                    f'Tente pesquisar diretamente em {DOCS_BASE_URL}'
-                )
-                return
-
-            answer, embed = await self._build_answer(question, results, image_url=image_url)
+            answer, embed = await self._run_agent(question, image_url=image_url)
             msg = await interaction.followup.send(embed=embed, wait=True)
-
-            # Store conversation for follow-ups
-            self._store_conversation(msg.id, question, answer, results)
+            self._store_conversation(msg.id, question, answer)
 
         except RateLimitError:
             await interaction.followup.send(
@@ -560,51 +606,198 @@ class DocsRAG(commands.Cog):
                 'Ocorreu um erro ao processar sua pergunta. Tente novamente mais tarde.'
             )
 
-    async def _build_answer(
+    # --- Tool execution ---
+
+    async def _exec_tool(self, name: str, args: dict) -> tuple[str, list[dict]]:
+        """Execute a tool call and return (result_text, source_chunks)."""
+        if name == 'search_docs':
+            query = args.get('query', '')
+            results = await self.search(query)
+            if not results:
+                return 'Nenhum resultado encontrado na documentação.', []
+            parts = []
+            for r in results:
+                doc_url = r.get('doc_url', path_to_docs_url(r['path']))
+                parts.append(f"[Fonte: {r['title']} — {doc_url}]\n{r['content']}")
+            return '\n\n---\n\n'.join(parts), results
+
+        if name == 'search_plugins':
+            query = args.get('query', '')
+            results = await self._search_plugins_all(query)
+            if not results:
+                return 'Nenhum plugin encontrado.', []
+            lines = []
+            for r in results[:6]:
+                versions = ', '.join(str(v) for v in r.get('versions', [])[:3]) or '—'
+                lines.append(
+                    f"**{r['name']}** ({r['source']}) — {r.get('description', '')}\n"
+                    f"Downloads: {r.get('downloads', 0):,} | Versões: {versions}\n"
+                    f"URL: {r['url']}"
+                )
+            return '\n\n'.join(lines), []
+
+        return f'Ferramenta desconhecida: {name}', []
+
+    async def _search_plugins_all(self, query: str) -> list[dict]:
+        """Search Modrinth, Hangar, and Spiget concurrently."""
+        modrinth, hangar = await asyncio.gather(
+            self._search_modrinth(query),
+            self._search_hangar(query),
+        )
+        results = modrinth + hangar
+        if not results:
+            results = await self._search_spiget(query)
+        return results
+
+    async def _search_modrinth(self, name: str) -> list[dict]:
+        params = {
+            'query': name,
+            'limit': 3,
+            'facets': json.dumps([['project_type:plugin']]),
+        }
+        data = await self._api_get_json(f'{MODRINTH_API}/search', params=params)
+        if not data:
+            return []
+        results = []
+        for hit in data.get('hits', [])[:3]:
+            game_versions = hit.get('versions', [])
+            slug_or_id = hit.get('slug') or hit.get('project_id', '')
+            results.append({
+                'name': hit.get('title', '?'),
+                'author': hit.get('author', '?'),
+                'description': hit.get('description', '')[:100],
+                'downloads': hit.get('downloads', 0),
+                'url': f'https://modrinth.com/project/{slug_or_id}',
+                'versions': game_versions[-3:] if game_versions else [],
+                'source': 'Modrinth',
+            })
+        return results
+
+    async def _search_hangar(self, name: str) -> list[dict]:
+        params = {'q': name, 'limit': 3}
+        data = await self._api_get_json(f'{HANGAR_API}/projects', params=params)
+        if not data:
+            return []
+        results = []
+        for project in data.get('result', [])[:3]:
+            ns = project.get('namespace', {})
+            owner = ns.get('owner', '?')
+            slug = ns.get('slug', '')
+            results.append({
+                'name': project.get('name', '?'),
+                'author': owner,
+                'description': project.get('description', '')[:100],
+                'downloads': project.get('stats', {}).get('downloads', 0),
+                'url': f'https://hangar.papermc.io/{owner}/{slug}',
+                'versions': [],
+                'source': 'Hangar',
+            })
+        return results
+
+    async def _search_spiget(self, name: str) -> list[dict]:
+        encoded = urllib.parse.quote(name)
+        data = await self._api_get_json(
+            f'{SPIGET_API}/search/resources/{encoded}'
+            '?sort=-downloads&size=3&fields=id,name,downloads,testedVersions'
+        )
+        if not isinstance(data, list):
+            return []
+        results = []
+        for res in data[:3]:
+            res_id = res.get('id', '')
+            results.append({
+                'name': res.get('name', '?'),
+                'author': '?',
+                'description': '',
+                'downloads': res.get('downloads', 0),
+                'url': f'https://www.spigotmc.org/resources/{res_id}',
+                'versions': res.get('testedVersions', [])[:3],
+                'source': 'SpigotMC',
+            })
+        return results
+
+    async def _api_get_json(self, url: str, **kwargs) -> dict | list | None:
+        """Fetch JSON from an external API with User-Agent header."""
+        try:
+            async with self.session.get(url, headers=_HTTP_HEADERS, **kwargs) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+                logger.warning("GET %s returned %d", url, resp.status)
+        except Exception:
+            logger.exception("Failed to fetch %s", url)
+        return None
+
+    # --- Agentic loop ---
+
+    async def _run_agent(
         self,
         question: str,
-        results: list[dict],
         history: list[dict] | None = None,
         image_url: str | None = None,
     ) -> tuple[str, discord.Embed]:
-        """Generate an answer from search results and return (raw_answer, embed)."""
-        context_parts = []
-        for r in results:
-            doc_url = r.get('doc_url', path_to_docs_url(r['path']))
-            context_parts.append(
-                f"[Fonte: {r['title']} -- {doc_url}]\n{r['content']}"
-            )
-        context = '\n\n---\n\n'.join(context_parts)
-
+        """Run the LLM with tool-calling in a loop until it produces a final answer."""
         messages = [{'role': 'system', 'content': SYSTEM_PROMPT}]
 
-        # Include conversation history for follow-ups
         if history:
-            for h in history[-3:]:  # Last 3 exchanges max
+            for h in history[-3:]:
                 messages.append({'role': 'user', 'content': h['question']})
                 messages.append({'role': 'assistant', 'content': h['answer']})
 
-        user_text = f"Contexto da documentação:\n{context}\n\nPergunta: {question}"
-
         if image_url:
-            # Vision format: content as list of parts
             messages.append({
                 'role': 'user',
                 'content': [
-                    {'type': 'text', 'text': user_text},
+                    {'type': 'text', 'text': question},
                     {'type': 'image_url', 'image_url': {'url': image_url}},
                 ],
             })
         else:
-            messages.append({'role': 'user', 'content': user_text})
+            messages.append({'role': 'user', 'content': question})
 
-        response = await self.client.chat.completions.create(
-            model=CHAT_MODEL,
-            messages=messages,
-            max_tokens=1024,
-        )
+        all_sources: list[dict] = []
 
-        answer = response.choices[0].message.content
+        for _ in range(MAX_TOOL_ROUNDS):
+            response = await self.client.chat.completions.create(
+                model=CHAT_MODEL,
+                messages=messages,
+                tools=TOOLS,
+                max_tokens=1024,
+            )
+
+            choice = response.choices[0]
+
+            # No tool calls → final answer
+            if not choice.message.tool_calls:
+                break
+
+            # Append the assistant message with tool calls
+            messages.append(choice.message)
+
+            # Execute each tool call
+            for tc in choice.message.tool_calls:
+                try:
+                    args = json.loads(tc.function.arguments)
+                except (json.JSONDecodeError, TypeError):
+                    args = {}
+
+                result_text, sources = await self._exec_tool(tc.function.name, args)
+                all_sources.extend(sources)
+
+                messages.append({
+                    'role': 'tool',
+                    'tool_call_id': tc.id,
+                    'content': _truncate_safe(result_text, limit=6000),
+                })
+        else:
+            # If we exhausted rounds, get a final response without tools
+            response = await self.client.chat.completions.create(
+                model=CHAT_MODEL,
+                messages=messages,
+                max_tokens=1024,
+            )
+            choice = response.choices[0]
+
+        answer = choice.message.content or 'Não foi possível gerar uma resposta.'
         answer = _truncate_safe(answer)
 
         embed = discord.Embed(
@@ -613,30 +806,34 @@ class DocsRAG(commands.Cog):
             color=discord.Color.blue(),
         )
 
-        seen_paths = set()
-        source_lines = []
-        for r in results:
-            if r['path'] not in seen_paths:
-                seen_paths.add(r['path'])
-                doc_url = r.get('doc_url', path_to_docs_url(r['path']))
-                title = r['title'] or _title_from_path(r['path'])
-                source_label = r.get('source', "Miners' Refuge")
-                source_lines.append(f'• [{title}]({doc_url}) — {source_label}')
-            if len(source_lines) >= 8:
-                break
+        # Add source links from doc chunks
+        if all_sources:
+            seen_paths = set()
+            source_lines = []
+            for r in all_sources:
+                if r['path'] not in seen_paths:
+                    seen_paths.add(r['path'])
+                    doc_url = r.get('doc_url', path_to_docs_url(r['path']))
+                    title = r['title'] or _title_from_path(r['path'])
+                    source_label = r.get('source', "Miners' Refuge")
+                    source_lines.append(f'• [{title}]({doc_url}) — {source_label}')
+                if len(source_lines) >= 8:
+                    break
 
-        embed.add_field(
-            name='📄 Fontes da Documentação',
-            value='\n'.join(source_lines),
-            inline=False,
-        )
+            if source_lines:
+                embed.add_field(
+                    name='📄 Fontes da Documentação',
+                    value='\n'.join(source_lines),
+                    inline=False,
+                )
+
         embed.set_footer(
             text=f"Documentação • {DOCS_BASE_URL} • 💬 Responda a esta mensagem para continuar a conversa"
         )
 
         return answer, embed
 
-    def _store_conversation(self, message_id: int, question: str, answer: str, results: list[dict]):
+    def _store_conversation(self, message_id: int, question: str, answer: str):
         """Store a conversation exchange for follow-up replies."""
         self._conversations[message_id] = {
             'question': question,
@@ -657,12 +854,10 @@ class DocsRAG(commands.Cog):
         if not conv:
             return
 
-        # User is replying to one of our /ask responses
         follow_up_question = message.content.strip()
         if not follow_up_question and not message.attachments:
             return
 
-        # Check for image attachments
         image_url = None
         for att in message.attachments:
             if att.content_type and att.content_type.startswith('image/'):
@@ -674,24 +869,14 @@ class DocsRAG(commands.Cog):
 
         async with message.channel.typing():
             try:
-                # Build history from previous exchanges
                 history = conv.get('history', []).copy()
                 history.append({'question': conv['question'], 'answer': conv['answer']})
 
-                results = await self.search(follow_up_question)
-                if not results:
-                    await message.reply(
-                        'Não encontrei informações relevantes na documentação. '
-                        f'Tente pesquisar diretamente em {DOCS_BASE_URL}'
-                    )
-                    return
-
-                answer, embed = await self._build_answer(
-                    follow_up_question, results, history=history, image_url=image_url
+                answer, embed = await self._run_agent(
+                    follow_up_question, history=history, image_url=image_url
                 )
                 reply = await message.reply(embed=embed)
 
-                # Store new conversation entry so the chain can continue
                 self._conversations[reply.id] = {
                     'question': follow_up_question,
                     'answer': answer,
