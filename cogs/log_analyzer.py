@@ -7,7 +7,7 @@ from discord import app_commands
 from discord.ext import commands
 from openai import AsyncOpenAI, RateLimitError
 
-from cogs.utils import truncate_safe as _truncate_safe
+from cogs.utils import PaginatedEmbedView, split_response
 from config import (
     CHAT_MODEL,
     COOLDOWN_PER,
@@ -375,32 +375,43 @@ class LogAnalyzer(commands.Cog):
             await interaction.followup.send('Ocorreu um erro ao analisar o log. Tente novamente.')
             return
 
-        analysis = _truncate_safe(analysis)
-
-        embed = discord.Embed(
-            title='🔬 Análise de Log',
-            description=analysis,
-            color=discord.Color.orange(),
-        )
-
-        if log_file:
-            embed.add_field(name='Arquivo', value=log_file.filename, inline=True)
-        if image:
-            embed.set_thumbnail(url=image.url)
-        if mclogs_url:
-            embed.add_field(name='mclo.gs', value=f'[Ver log]({mclogs_url})', inline=True)
-        if content_truncated:
-            embed.add_field(
-                name='⚠️ Log muito grande',
-                value=(
-                    f'O arquivo excede {MAX_CONTENT_SIZE // (1024 * 1024)} MB. '
-                    'A análise foi feita sobre os erros e avisos extraídos do início do log.'
-                ),
-                inline=False,
+        pages = split_response(analysis)
+        total = len(pages)
+        embeds: list[discord.Embed] = []
+        for i, page_text in enumerate(pages):
+            e = discord.Embed(
+                title='🔬 Análise de Log' if i == 0 else '',
+                description=page_text,
+                color=discord.Color.orange(),
             )
+            if i == 0:
+                if log_file:
+                    e.add_field(name='Arquivo', value=log_file.filename, inline=True)
+                if image:
+                    e.set_thumbnail(url=image.url)
+                if mclogs_url:
+                    e.add_field(name='mclo.gs', value=f'[Ver log]({mclogs_url})', inline=True)
+                if content_truncated:
+                    e.add_field(
+                        name='⚠️ Log muito grande',
+                        value=(
+                            f'O arquivo excede {MAX_CONTENT_SIZE // (1024 * 1024)} MB. '
+                            'A análise foi feita sobre os erros e avisos extraídos do início do log.'
+                        ),
+                        inline=False,
+                    )
+            footer = (
+                f'Página {i + 1}/{total} • Análise gerada por IA • Sempre verifique manualmente'
+                if total > 1 else
+                'Análise gerada por IA • Sempre verifique manualmente'
+            )
+            e.set_footer(text=footer)
+            embeds.append(e)
 
-        embed.set_footer(text='Análise gerada por IA • Sempre verifique manualmente')
-        await interaction.followup.send(embed=embed)
+        if len(embeds) == 1:
+            await interaction.followup.send(embed=embeds[0])
+        else:
+            await interaction.followup.send(embed=embeds[0], view=PaginatedEmbedView(embeds))
 
 
 async def setup(bot: commands.Bot):

@@ -14,7 +14,7 @@ from openai import AsyncOpenAI, RateLimitError
 
 from cogs.plugin_apis import HTTP_HEADERS as _HTTP_HEADERS
 from cogs.plugin_apis import search_all as _search_plugins_all
-from cogs.utils import truncate_safe as _truncate_safe
+from cogs.utils import PaginatedEmbedView, split_response, truncate_safe as _truncate_safe
 from config import (
     CHAT_MODEL,
     COOLDOWN_PER,
@@ -621,8 +621,13 @@ class DocsRAG(commands.Cog):
         await interaction.response.defer(thinking=True)
 
         try:
-            answer, embed = await self._run_agent(question, image_url=image_url)
-            msg = await interaction.followup.send(embed=embed, wait=True)
+            answer, embeds = await self._run_agent(question, image_url=image_url)
+            if len(embeds) == 1:
+                msg = await interaction.followup.send(embed=embeds[0], wait=True)
+            else:
+                msg = await interaction.followup.send(
+                    embed=embeds[0], view=PaginatedEmbedView(embeds), wait=True
+                )
             self._store_conversation(msg.id, question, answer)
 
         except RateLimitError:
@@ -739,18 +744,12 @@ class DocsRAG(commands.Cog):
             choice = response.choices[0]
 
         answer = choice.message.content or 'Não foi possível gerar uma resposta.'
-        answer = _truncate_safe(answer)
 
-        embed = discord.Embed(
-            title=f'❓ {question}',
-            description=answer,
-            color=discord.Color.blue(),
-        )
-
-        # Add source links from doc chunks
+        # Build source links (attached to first page only)
+        sources_value: str | None = None
         if all_sources:
-            seen_paths = set()
-            source_lines = []
+            seen_paths: set[str] = set()
+            source_lines: list[str] = []
             for r in all_sources:
                 if r['path'] not in seen_paths:
                     seen_paths.add(r['path'])
@@ -760,19 +759,34 @@ class DocsRAG(commands.Cog):
                     source_lines.append(f'• [{title}]({doc_url}) — {source_label}')
                 if len(source_lines) >= 8:
                     break
-
             if source_lines:
-                embed.add_field(
+                sources_value = '\n'.join(source_lines)
+
+        pages = split_response(answer)
+        total = len(pages)
+        footer_base = (
+            f"Documentação • {DOCS_BASE_URL} • "
+            "💬 Responda a esta mensagem para continuar a conversa"
+        )
+        embeds: list[discord.Embed] = []
+        for i, page_text in enumerate(pages):
+            e = discord.Embed(
+                title=f'❓ {question}' if i == 0 else '',
+                description=page_text,
+                color=discord.Color.blue(),
+            )
+            if i == 0 and sources_value:
+                e.add_field(
                     name='📄 Fontes da Documentação',
-                    value='\n'.join(source_lines),
+                    value=sources_value,
                     inline=False,
                 )
+            e.set_footer(
+                text=f"Página {i + 1}/{total} • {footer_base}" if total > 1 else footer_base
+            )
+            embeds.append(e)
 
-        embed.set_footer(
-            text=f"Documentação • {DOCS_BASE_URL} • 💬 Responda a esta mensagem para continuar a conversa"
-        )
-
-        return answer, embed
+        return answer, embeds
 
     def _store_conversation(self, message_id: int, question: str, answer: str):
         """Store a conversation exchange for follow-up replies."""
@@ -813,10 +827,15 @@ class DocsRAG(commands.Cog):
                 history = conv.get('history', []).copy()
                 history.append({'question': conv['question'], 'answer': conv['answer']})
 
-                answer, embed = await self._run_agent(
+                answer, embeds = await self._run_agent(
                     follow_up_question, history=history, image_url=image_url
                 )
-                reply = await message.reply(embed=embed)
+                if len(embeds) == 1:
+                    reply = await message.reply(embed=embeds[0])
+                else:
+                    reply = await message.reply(
+                        embed=embeds[0], view=PaginatedEmbedView(embeds)
+                    )
 
                 self._conversations[reply.id] = {
                     'question': follow_up_question,
