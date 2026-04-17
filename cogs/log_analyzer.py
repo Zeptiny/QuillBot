@@ -44,10 +44,41 @@ ANALYZE_SYSTEM_PROMPT = (
 # Minimum message length to run pattern matching against (skip trivial messages)
 _MIN_PATTERN_LENGTH = 20
 
+# Lines matching these patterns are kept when filtering large logs
+_LOG_ERROR_PATTERN = re.compile(
+    r'\b(ERROR|WARN|Exception|Caused by|at [a-z][\w.$]+\()',
+    re.IGNORECASE,
+)
+# Number of header lines (startup info: version, plugins) always kept
+_LOG_HEADER_LINES = 60
+
 
 def _sanitize_log_content(text: str) -> str:
     """Strip non-printable characters from log content, keeping newlines and tabs."""
     return re.sub(r'[^\x09\x0a\x0d\x20-\x7e\x80-\uffff]', '', text)
+
+
+def _extract_relevant_lines(text: str, limit: int = MAX_LOG_CONTEXT) -> str:
+    """Extract meaningful lines from an oversized log.
+
+    Keeps the first ``_LOG_HEADER_LINES`` lines (server startup, plugin list)
+    plus every line that matches an error/warning/exception pattern.  This
+    gives the LLM more signal per token than naive head+tail truncation.
+    Falls back to head+tail if the filtered result still exceeds ``limit``.
+    """
+    lines = text.splitlines(keepends=True)
+    header = lines[:_LOG_HEADER_LINES]
+    relevant = [l for l in lines[_LOG_HEADER_LINES:] if _LOG_ERROR_PATTERN.search(l)]
+    filtered = (
+        ''.join(header)
+        + '\n[... linhas informativas omitidas — exibindo apenas erros e avisos ...]\n\n'
+        + ''.join(relevant)
+    )
+    if len(filtered) <= limit:
+        return filtered
+    # Filtered result is still too large: head + tail of *filtered* text
+    half = limit // 2
+    return filtered[:half] + '\n\n[... truncado ...]\n\n' + filtered[-half:]
 
 
 def _truncate_safe(text: str, limit: int = 3800) -> str:
@@ -119,30 +150,38 @@ class LogAnalyzer(commands.Cog):
 
     # --- HTTP helpers ---
 
-    async def read_file_content(self, url: str) -> str | None:
-        """Fetch text content from a URL, streaming with a hard size limit."""
+    async def read_file_content(self, url: str) -> tuple[str | None, bool]:
+        """Fetch text content from a URL, streaming up to MAX_CONTENT_SIZE.
+
+        Returns ``(content, truncated)``.
+        *content* is ``None`` only on a genuine fetch failure (non-200, network
+        error).  When the source is larger than the limit the first
+        ``MAX_CONTENT_SIZE`` bytes are returned and *truncated* is ``True``.
+        """
         try:
             async with self.session.get(url) as resp:
                 if resp.status != 200:
-                    return None
-                # Reject early if Content-Length is present and too large
-                content_length = resp.headers.get('Content-Length')
-                if content_length and int(content_length) > MAX_CONTENT_SIZE:
-                    logger.warning("Content too large from %s (%s bytes)", url, content_length)
-                    return None
-                # Stream in chunks to enforce the limit regardless of headers
+                    return None, False
                 chunks: list[bytes] = []
                 total = 0
+                truncated = False
                 async for chunk in resp.content.iter_chunked(64 * 1024):
-                    total += len(chunk)
-                    if total > MAX_CONTENT_SIZE:
-                        logger.warning("Streaming content exceeded size limit from %s", url)
-                        return None
+                    remaining = MAX_CONTENT_SIZE - total
+                    if remaining <= 0:
+                        truncated = True
+                        break
+                    if len(chunk) > remaining:
+                        chunks.append(chunk[:remaining])
+                        truncated = True
+                        break
                     chunks.append(chunk)
-                return b''.join(chunks).decode('utf-8', errors='replace')
+                    total += len(chunk)
+                if truncated:
+                    logger.warning("Content from %s truncated at %d bytes", url, MAX_CONTENT_SIZE)
+                return b''.join(chunks).decode('utf-8', errors='replace'), truncated
         except Exception:
             logger.exception("Failed to fetch content from %s", url)
-            return None
+            return None, False
 
     async def upload_mclogs(self, content: str) -> str | None:
         """Upload log content to mclo.gs and return the URL."""
@@ -180,7 +219,7 @@ class LogAnalyzer(commands.Cog):
 
         if fetch_url:
             await message.add_reaction('👀')
-            link_content = await self.read_file_content(fetch_url)
+            link_content, _ = await self.read_file_content(fetch_url)
             if link_content and not response:
                 response = check_message(link_content)
 
@@ -188,15 +227,20 @@ class LogAnalyzer(commands.Cog):
         if has_attachments:
             for attachment in message.attachments:
                 if attachment.filename.endswith(('.txt', '.log')):
-                    file_content = await self.read_file_content(attachment.url)
+                    file_content, was_truncated = await self.read_file_content(attachment.url)
                     if file_content:
                         if not response:
                             response = check_message(file_content)
                         mclogs_url = await self.upload_mclogs(file_content)
                         if mclogs_url:
+                            note = (
+                                ' ⚠️ O arquivo era muito grande — apenas os primeiros '
+                                f'{MAX_CONTENT_SIZE // (1024 * 1024)} MB foram lidos.'
+                                if was_truncated else ''
+                            )
                             await message.reply(
                                 f'Na próxima vez busque utilizar um serviço para enviar suas logs, '
-                                f'como o mclo.gs, fiz o upload para você <3:\n<{mclogs_url}>'
+                                f'como o mclo.gs, fiz o upload para você <3:\n<{mclogs_url}>{note}'
                             )
                         else:
                             await message.reply(
@@ -222,14 +266,8 @@ class LogAnalyzer(commands.Cog):
 
         if log_content:
             log_content = _sanitize_log_content(log_content)
-            # Truncate if too long, keeping start and end (most useful parts)
             if len(log_content) > MAX_LOG_CONTEXT:
-                half = MAX_LOG_CONTEXT // 2
-                log_content = (
-                    log_content[:half]
-                    + '\n\n[... log truncado ...]\n\n'
-                    + log_content[-half:]
-                )
+                log_content = _extract_relevant_lines(log_content, MAX_LOG_CONTEXT)
             user_parts.append({'type': 'text', 'text': f"Analise este log:\n\n```\n{log_content}\n```"})
 
         if image_url:
@@ -303,6 +341,7 @@ class LogAnalyzer(commands.Cog):
         await interaction.response.defer(thinking=True)
 
         log_content = None
+        content_truncated = False
 
         if log_file:
             if not log_file.filename.endswith(('.txt', '.log')):
@@ -310,11 +349,11 @@ class LogAnalyzer(commands.Cog):
                     'Formato não suportado. Envie um arquivo `.log` ou `.txt`.', ephemeral=True
                 )
                 return
-            log_content = await self.read_file_content(log_file.url)
+            log_content, content_truncated = await self.read_file_content(log_file.url)
             if log_content:
                 mclogs_url = await self.upload_mclogs(log_content)
         elif fetch_url:
-            log_content = await self.read_file_content(fetch_url)
+            log_content, content_truncated = await self.read_file_content(fetch_url)
 
         if not log_content and not image_url:
             await interaction.followup.send('Não foi possível ler o conteúdo do log.')
@@ -350,6 +389,15 @@ class LogAnalyzer(commands.Cog):
             embed.set_thumbnail(url=image.url)
         if mclogs_url:
             embed.add_field(name='mclo.gs', value=f'[Ver log]({mclogs_url})', inline=True)
+        if content_truncated:
+            embed.add_field(
+                name='⚠️ Log muito grande',
+                value=(
+                    f'O arquivo excede {MAX_CONTENT_SIZE // (1024 * 1024)} MB. '
+                    'A análise foi feita sobre os erros e avisos extraídos do início do log.'
+                ),
+                inline=False,
+            )
 
         embed.set_footer(text='Análise gerada por IA • Sempre verifique manualmente')
         await interaction.followup.send(embed=embed)
