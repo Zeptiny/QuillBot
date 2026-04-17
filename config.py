@@ -67,6 +67,15 @@ DOC_SOURCES: Final[list[dict]] = [
         'url_strip_prefix': 'mkdocs/purpur/',
         'max_files': 400,
     },
+    {
+        'repo': 'lucko/spark-docs',
+        'branch': 'main',
+        'base_url': 'https://spark.lucko.me/docs/',
+        'label': 'Spark',
+        'path_prefix': 'docs/',
+        'url_strip_prefix': 'docs/',
+        'max_files': 400,
+    },
 ]
 
 
