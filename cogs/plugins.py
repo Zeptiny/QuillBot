@@ -1,5 +1,4 @@
 import asyncio
-import json
 import logging
 import re
 import urllib.parse
@@ -9,20 +8,21 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+from cogs.plugin_apis import (
+    HTTP_HEADERS as _HEADERS,
+    search_hangar,
+    search_modrinth,
+    search_spiget,
+)
 from config import DOCS_BRANCH, GITHUB_API
+
 
 # Basic hostname/IP pattern: letters, digits, dots, colons, hyphens; optional port
 _IP_PATTERN = re.compile(r'^[\w.:-]+$')
 
 logger = logging.getLogger(__name__)
 
-MODRINTH_API = 'https://api.modrinth.com/v2'
-HANGAR_API = 'https://hangar.papermc.io/api/v1'
-SPIGET_API = 'https://api.spiget.org/v2'
 MCSRVSTAT_API = 'https://api.mcsrvstat.us/3'
-
-# User-Agent is required by Modrinth's API policy
-_HEADERS = {'User-Agent': 'QuillBot/1.0 (github.com/Zeptiny/QuillBot)'}
 
 
 class PluginSearch(commands.Cog):
@@ -53,76 +53,7 @@ class PluginSearch(commands.Cog):
             logger.exception("Failed to fetch %s", url)
         return None
 
-    # --- Plugin search helpers ---
-
-    async def _search_modrinth(self, name: str) -> list[dict]:
-        params = {
-            'query': name,
-            'limit': 3,
-            'facets': json.dumps([['project_type:plugin']]),
-        }
-        data = await self._get_json(f'{MODRINTH_API}/search', params=params)
-        if not data:
-            return []
-        results = []
-        for hit in data.get('hits', [])[:3]:
-            game_versions = hit.get('versions', [])
-            # Show up to the 3 most recent supported versions
-            display_versions = game_versions[-3:] if game_versions else []
-            slug_or_id = hit.get('slug') or hit.get('project_id', '')
-            results.append({
-                'name': hit.get('title', '?'),
-                'author': hit.get('author', '?'),
-                'description': hit.get('description', '')[:100],
-                'downloads': hit.get('downloads', 0),
-                'url': f'https://modrinth.com/project/{slug_or_id}',
-                'versions': display_versions,
-                'source': 'Modrinth',
-            })
-        return results
-
-    async def _search_hangar(self, name: str) -> list[dict]:
-        params = {'q': name, 'limit': 3}
-        data = await self._get_json(f'{HANGAR_API}/projects', params=params)
-        if not data:
-            return []
-        results = []
-        for project in data.get('result', [])[:3]:
-            ns = project.get('namespace', {})
-            owner = ns.get('owner', '?')
-            slug = ns.get('slug', '')
-            results.append({
-                'name': project.get('name', '?'),
-                'author': owner,
-                'description': project.get('description', '')[:100],
-                'downloads': project.get('stats', {}).get('downloads', 0),
-                'url': f'https://hangar.papermc.io/{owner}/{slug}',
-                'versions': [],
-                'source': 'Hangar',
-            })
-        return results
-
-    async def _search_spiget(self, name: str) -> list[dict]:
-        encoded = urllib.parse.quote(name)
-        data = await self._get_json(
-            f'{SPIGET_API}/search/resources/{encoded}'
-            '?sort=-downloads&size=3&fields=id,name,downloads,testedVersions'
-        )
-        if not isinstance(data, list):
-            return []
-        results = []
-        for res in data[:3]:
-            res_id = res.get('id', '')
-            results.append({
-                'name': res.get('name', '?'),
-                'author': '?',
-                'description': '',
-                'downloads': res.get('downloads', 0),
-                'url': f'https://www.spigotmc.org/resources/{res_id}',
-                'versions': res.get('testedVersions', [])[:3],
-                'source': 'SpigotMC',
-            })
-        return results
+    # --- /plugin ---
 
     @staticmethod
     def _format_plugin_list(results: list[dict]) -> str:
@@ -139,22 +70,20 @@ class PluginSearch(commands.Cog):
             lines.append(line)
         return '\n\n'.join(lines) if lines else 'Sem resultados.'
 
-    # --- /plugin ---
-
     @app_commands.command(name='plugin', description='Pesquisa um plugin no Modrinth, Hangar e SpigotMC')
     @app_commands.describe(name='Nome do plugin para pesquisar')
     async def plugin_search(self, interaction: discord.Interaction, name: str):
         await interaction.response.defer(thinking=True)
 
         modrinth_results, hangar_results = await asyncio.gather(
-            self._search_modrinth(name),
-            self._search_hangar(name),
+            search_modrinth(self.session, name),
+            search_hangar(self.session, name),
         )
 
         secondary_results = hangar_results
         if not modrinth_results and not secondary_results:
             # Fallback to Spiget
-            spiget_results = await self._search_spiget(name)
+            spiget_results = await search_spiget(self.session, name)
             if not spiget_results:
                 await interaction.followup.send(
                     f'Nenhum plugin encontrado para `{name}`.'

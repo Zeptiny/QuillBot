@@ -7,6 +7,7 @@ from discord import app_commands
 from discord.ext import commands
 from openai import AsyncOpenAI, RateLimitError
 
+from cogs.utils import truncate_safe as _truncate_safe
 from config import (
     CHAT_MODEL,
     COOLDOWN_PER,
@@ -81,16 +82,6 @@ def _extract_relevant_lines(text: str, limit: int = MAX_LOG_CONTEXT) -> str:
     return filtered[:half] + '\n\n[... truncado ...]\n\n' + filtered[-half:]
 
 
-def _truncate_safe(text: str, limit: int = 3800) -> str:
-    """Truncate text at the last newline before *limit* to avoid breaking markdown."""
-    if len(text) <= limit:
-        return text
-    idx = text.rfind('\n', 0, limit)
-    if idx == -1:
-        idx = limit
-    return text[:idx] + '\n\n*...análise truncada*'
-
-
 def check_message(content: str) -> str | None:
     """Check message content against known error patterns."""
     for compiled_pattern, response_template in patterns:
@@ -129,7 +120,9 @@ class LogAnalyzer(commands.Cog):
             )
 
     async def cog_load(self):
-        self.session = aiohttp.ClientSession()
+        self.session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=15),
+        )
 
     async def cog_unload(self):
         if self.session:

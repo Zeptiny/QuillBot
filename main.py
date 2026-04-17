@@ -1,6 +1,7 @@
 import logging
 
 import discord
+from discord import app_commands
 from discord.ext import commands
 
 from config import BOT_TOKEN, validate_config
@@ -25,14 +26,27 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 COGS = ['cogs.log_analyzer', 'cogs.commands', 'cogs.plugins', 'cogs.docs_rag']
 
 
+@bot.tree.error
+async def on_app_command_error(
+    interaction: discord.Interaction, error: app_commands.AppCommandError
+):
+    if isinstance(error, app_commands.CommandOnCooldown):
+        await interaction.response.send_message(
+            f'⏳ Aguarde {error.retry_after:.0f}s antes de usar este comando novamente.',
+            ephemeral=True,
+        )
+        return
+    logger.exception("Unhandled command error: %s", error)
+    msg = 'Ocorreu um erro inesperado. Tente novamente.'
+    if interaction.response.is_done():
+        await interaction.followup.send(msg, ephemeral=True)
+    else:
+        await interaction.response.send_message(msg, ephemeral=True)
+
+
 @bot.event
 async def on_ready():
     logger.info('Logged on as %s', bot.user)
-    try:
-        synced = await bot.tree.sync()
-        logger.info('Synced %d slash commands', len(synced))
-    except Exception:
-        logger.exception('Failed to sync slash commands')
 
 
 async def main():

@@ -4,7 +4,6 @@ import logging
 import math
 import os
 import re
-import urllib.parse
 
 import aiohttp
 import discord
@@ -13,6 +12,9 @@ from discord import app_commands
 from discord.ext import commands, tasks
 from openai import AsyncOpenAI, RateLimitError
 
+from cogs.plugin_apis import HTTP_HEADERS as _HTTP_HEADERS
+from cogs.plugin_apis import search_all as _search_plugins_all
+from cogs.utils import truncate_safe as _truncate_safe
 from config import (
     CHAT_MODEL,
     COOLDOWN_PER,
@@ -29,11 +31,6 @@ from config import (
 )
 
 logger = logging.getLogger(__name__)
-
-MODRINTH_API = 'https://api.modrinth.com/v2'
-HANGAR_API = 'https://hangar.papermc.io/api/v1'
-SPIGET_API = 'https://api.spiget.org/v2'
-_HTTP_HEADERS = {'User-Agent': 'QuillBot/1.0 (github.com/Zeptiny/QuillBot)'}
 
 MAX_TOOL_ROUNDS = 4  # Safety cap on tool-calling iterations
 
@@ -155,16 +152,6 @@ def path_to_docs_url(path: str) -> str:
     return _compute_doc_url(path, DOCS_BASE_URL)
 
 
-def _truncate_safe(text: str, limit: int = 3800) -> str:
-    """Truncate text at the last newline before *limit* to avoid breaking markdown."""
-    if len(text) <= limit:
-        return text
-    idx = text.rfind('\n', 0, limit)
-    if idx == -1:
-        idx = limit
-    return text[:idx] + '\n\n...'
-
-
 class DocsRAG(commands.Cog):
     """RAG-powered documentation search and Q&A with vector storage and reranking."""
 
@@ -184,7 +171,10 @@ class DocsRAG(commands.Cog):
         self._conversations: TTLCache = TTLCache(maxsize=200, ttl=1800)
 
     async def cog_load(self):
-        self.session = aiohttp.ClientSession()
+        self.session = aiohttp.ClientSession(
+            headers=_HTTP_HEADERS,
+            timeout=aiohttp.ClientTimeout(total=15),
+        )
         loaded = self._load_vectors()
         if not loaded:
             await self.index_docs()
@@ -623,7 +613,7 @@ class DocsRAG(commands.Cog):
 
         if name == 'search_plugins':
             query = args.get('query', '')
-            results = await self._search_plugins_all(query)
+            results = await _search_plugins_all(self.session, query)
             if not results:
                 return 'Nenhum plugin encontrado.', []
             lines = []
@@ -637,95 +627,6 @@ class DocsRAG(commands.Cog):
             return '\n\n'.join(lines), []
 
         return f'Ferramenta desconhecida: {name}', []
-
-    async def _search_plugins_all(self, query: str) -> list[dict]:
-        """Search Modrinth, Hangar, and Spiget concurrently."""
-        modrinth, hangar = await asyncio.gather(
-            self._search_modrinth(query),
-            self._search_hangar(query),
-        )
-        results = modrinth + hangar
-        if not results:
-            results = await self._search_spiget(query)
-        return results
-
-    async def _search_modrinth(self, name: str) -> list[dict]:
-        params = {
-            'query': name,
-            'limit': 3,
-            'facets': json.dumps([['project_type:plugin']]),
-        }
-        data = await self._api_get_json(f'{MODRINTH_API}/search', params=params)
-        if not data:
-            return []
-        results = []
-        for hit in data.get('hits', [])[:3]:
-            game_versions = hit.get('versions', [])
-            slug_or_id = hit.get('slug') or hit.get('project_id', '')
-            results.append({
-                'name': hit.get('title', '?'),
-                'author': hit.get('author', '?'),
-                'description': hit.get('description', '')[:100],
-                'downloads': hit.get('downloads', 0),
-                'url': f'https://modrinth.com/project/{slug_or_id}',
-                'versions': game_versions[-3:] if game_versions else [],
-                'source': 'Modrinth',
-            })
-        return results
-
-    async def _search_hangar(self, name: str) -> list[dict]:
-        params = {'q': name, 'limit': 3}
-        data = await self._api_get_json(f'{HANGAR_API}/projects', params=params)
-        if not data:
-            return []
-        results = []
-        for project in data.get('result', [])[:3]:
-            ns = project.get('namespace', {})
-            owner = ns.get('owner', '?')
-            slug = ns.get('slug', '')
-            results.append({
-                'name': project.get('name', '?'),
-                'author': owner,
-                'description': project.get('description', '')[:100],
-                'downloads': project.get('stats', {}).get('downloads', 0),
-                'url': f'https://hangar.papermc.io/{owner}/{slug}',
-                'versions': [],
-                'source': 'Hangar',
-            })
-        return results
-
-    async def _search_spiget(self, name: str) -> list[dict]:
-        encoded = urllib.parse.quote(name)
-        data = await self._api_get_json(
-            f'{SPIGET_API}/search/resources/{encoded}'
-            '?sort=-downloads&size=3&fields=id,name,downloads,testedVersions'
-        )
-        if not isinstance(data, list):
-            return []
-        results = []
-        for res in data[:3]:
-            res_id = res.get('id', '')
-            results.append({
-                'name': res.get('name', '?'),
-                'author': '?',
-                'description': '',
-                'downloads': res.get('downloads', 0),
-                'url': f'https://www.spigotmc.org/resources/{res_id}',
-                'versions': res.get('testedVersions', [])[:3],
-                'source': 'SpigotMC',
-            })
-        return results
-
-    async def _api_get_json(self, url: str, **kwargs) -> dict | list | None:
-        """Fetch JSON from an external API with User-Agent header."""
-        try:
-            async with self.session.get(url, headers=_HTTP_HEADERS, **kwargs) as resp:
-                if resp.status == 200:
-                    return await resp.json()
-                logger.warning("GET %s returned %d", url, resp.status)
-        except Exception:
-            logger.exception("Failed to fetch %s", url)
-        return None
 
     # --- Agentic loop ---
 
