@@ -1,5 +1,7 @@
 import asyncio
+import json
 import logging
+import re
 import urllib.parse
 
 import aiohttp
@@ -8,6 +10,9 @@ from discord import app_commands
 from discord.ext import commands
 
 from config import DOCS_BRANCH, GITHUB_API
+
+# Basic hostname/IP pattern: letters, digits, dots, colons, hyphens; optional port
+_IP_PATTERN = re.compile(r'^[\w.:-]+$')
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +33,10 @@ class PluginSearch(commands.Cog):
         self.session: aiohttp.ClientSession | None = None
 
     async def cog_load(self):
-        self.session = aiohttp.ClientSession(headers=_HEADERS)
+        self.session = aiohttp.ClientSession(
+            headers=_HEADERS,
+            timeout=aiohttp.ClientTimeout(total=10),
+        )
 
     async def cog_unload(self):
         if self.session:
@@ -48,11 +56,10 @@ class PluginSearch(commands.Cog):
     # --- Plugin search helpers ---
 
     async def _search_modrinth(self, name: str) -> list[dict]:
-        import json as _json
         params = {
             'query': name,
             'limit': 3,
-            'facets': _json.dumps([['project_type:plugin']]),
+            'facets': json.dumps([['project_type:plugin']]),
         }
         data = await self._get_json(f'{MODRINTH_API}/search', params=params)
         if not data:
@@ -62,15 +69,13 @@ class PluginSearch(commands.Cog):
             game_versions = hit.get('versions', [])
             # Show up to the 3 most recent supported versions
             display_versions = game_versions[-3:] if game_versions else []
+            slug_or_id = hit.get('slug') or hit.get('project_id', '')
             results.append({
                 'name': hit.get('title', '?'),
                 'author': hit.get('author', '?'),
                 'description': hit.get('description', '')[:100],
                 'downloads': hit.get('downloads', 0),
-                'url': (
-                    hit.get('project_url')
-                    or f"https://modrinth.com/project/{hit.get('project_id', '')}"
-                ),
+                'url': f'https://modrinth.com/project/{slug_or_id}',
                 'versions': display_versions,
                 'source': 'Modrinth',
             })
@@ -146,7 +151,8 @@ class PluginSearch(commands.Cog):
             self._search_hangar(name),
         )
 
-        if not modrinth_results and not hangar_results:
+        secondary_results = hangar_results
+        if not modrinth_results and not secondary_results:
             # Fallback to Spiget
             spiget_results = await self._search_spiget(name)
             if not spiget_results:
@@ -154,7 +160,7 @@ class PluginSearch(commands.Cog):
                     f'Nenhum plugin encontrado para `{name}`.'
                 )
                 return
-            hangar_results = spiget_results
+            secondary_results = spiget_results
 
         embed = discord.Embed(
             title=f'🔌 Plugins encontrados: {name}',
@@ -168,11 +174,11 @@ class PluginSearch(commands.Cog):
                 inline=False,
             )
 
-        if hangar_results:
-            source_name = hangar_results[0].get('source', 'Hangar')
+        if secondary_results:
+            source_name = secondary_results[0].get('source', 'Hangar')
             embed.add_field(
                 name=f'🔵 {source_name}',
-                value=self._format_plugin_list(hangar_results),
+                value=self._format_plugin_list(secondary_results),
                 inline=False,
             )
 
@@ -184,9 +190,16 @@ class PluginSearch(commands.Cog):
     @app_commands.command(name='status', description='Verifica o status de um servidor Minecraft')
     @app_commands.describe(ip='Endereço IP ou hostname do servidor')
     async def server_status(self, interaction: discord.Interaction, ip: str):
+        if not _IP_PATTERN.match(ip):
+            await interaction.response.send_message(
+                'Endereço inválido. Use um IP ou hostname válido (ex: `mc.example.com` ou `1.2.3.4:25565`).',
+                ephemeral=True,
+            )
+            return
         await interaction.response.defer(thinking=True)
 
-        data = await self._get_json(f'{MCSRVSTAT_API}/{ip}')
+        safe_ip = urllib.parse.quote(ip, safe='')
+        data = await self._get_json(f'{MCSRVSTAT_API}/{safe_ip}')
         if data is None:
             await interaction.followup.send(
                 'Não foi possível consultar o servidor. Verifique o IP e tente novamente.'

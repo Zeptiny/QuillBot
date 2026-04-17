@@ -6,6 +6,7 @@ from discord.ext import commands
 from config import BOT_TOKEN, validate_config
 
 validate_config()
+assert BOT_TOKEN is not None  # narrowed by validate_config()
 
 logging.basicConfig(
     level=logging.INFO,

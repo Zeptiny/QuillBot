@@ -50,17 +50,19 @@ class Commands(commands.Cog):
                         title=f"🔍 Resultados para: {query}",
                         color=discord.Color.gold(),
                     )
+                    from cogs.docs_rag import path_to_docs_url
                     seen_paths = set()
                     lines = []
                     for r in results:
                         if r['path'] not in seen_paths:
                             seen_paths.add(r['path'])
-                            from cogs.docs_rag import path_to_docs_url
-                            url = path_to_docs_url(r['path'])
+                            url = r.get('doc_url', path_to_docs_url(r['path']))
                             title = r['title'] or r['path']
+                            source = r.get('source')
                             # Show a snippet of the content
                             snippet = r['content'][:120].replace('\n', ' ').strip()
-                            lines.append(f'**[{title}]({url})**\n{snippet}…')
+                            source_prefix = f'`{source}` ' if source else ''
+                            lines.append(f'**[{title}]({url})**\n{source_prefix}{snippet}…')
                     embed.description = '\n\n'.join(lines)
                     embed.set_footer(text=f'Use /ask para perguntas detalhadas • {DOCS_BASE_URL}')
                     await interaction.followup.send(embed=embed)
@@ -137,7 +139,8 @@ class Commands(commands.Cog):
     async def jvm_flags(self, interaction: discord.Interaction, ram: int):
         if ram < 512:
             await interaction.response.send_message(
-                'Recomendamos pelo menos 512 MB de RAM para um servidor Minecraft.',
+                'Recomendamos pelo menos 512 MB de RAM. Informe o valor em MB '
+                '(ex.: 4096 para 4 GB).',
                 ephemeral=True,
             )
             return
@@ -168,7 +171,7 @@ class Commands(commands.Cog):
             f'-Dusing.aikars.flags=https://mcflags.emc.gs -Daikars.new.flags=true'
         )
 
-        ram_label = f'{ram} MB ({ram // 1024} GB)' if ram >= 1024 else f'{ram} MB'
+        ram_label = f'{ram} MB ({ram / 1024:.1f} GB)' if ram >= 1024 else f'{ram} MB'
         embed = discord.Embed(
             title='⚙️ Flags JVM de Aikar',
             color=discord.Color.dark_green(),

@@ -52,7 +52,17 @@ def _compute_doc_url(path: str, base_url: str, url_strip_prefix: str = '') -> st
     """Convert a repo file path to its docs website URL."""
     if url_strip_prefix and path.startswith(url_strip_prefix):
         path = path[len(url_strip_prefix):]
-    url = path.replace('.md', '').replace('.mdx', '').replace('README', '').rstrip('/')
+    # Strip extension (suffix only, longest first to avoid .mdx -> x)
+    for ext in ('.mdx', '.md'):
+        if path.endswith(ext):
+            path = path[:-len(ext)]
+            break
+    # Strip README only from the final path segment
+    if path.endswith('/README'):
+        path = path[:-len('/README')]
+    elif path == 'README':
+        path = ''
+    url = path.rstrip('/')
     return f'{base_url}/{url}' if url else base_url
 
 
@@ -347,6 +357,9 @@ class DocsRAG(commands.Cog):
 
     async def index_docs(self):
         """Fetch all docs from all configured sources and create embeddings."""
+        if self._indexing:
+            logger.info("index_docs() called while already indexing; skipping")
+            return
         self._indexing = True
         try:
             await self._index_docs_inner()
@@ -362,7 +375,7 @@ class DocsRAG(commands.Cog):
         source_results = await asyncio.gather(*source_tasks, return_exceptions=True)
 
         all_chunks = []
-        for src, result in zip(DOC_SOURCES, source_results):
+        for src, result in zip(DOC_SOURCES, source_results, strict=True):
             if isinstance(result, Exception):
                 logger.error("Error indexing source '%s': %s", src['label'], result)
             else:
@@ -583,7 +596,7 @@ class DocsRAG(commands.Cog):
             inline=False,
         )
         embed.set_footer(
-            text=f"Miners' Refuge Docs • {DOCS_BASE_URL} • 💬 Responda a esta mensagem para continuar a conversa"
+            text=f"Documentação • {DOCS_BASE_URL} • 💬 Responda a esta mensagem para continuar a conversa"
         )
 
         return answer, embed
@@ -662,6 +675,12 @@ class DocsRAG(commands.Cog):
     @app_commands.command(name='reindex', description='Re-indexar a documentação (Admin)')
     @app_commands.checks.has_permissions(administrator=True)
     async def reindex(self, interaction: discord.Interaction):
+        if self._indexing:
+            await interaction.response.send_message(
+                '📚 Já há uma indexação em andamento, aguarde a conclusão.',
+                ephemeral=True,
+            )
+            return
         await interaction.response.defer(thinking=True)
         await self.index_docs()
         await interaction.followup.send(
