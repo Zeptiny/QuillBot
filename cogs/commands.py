@@ -42,6 +42,12 @@ class Commands(commands.Cog):
         if query:
             # Delegate to RAG search if available
             docs_rag = self.bot.cogs.get('DocsRAG')
+            if docs_rag and hasattr(docs_rag, '_indexing') and docs_rag._indexing:
+                await interaction.response.send_message(
+                    '📚 A documentação está sendo indexada. Tente novamente em alguns instantes.',
+                    ephemeral=True,
+                )
+                return
             if docs_rag and hasattr(docs_rag, 'search') and docs_rag.chunks:
                 await interaction.response.defer(thinking=True)
                 results = await docs_rag.search(query, top_k=5)
@@ -193,6 +199,15 @@ class Commands(commands.Cog):
         )
         embed.set_footer(text=footer)
         await interaction.response.send_message(embed=embed)
+
+    @app_commands.command(name='sync', description='Sincronizar comandos slash com o Discord (Admin)')
+    @app_commands.checks.has_permissions(administrator=True)
+    async def sync_commands(self, interaction: discord.Interaction):
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        synced = await self.bot.tree.sync()
+        await interaction.followup.send(
+            f'✅ {len(synced)} comandos sincronizados.', ephemeral=True
+        )
 
 
 async def setup(bot: commands.Bot):

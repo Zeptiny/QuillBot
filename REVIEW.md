@@ -62,21 +62,4 @@ Multi-step `discord.ui.Modal`:
 - Expose as an LLM tool (`check_compatibility`) for natural-language queries
 - Addresses the most repetitive question type in support channels
 
----
 
-## 3. UX Enhancements (Minor)
-
-- **Autocomplete on `/plugin name`** — Use `app_commands.autocomplete` with Modrinth search suggestions
-- **Pagination for long results** — Use `discord.ui.View` with prev/next buttons for `/plugin` and `/docs` results
-- **Inform users when RAG isn't ready** — `/docs` with query should say "indexação em andamento" instead of silently falling back
-- **Add `/sync` admin command** — Replace the removed `on_ready` auto-sync with a manual admin command:
-
-```python
-@app_commands.command(name='sync', description='Sincronizar comandos (Admin)')
-@app_commands.checks.has_permissions(administrator=True)
-async def sync_commands(self, interaction: discord.Interaction):
-    synced = await interaction.client.tree.sync()
-    await interaction.response.send_message(
-        f'✅ {len(synced)} comandos sincronizados.', ephemeral=True
-    )
-```

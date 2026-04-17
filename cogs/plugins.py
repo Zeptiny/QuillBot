@@ -17,12 +17,90 @@ from cogs.plugin_apis import (
 from config import DOCS_BRANCH, GITHUB_API
 
 
+import asyncio
+import logging
+import re
+import urllib.parse
+
+import aiohttp
+import discord
+from discord import app_commands
+from discord.ext import commands
+
+from cogs.plugin_apis import (
+    HTTP_HEADERS as _HEADERS,
+    search_hangar,
+    search_modrinth,
+    search_spiget,
+)
+from config import DOCS_BRANCH, GITHUB_API
+
+
 # Basic hostname/IP pattern: letters, digits, dots, colons, hyphens; optional port
 _IP_PATTERN = re.compile(r'^[\w.:-]+$')
 
 logger = logging.getLogger(__name__)
 
 MCSRVSTAT_API = 'https://api.mcsrvstat.us/3'
+
+
+def _format_plugin_list(results: list[dict]) -> str:
+    lines = []
+    for r in results:
+        versions = ', '.join(str(v) for v in r['versions'][:3]) if r['versions'] else '—'
+        desc = r['description']
+        line = (
+            f"**[{r['name']}]({r['url']})** por `{r['author']}`\n"
+            f"⬇️ `{r['downloads']:,}` downloads | 🎮 `{versions}`"
+        )
+        if desc:
+            line += f"\n{desc}"
+        lines.append(line)
+    return '\n\n'.join(lines) if lines else 'Sem resultados.'
+
+
+class PluginResultView(discord.ui.View):
+    """Paginated view cycling through one plugin source per page."""
+
+    def __init__(self, query: str, pages: list[tuple[str, str]]):
+        super().__init__(timeout=120)
+        self.query = query
+        self.pages = pages
+        self.index = 0
+        self._sync_buttons()
+
+    def _sync_buttons(self) -> None:
+        self.prev_btn.disabled = self.index == 0
+        self.next_btn.disabled = self.index >= len(self.pages) - 1
+        self.counter_btn.label = f'{self.index + 1}/{len(self.pages)}'
+
+    def current_embed(self) -> discord.Embed:
+        source_label, text = self.pages[self.index]
+        embed = discord.Embed(
+            title=f'🔌 Plugins: {self.query}',
+            color=discord.Color.green(),
+        )
+        embed.add_field(name=source_label, value=text, inline=False)
+        embed.set_footer(
+            text=f'Página {self.index + 1} de {len(self.pages)} • Modrinth, Hangar e SpigotMC'
+        )
+        return embed
+
+    @discord.ui.button(label='◄', style=discord.ButtonStyle.secondary)
+    async def prev_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.index -= 1
+        self._sync_buttons()
+        await interaction.response.edit_message(embed=self.current_embed(), view=self)
+
+    @discord.ui.button(label='1/1', style=discord.ButtonStyle.secondary, disabled=True)
+    async def counter_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+
+    @discord.ui.button(label='►', style=discord.ButtonStyle.secondary)
+    async def next_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.index += 1
+        self._sync_buttons()
+        await interaction.response.edit_message(embed=self.current_embed(), view=self)
 
 
 class PluginSearch(commands.Cog):
@@ -55,64 +133,47 @@ class PluginSearch(commands.Cog):
 
     # --- /plugin ---
 
-    @staticmethod
-    def _format_plugin_list(results: list[dict]) -> str:
-        lines = []
-        for r in results:
-            versions = ', '.join(str(v) for v in r['versions'][:3]) if r['versions'] else '—'
-            desc = r['description']
-            line = (
-                f"**[{r['name']}]({r['url']})** por `{r['author']}`\n"
-                f"⬇️ `{r['downloads']:,}` downloads | 🎮 `{versions}`"
-            )
-            if desc:
-                line += f"\n{desc}"
-            lines.append(line)
-        return '\n\n'.join(lines) if lines else 'Sem resultados.'
-
     @app_commands.command(name='plugin', description='Pesquisa um plugin no Modrinth, Hangar e SpigotMC')
     @app_commands.describe(name='Nome do plugin para pesquisar')
     async def plugin_search(self, interaction: discord.Interaction, name: str):
         await interaction.response.defer(thinking=True)
 
-        modrinth_results, hangar_results = await asyncio.gather(
+        modrinth_results, hangar_results, spiget_results = await asyncio.gather(
             search_modrinth(self.session, name),
             search_hangar(self.session, name),
+            search_spiget(self.session, name),
         )
 
-        secondary_results = hangar_results
-        if not modrinth_results and not secondary_results:
-            # Fallback to Spiget
-            spiget_results = await search_spiget(self.session, name)
-            if not spiget_results:
-                await interaction.followup.send(
-                    f'Nenhum plugin encontrado para `{name}`.'
-                )
-                return
-            secondary_results = spiget_results
-
-        embed = discord.Embed(
-            title=f'🔌 Plugins encontrados: {name}',
-            color=discord.Color.green(),
-        )
-
+        pages: list[tuple[str, str]] = []
         if modrinth_results:
-            embed.add_field(
-                name='🟢 Modrinth',
-                value=self._format_plugin_list(modrinth_results),
-                inline=False,
-            )
+            pages.append(('🟢 Modrinth', _format_plugin_list(modrinth_results)))
+        if hangar_results:
+            pages.append(('🔵 Hangar', _format_plugin_list(hangar_results)))
+        if spiget_results:
+            pages.append(('🟠 SpigotMC', _format_plugin_list(spiget_results)))
 
-        if secondary_results:
-            source_name = secondary_results[0].get('source', 'Hangar')
-            embed.add_field(
-                name=f'🔵 {source_name}',
-                value=self._format_plugin_list(secondary_results),
-                inline=False,
-            )
+        if not pages:
+            await interaction.followup.send(f'Nenhum plugin encontrado para `{name}`.')
+            return
 
-        embed.set_footer(text='Dados do Modrinth, Hangar e SpigotMC')
-        await interaction.followup.send(embed=embed)
+        view = PluginResultView(name, pages)
+        await interaction.followup.send(embed=view.current_embed(), view=view)
+
+    @plugin_search.autocomplete('name')
+    async def _plugin_name_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        if not self.session or len(current) < 2:
+            return []
+        try:
+            results = await search_modrinth(self.session, current)
+            return [
+                app_commands.Choice(name=r['name'][:100], value=r['name'][:100])
+                for r in results[:6]
+            ]
+        except Exception:
+            logger.exception('Autocomplete error for query %r', current)
+            return []
 
     # --- /status ---
 
