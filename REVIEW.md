@@ -40,6 +40,38 @@ if history and len(history) > 1:
 max_tokens=2048
 ```
 
+### 1.5 De-duplicate Tool Results Across Rounds
+
+**Current behavior:**
+- If the LLM calls `search_docs` multiple times (in different tool rounds), the same document chunks may appear in both results
+- The assistant repeats information redundantly in its final answer
+
+**Action items:**
+1. **Verify** — check `docs_rag.py` agentic loop to confirm if duplicate `search_docs` calls occur in practice
+2. **If confirmed** — track `all_sources` across rounds and filter duplicates before sending to LLM
+3. **Optional enhancement** — add a memo/context field to the LLM stating "avoid repeating these sources you just retrieved"
+
+**Note:** This is lower priority than 1.3/1.4 and depends on runtime observation.
+
+### 1.6 Add Gamemode Knowledge Base
+
+**Rationale:**
+- Most common admin questions involve choosing between Survival, Creative, Adventure, and Spectator
+- Resource usage, difficulty balancing, and version compatibility vary per gamemode
+- Currently the LLM has no structured gamemode reference
+
+**Implementation:**
+1. Create a new RAG vector store or static context chunk: `gamemode_reference.md`
+   - Survival: description, typical configs, RAM usage, common settings changes
+   - Creative: building/testing specific requirements, performance tips
+   - Adventure: map design constraints, custom rules
+   - Spectator: spectator-only server considerations
+2. Include per-gamemode recommendations:
+   - Most common MC versions (e.g., Survival = latest; Creative = stable)
+   - PaperMC config tuning (e.g., `mob-spawning.per-player`, `difficulty`)
+   - Plugin compatibility by gamemode
+3. Embed during initial `/reindex` so the LLM can cite it naturally
+
 ---
 
 ## 2. Feature Roadmap
