@@ -46,6 +46,12 @@ max_tokens=2048
 
 ### 2.1 Interactive Timings/Spark Analysis (High Impact)
 
+Add `/timings` command:
+- Accept Spark report URL (`spark.lucko.me`)
+- Parse heap summary, tick stats, top plugins from the Spark JSON API
+- Feed structured data to the LLM for diagnosis
+- Most commonly shared artifact in MC admin channels
+
 ### 2.2 Server Configuration Wizard (Medium Impact)
 
 Multi-step `discord.ui.Modal`:
