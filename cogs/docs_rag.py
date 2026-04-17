@@ -48,6 +48,22 @@ def cosine_similarity(a: list[float], b: list[float]) -> float:
     return dot / (norm_a * norm_b)
 
 
+def _parse_frontmatter(content: str) -> dict:
+    """Extract key-value pairs from YAML frontmatter (between --- delimiters)."""
+    if not content.startswith('---'):
+        return {}
+    end = content.find('\n---', 3)
+    if end == -1:
+        return {}
+    fm_text = content[3:end]
+    result = {}
+    for line in fm_text.splitlines():
+        m = re.match(r'^(\w+)\s*:\s*(.+)$', line)
+        if m:
+            result[m.group(1)] = m.group(2).strip().strip('"\'')
+    return result
+
+
 def _compute_doc_url(path: str, base_url: str, url_strip_prefix: str = '') -> str:
     """Convert a repo file path to its docs website URL."""
     if url_strip_prefix and path.startswith(url_strip_prefix):
@@ -223,6 +239,9 @@ class DocsRAG(commands.Cog):
         return list(dict.fromkeys(paths))  # deduplicate preserving order
 
     def _extract_title(self, content: str) -> str:
+        fm = _parse_frontmatter(content)
+        if fm.get('title'):
+            return fm['title']
         match = re.search(r'^#\s+(.+)', content, re.MULTILINE)
         return match.group(1).strip() if match else ''
 
@@ -342,7 +361,12 @@ class DocsRAG(commands.Cog):
         fetched = 0
         for path, content in results:
             if content:
-                doc_url = _compute_doc_url(path, base_url, url_strip_prefix)
+                fm = _parse_frontmatter(content)
+                slug = fm.get('slug')
+                if slug:
+                    doc_url = f'{base_url}/{slug}'
+                else:
+                    doc_url = _compute_doc_url(path, base_url, url_strip_prefix)
                 for chunk in self._chunk_text(content, path):
                     chunk['source'] = label
                     chunk['doc_url'] = doc_url

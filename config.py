@@ -54,9 +54,9 @@ DOC_SOURCES: Final[list[dict]] = [
         'branch': 'main',
         'base_url': 'https://docs.papermc.io',
         'label': 'PaperMC',
-        'path_prefix': 'docs/paper/admin',
-        'url_strip_prefix': 'docs/',
-        'max_files': 30,
+        'path_prefix': 'src/content/docs/paper/admin/',
+        'url_strip_prefix': 'src/content/docs/',
+        'max_files': 400,
     },
 ]
 
