@@ -7,30 +7,6 @@ Organized by priority.
 
 ## 1. LLM / Prompting Improvements
 
-### 1.2 Improve Tool Definitions
-
-Add a `max_results` parameter to `search_docs` so the LLM can control result granularity:
-
-```python
-{
-    'type': 'function',
-    'function': {
-        'name': 'search_docs',
-        'parameters': {
-            'type': 'object',
-            'properties': {
-                'query': {'type': 'string', 'description': '...'},
-                'max_results': {
-                    'type': 'integer',
-                    'description': 'Número máximo de resultados (1-12). Default: 5.',
-                },
-            },
-            'required': ['query'],
-        },
-    },
-}
-```
-
 ### 1.3 New Tools to Expose
 
 | Tool | Source | Purpose |

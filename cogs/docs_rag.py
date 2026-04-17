@@ -61,7 +61,8 @@ TOOLS = [
             'name': 'search_docs',
             'description': (
                 'Pesquisa na documentação do Miners\' Refuge, PaperMC e PurpurMC. '
-                'Use para qualquer pergunta sobre configuração, administração ou setup de servidores Minecraft.'
+                'Use para qualquer pergunta sobre configuração, administração ou setup de servidores Minecraft. '
+                'Não use para perguntas sobre plugins específicos — use search_plugins para isso.'
             ),
             'parameters': {
                 'type': 'object',
@@ -69,6 +70,14 @@ TOOLS = [
                     'query': {
                         'type': 'string',
                         'description': 'A consulta de busca em linguagem natural.',
+                    },
+                    'max_results': {
+                        'type': 'integer',
+                        'description': (
+                            'Número máximo de resultados a retornar (1-12). '
+                            'Use valores menores (3-5) para perguntas focadas e maiores (8-12) '
+                            'para tópicos amplos que podem abranger múltiplas páginas. Default: 5.'
+                        ),
                     },
                 },
                 'required': ['query'],
@@ -81,7 +90,8 @@ TOOLS = [
             'name': 'search_plugins',
             'description': (
                 'Pesquisa plugins no Modrinth, Hangar e SpigotMC. '
-                'Use quando o usuário perguntar sobre plugins, recomendações de plugins ou alternativas.'
+                'Use quando o usuário perguntar sobre plugins, recomendações de plugins ou alternativas. '
+                'Não use para perguntas gerais de configuração de servidor — use search_docs para isso.'
             ),
             'parameters': {
                 'type': 'object',
@@ -607,7 +617,8 @@ class DocsRAG(commands.Cog):
         """Execute a tool call and return (result_text, source_chunks)."""
         if name == 'search_docs':
             query = args.get('query', '')
-            results = await self.search(query)
+            top_k = max(1, min(12, int(args.get('max_results', 5))))
+            results = await self.search(query, top_k=top_k)
             if not results:
                 return 'Nenhum resultado encontrado na documentação.', []
             parts = []
