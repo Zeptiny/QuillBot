@@ -113,6 +113,72 @@ def _parse_link(text: str) -> tuple[str | None, str | None]:
     return None, None
 
 
+class AnalyzeView(discord.ui.View):
+    """Button offered when a log paste has no automatic pattern match — triggers AI analysis."""
+
+    def __init__(self, analyzer: 'LogAnalyzer', fetch_url: str, mclogs_url: str | None):
+        super().__init__(timeout=300)
+        self.analyzer = analyzer
+        self.fetch_url = fetch_url
+        self.mclogs_url = mclogs_url
+        self._used = False
+
+    @discord.ui.button(label='🔍 Analisar com IA', style=discord.ButtonStyle.primary)
+    async def analyze_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self._used:
+            await interaction.response.send_message(
+                'Esta análise já foi solicitada.', ephemeral=True
+            )
+            return
+        if not self.analyzer.ai_client:
+            await interaction.response.send_message(
+                '⚠️ IA não disponível: chave de API não configurada.', ephemeral=True
+            )
+            return
+        self._used = True
+        button.disabled = True
+        await interaction.response.edit_message(view=self)
+
+        content, _ = await self.analyzer.read_file_content(self.fetch_url)
+        if not content:
+            await interaction.followup.send(
+                'Não foi possível re-ler o conteúdo para análise.', ephemeral=True
+            )
+            return
+        try:
+            analysis = await self.analyzer._analyze_with_ai(log_content=content)
+        except RateLimitError:
+            await interaction.followup.send(
+                '⏳ Limite de requisições atingido. Tente novamente em alguns minutos.',
+                ephemeral=True,
+            )
+            return
+        except Exception:
+            logger.exception("AI analysis failed from AnalyzeView button")
+            await interaction.followup.send('Erro ao analisar o log.', ephemeral=True)
+            return
+
+        if not analysis:
+            await interaction.followup.send('Não foi possível gerar análise.', ephemeral=True)
+            return
+
+        pages = split_response(analysis)
+        embeds = []
+        for i, page_text in enumerate(pages):
+            e = discord.Embed(
+                title='🔬 Análise de Log' if i == 0 else '',
+                description=page_text,
+                color=discord.Color.orange(),
+            )
+            if i == 0 and self.mclogs_url:
+                e.add_field(name='mclo.gs', value=f'[Ver log]({self.mclogs_url})', inline=True)
+            embeds.append(e)
+        if len(embeds) == 1:
+            await interaction.followup.send(embed=embeds[0])
+        else:
+            await interaction.followup.send(embed=embeds[0], view=PaginatedEmbedView(embeds))
+
+
 class LogAnalyzer(commands.Cog):
     """Analyzes logs and error messages sent in chat."""
 
@@ -216,6 +282,7 @@ class LogAnalyzer(commands.Cog):
 
         # Check for paste service links
         fetch_url, mclogs_url = _parse_link(content)
+        link_content: str | None = None
 
         if fetch_url:
             await message.add_reaction('👀')
@@ -232,15 +299,25 @@ class LogAnalyzer(commands.Cog):
                         if not response:
                             response = check_message(file_content)
                         mclogs_url = await self.upload_mclogs(file_content)
+                        note = (
+                            ' ⚠️ O arquivo era muito grande — apenas os primeiros '
+                            f'{MAX_CONTENT_SIZE // (1024 * 1024)} MB foram lidos.'
+                            if was_truncated else ''
+                        )
+                        # Offer AI analysis when no regex pattern matched
+                        raw_url = (
+                            f'https://api.mclo.gs/1/raw/{mclogs_url.rsplit("/", 1)[-1]}'
+                            if mclogs_url else attachment.url
+                        )
+                        ai_view = (
+                            AnalyzeView(self, raw_url, mclogs_url)
+                            if not response and self.ai_client else None
+                        )
                         if mclogs_url:
-                            note = (
-                                ' ⚠️ O arquivo era muito grande — apenas os primeiros '
-                                f'{MAX_CONTENT_SIZE // (1024 * 1024)} MB foram lidos.'
-                                if was_truncated else ''
-                            )
                             await message.reply(
                                 f'Na próxima vez busque utilizar um serviço para enviar suas logs, '
-                                f'como o mclo.gs, fiz o upload para você <3:\n<{mclogs_url}>{note}'
+                                f'como o mclo.gs, fiz o upload para você <3:\n<{mclogs_url}>{note}',
+                                view=ai_view,
                             )
                         else:
                             await message.reply(
@@ -249,6 +326,13 @@ class LogAnalyzer(commands.Cog):
                             )
                         if response:
                             break
+
+        # For paste links with no regex match, offer AI analysis as a follow-up prompt
+        if fetch_url and link_content and not response and self.ai_client:
+            await message.reply(
+                '🤔 Não reconheci nenhum erro específico no log. Deseja uma análise com IA?',
+                view=AnalyzeView(self, fetch_url, mclogs_url),
+            )
 
         if response:
             await message.reply(response)
