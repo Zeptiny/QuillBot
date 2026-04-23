@@ -1,8 +1,30 @@
+import logging
+
 import discord
+from cachetools import TTLCache
 from discord import app_commands
 from discord.ext import commands
+from openai import AsyncOpenAI, RateLimitError
 
-from config import DOCS_BASE_URL
+from cogs.utils import PaginatedEmbedView, split_response
+from config import CHAT_MODEL, COOLDOWN_PER, COOLDOWN_RATE, DOCS_BASE_URL, OPENROUTER_API_KEY
+
+logger = logging.getLogger(__name__)
+
+GENERAL_SYSTEM_PROMPT = (
+    "<role>\n"
+    "Você é um assistente de propósito geral do servidor Miners' Refuge. "
+    "Responda sempre em português brasileiro.\n"
+    "</role>\n\n"
+    "<instructions>\n"
+    "1. Responda perguntas gerais com base no seu conhecimento.\n"
+    "2. Seja honesto quando não souber a resposta — não invente informações.\n"
+    "3. Quando útil, termine com uma sugestão de acompanhamento na linha final, prefixada com '💡 '.\n"
+    "</instructions>\n\n"
+    "<response_format>\n"
+    "Seja claro e conciso. Use markdown para formatação quando aplicável.\n"
+    "</response_format>"
+)
 
 
 class Commands(commands.Cog):
@@ -10,6 +32,14 @@ class Commands(commands.Cog):
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        self.client: AsyncOpenAI | None = None
+        if OPENROUTER_API_KEY:
+            self.client = AsyncOpenAI(
+                base_url='https://openrouter.ai/api/v1',
+                api_key=OPENROUTER_API_KEY,
+            )
+        # TTL cache: max 200 conversations, each expires after 30 min
+        self._conversations: TTLCache = TTLCache(maxsize=200, ttl=1800)
 
     @app_commands.command(name="plov", description="Informações necessárias para escolher um serviço de hospedagem")
     async def hosting_info(self, interaction: discord.Interaction):
@@ -208,6 +238,175 @@ class Commands(commands.Cog):
         await interaction.followup.send(
             f'✅ {len(synced)} comandos sincronizados.', ephemeral=True
         )
+
+    @app_commands.command(name='chat', description='Faça uma pergunta geral ao assistente')
+    @app_commands.checks.cooldown(COOLDOWN_RATE, COOLDOWN_PER)
+    @app_commands.describe(
+        question='Sua pergunta',
+        image='Imagem/screenshot para análise (opcional)',
+    )
+    async def chat(
+        self,
+        interaction: discord.Interaction,
+        question: str,
+        image: discord.Attachment | None = None,
+    ):
+        if not self.client:
+            await interaction.response.send_message(
+                '⚠️ Comando indisponível: chave de API não configurada.', ephemeral=True
+            )
+            return
+
+        image_url = None
+        if image:
+            if not image.content_type or not image.content_type.startswith('image/'):
+                await interaction.response.send_message(
+                    'O arquivo enviado não é uma imagem válida.', ephemeral=True
+                )
+                return
+            image_url = image.url
+
+        await interaction.response.defer(thinking=True)
+
+        try:
+            answer, embeds = await self._run_chat(question, image_url=image_url)
+            if len(embeds) == 1:
+                msg = await interaction.followup.send(embed=embeds[0], wait=True)
+            else:
+                msg = await interaction.followup.send(
+                    embed=embeds[0], view=PaginatedEmbedView(embeds), wait=True
+                )
+            self._conversations[msg.id] = {
+                'question': question,
+                'answer': answer,
+                'history': [],
+            }
+
+        except RateLimitError:
+            await interaction.followup.send(
+                '⏳ Limite de requisições atingido. Tente novamente em alguns minutos.'
+            )
+        except Exception:
+            logger.exception("Error in /chat command")
+            await interaction.followup.send(
+                'Ocorreu um erro ao processar sua pergunta. Tente novamente mais tarde.'
+            )
+
+    async def _run_chat(
+        self,
+        question: str,
+        history: list[dict] | None = None,
+        image_url: str | None = None,
+    ) -> tuple[str, list[discord.Embed]]:
+        messages = [{'role': 'system', 'content': GENERAL_SYSTEM_PROMPT}]
+
+        if history:
+            for h in history[-3:]:
+                messages.append({'role': 'user', 'content': h['question']})
+                messages.append({'role': 'assistant', 'content': h['answer']})
+
+        if image_url:
+            messages.append({
+                'role': 'user',
+                'content': [
+                    {'type': 'text', 'text': question},
+                    {'type': 'image_url', 'image_url': {'url': image_url}},
+                ],
+            })
+        else:
+            messages.append({'role': 'user', 'content': question})
+
+        response = await self.client.chat.completions.create(
+            model=CHAT_MODEL,
+            messages=messages,
+            max_tokens=1024,
+        )
+        answer = response.choices[0].message.content or 'Não foi possível gerar uma resposta.'
+
+        pages = split_response(answer)
+        total = len(pages)
+        footer_base = "💬 Assistente geral • Miners' Refuge"
+        embeds: list[discord.Embed] = []
+        for i, page_text in enumerate(pages):
+            e = discord.Embed(
+                title=f'💬 {question}' if i == 0 else '',
+                description=page_text,
+                color=discord.Color.teal(),
+            )
+            e.set_footer(
+                text=f"Página {i + 1}/{total} • {footer_base}" if total > 1 else footer_base
+            )
+            embeds.append(e)
+
+        return answer, embeds
+
+    async def cog_app_command_error(
+        self, interaction: discord.Interaction, error: app_commands.AppCommandError
+    ):
+        if isinstance(error, app_commands.CommandOnCooldown):
+            await interaction.response.send_message(
+                f'⏳ Aguarde {error.retry_after:.0f}s antes de usar este comando novamente.',
+                ephemeral=True,
+            )
+        else:
+            raise error
+
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message):
+        """Handle reply-based follow-up conversations for /chat."""
+        if message.author.bot:
+            return
+        if not message.reference or not message.reference.message_id:
+            return
+
+        ref_id = message.reference.message_id
+        conv = self._conversations.get(ref_id)
+        if not conv:
+            return
+
+        follow_up_question = message.content.strip()
+        if not follow_up_question and not message.attachments:
+            return
+
+        image_url = None
+        for att in message.attachments:
+            if att.content_type and att.content_type.startswith('image/'):
+                image_url = att.url
+                break
+
+        if not follow_up_question:
+            follow_up_question = 'Analise esta imagem.'
+
+        async with message.channel.typing():
+            try:
+                history = conv.get('history', []).copy()
+                history.append({'question': conv['question'], 'answer': conv['answer']})
+
+                answer, embeds = await self._run_chat(
+                    follow_up_question, history=history, image_url=image_url
+                )
+
+                if len(embeds) == 1:
+                    reply = await message.reply(embed=embeds[0])
+                else:
+                    reply = await message.reply(
+                        embed=embeds[0], view=PaginatedEmbedView(embeds)
+                    )
+
+                self._conversations[reply.id] = {
+                    'question': follow_up_question,
+                    'answer': answer,
+                    'history': history,
+                }
+            except RateLimitError:
+                await message.reply(
+                    '⏳ Limite de requisições atingido. Tente novamente em alguns minutos.'
+                )
+            except Exception:
+                logger.exception("Error in /chat follow-up reply")
+                await message.reply(
+                    'Ocorreu um erro ao processar sua pergunta. Tente novamente.'
+                )
 
 
 async def setup(bot: commands.Bot):
