@@ -101,12 +101,10 @@ async def search_spiget(session: aiohttp.ClientSession, query: str) -> list[dict
 
 
 async def search_all(session: aiohttp.ClientSession, query: str) -> list[dict]:
-    """Search Modrinth, Hangar, and Spiget concurrently."""
-    modrinth, hangar = await asyncio.gather(
+    """Search Modrinth, Hangar, and SpigotMC concurrently."""
+    modrinth, hangar, spiget = await asyncio.gather(
         search_modrinth(session, query),
         search_hangar(session, query),
+        search_spiget(session, query),
     )
-    results = modrinth + hangar
-    if not results:
-        results = await search_spiget(session, query)
-    return results
+    return modrinth + hangar + spiget
