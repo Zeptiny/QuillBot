@@ -17,25 +17,6 @@ from cogs.plugin_apis import (
 from config import DOCS_BRANCH, GITHUB_API
 
 
-import asyncio
-import logging
-import re
-import urllib.parse
-
-import aiohttp
-import discord
-from discord import app_commands
-from discord.ext import commands
-
-from cogs.plugin_apis import (
-    HTTP_HEADERS as _HEADERS,
-    search_hangar,
-    search_modrinth,
-    search_spiget,
-)
-from config import DOCS_BRANCH, GITHUB_API
-
-
 # Basic hostname/IP pattern: letters, digits, dots, colons, hyphens; optional port
 _IP_PATTERN = re.compile(r'^[\w.:-]+$')
 
