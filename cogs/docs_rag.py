@@ -1,12 +1,13 @@
 import asyncio
+import hashlib
 import json
 import logging
-import math
 import os
 import re
 
 import aiohttp
 import discord
+import numpy as np
 from cachetools import TTLCache
 from discord import app_commands
 from discord.ext import commands, tasks
@@ -137,15 +138,6 @@ TOOLS = [
 ]
 
 
-def cosine_similarity(a: list[float], b: list[float]) -> float:
-    dot = sum(x * y for x, y in zip(a, b))
-    norm_a = math.sqrt(sum(x * x for x in a))
-    norm_b = math.sqrt(sum(x * x for x in b))
-    if norm_a == 0 or norm_b == 0:
-        return 0.0
-    return dot / (norm_a * norm_b)
-
-
 def _parse_frontmatter(content: str) -> dict:
     """Extract key-value pairs from YAML frontmatter (between --- delimiters)."""
     if not content.startswith('---'):
@@ -211,6 +203,7 @@ class DocsRAG(commands.Cog):
         self.chunks: list[dict] = []  # {content, path, title, embedding, source, doc_url}
         self._last_commit_sha: str | None = None
         self._indexing: bool = False
+        self._emb_matrix: np.ndarray | None = None  # (N, dim) float32 for vectorized search
         # TTL cache: max 200 conversations, each expires after 30 min
         self._conversations: TTLCache = TTLCache(maxsize=200, ttl=1800)
 
@@ -244,46 +237,85 @@ class DocsRAG(commands.Cog):
 
     # --- Vector Storage ---
 
+    def _rebuild_matrix(self) -> None:
+        """Rebuild the numpy embedding matrix from current chunks."""
+        if not self.chunks:
+            self._emb_matrix = None
+            return
+        self._emb_matrix = np.array(
+            [c['embedding'] for c in self.chunks], dtype=np.float32
+        )
+
     def _save_vectors(self):
-        """Persist chunks and embeddings to disk."""
+        """Persist chunk metadata to JSON and embeddings to a numpy binary file."""
         os.makedirs(os.path.dirname(VECTOR_STORE_PATH), exist_ok=True)
-        data = {
+        meta = {
             'commit_sha': self._last_commit_sha,
             'chunks': [
                 {
                     'content': c['content'],
                     'path': c['path'],
                     'title': c['title'],
-                    'embedding': c['embedding'],
                     'source': c.get('source', "Miners' Refuge"),
                     'doc_url': c.get('doc_url', path_to_docs_url(c['path'])),
+                    # embeddings stored separately in .npy
                 }
                 for c in self.chunks
             ],
         }
         with open(VECTOR_STORE_PATH, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False)
-        logger.info("Saved %d vectors to %s", len(self.chunks), VECTOR_STORE_PATH)
+            json.dump(meta, f, ensure_ascii=False)
+        npy_path = os.path.splitext(VECTOR_STORE_PATH)[0] + '.npy'
+        embeddings = np.array([c['embedding'] for c in self.chunks], dtype=np.float32)
+        np.save(npy_path, embeddings)
+        self._emb_matrix = embeddings
+        logger.info("Saved %d vectors to %s + %s", len(self.chunks), VECTOR_STORE_PATH, npy_path)
 
     def _load_vectors(self) -> bool:
-        """Load vectors from disk. Returns True if loaded successfully."""
+        """Load chunk metadata from JSON and embeddings from numpy binary file."""
         if not os.path.exists(VECTOR_STORE_PATH):
             return False
+        npy_path = os.path.splitext(VECTOR_STORE_PATH)[0] + '.npy'
         try:
             with open(VECTOR_STORE_PATH, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             chunks = data.get('chunks', [])
-            # Backfill fields absent in older vector store formats
+
+            if os.path.exists(npy_path):
+                # New binary format
+                embeddings = np.load(npy_path)
+                if len(embeddings) != len(chunks):
+                    logger.warning(
+                        "Embedding count mismatch (%d vs %d chunks), will reindex",
+                        len(embeddings), len(chunks),
+                    )
+                    return False
+                for chunk, emb in zip(chunks, embeddings):
+                    chunk['embedding'] = emb
+            elif chunks and 'embedding' in chunks[0]:
+                # Old JSON-with-embeddings format — migrate on load
+                logger.info("Migrating vector store from JSON to binary format...")
+                embeddings = np.array([c.pop('embedding') for c in chunks], dtype=np.float32)
+                for chunk, emb in zip(chunks, embeddings):
+                    chunk['embedding'] = emb
+            else:
+                logger.warning("No embeddings found in vector store, will reindex")
+                return False
+
             for chunk in chunks:
                 chunk.setdefault('source', "Miners' Refuge")
                 chunk.setdefault('doc_url', path_to_docs_url(chunk['path']))
             self.chunks = chunks
             self._last_commit_sha = data.get('commit_sha')
+            self._rebuild_matrix()
             logger.info(
                 "Loaded %d vectors from disk (commit: %s)",
                 len(self.chunks),
                 self._last_commit_sha,
             )
+            # If loaded from old format, immediately save in new binary format
+            if not os.path.exists(npy_path):
+                self._save_vectors()
             return bool(self.chunks)
         except Exception:
             logger.exception("Failed to load vectors from %s", VECTOR_STORE_PATH)
@@ -525,6 +557,7 @@ class DocsRAG(commands.Cog):
 
         self.chunks = [c for c in all_chunks if 'embedding' in c]
         logger.info("Documentation indexed: %d chunks with embeddings", len(self.chunks))
+        self._rebuild_matrix()
 
         # Track primary source commit SHA and persist
         self._last_commit_sha = await self._get_latest_commit_sha()
@@ -563,9 +596,21 @@ class DocsRAG(commands.Cog):
         # Fallback: return documents as-is (already sorted by cosine similarity)
         return documents[:top_n]
 
-    async def search(self, query: str, top_k: int = 12) -> list[dict]:
-        if not self.chunks:
+    async def search(self, query: str, top_k: int = 12, source_filter: str | None = None) -> list[dict]:
+        if not self.chunks or self._emb_matrix is None:
             return []
+
+        # Apply optional source filter
+        if source_filter:
+            indices = [i for i, c in enumerate(self.chunks) if c.get('source') == source_filter]
+            if not indices:
+                return []
+            idx_arr = np.array(indices)
+            chunks = [self.chunks[i] for i in indices]
+            emb_matrix = self._emb_matrix[idx_arr]
+        else:
+            chunks = self.chunks
+            emb_matrix = self._emb_matrix
 
         try:
             query_emb = (await self._embed_batch([query]))[0]
@@ -573,15 +618,14 @@ class DocsRAG(commands.Cog):
             logger.exception("Failed to embed query")
             return []
 
-        scored = []
-        for chunk in self.chunks:
-            score = cosine_similarity(query_emb, chunk['embedding'])
-            scored.append((score, chunk))
+        query_arr = np.array(query_emb, dtype=np.float32)
+        dots = emb_matrix @ query_arr
+        norms = np.linalg.norm(emb_matrix, axis=1) * np.linalg.norm(query_arr)
+        with np.errstate(invalid='ignore', divide='ignore'):
+            scores = np.where(norms > 0, dots / norms, 0.0)
 
-        scored.sort(key=lambda x: x[0], reverse=True)
-
-        # Take top candidates for reranking (wider net than final top_k)
-        candidates = [c for _, c in scored[:top_k * 3]]
+        top_indices = np.argsort(scores)[::-1][:top_k * 3]
+        candidates = [chunks[i] for i in top_indices]
 
         # Rerank for better precision
         reranked = await self._rerank(query, candidates, top_n=top_k)
