@@ -15,7 +15,7 @@ SPIGET_API = 'https://api.spiget.org/v2'
 HTTP_HEADERS = {'User-Agent': 'QuillBot/1.0 (github.com/Zeptiny/QuillBot)'}
 
 
-async def _get_json(
+async def get_json(
     session: aiohttp.ClientSession, url: str, **kwargs
 ) -> dict | list | None:
     """Fetch JSON from a URL, returning None on failure."""
@@ -35,7 +35,7 @@ async def search_modrinth(session: aiohttp.ClientSession, query: str) -> list[di
         'limit': 3,
         'facets': json.dumps([['project_type:plugin']]),
     }
-    data = await _get_json(session, f'{MODRINTH_API}/search', params=params)
+    data = await get_json(session, f'{MODRINTH_API}/search', params=params)
     if not data:
         return []
     results = []
@@ -56,7 +56,7 @@ async def search_modrinth(session: aiohttp.ClientSession, query: str) -> list[di
 
 async def search_hangar(session: aiohttp.ClientSession, query: str) -> list[dict]:
     params = {'q': query, 'limit': 3}
-    data = await _get_json(session, f'{HANGAR_API}/projects', params=params)
+    data = await get_json(session, f'{HANGAR_API}/projects', params=params)
     if not data:
         return []
     results = []
@@ -78,7 +78,7 @@ async def search_hangar(session: aiohttp.ClientSession, query: str) -> list[dict
 
 async def search_spiget(session: aiohttp.ClientSession, query: str) -> list[dict]:
     encoded = urllib.parse.quote(query)
-    data = await _get_json(
+    data = await get_json(
         session,
         f'{SPIGET_API}/search/resources/{encoded}'
         '?sort=-downloads&size=3&fields=id,name,downloads,testedVersions',

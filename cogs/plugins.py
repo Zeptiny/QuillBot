@@ -10,6 +10,7 @@ from discord.ext import commands
 
 from cogs.plugin_apis import (
     HTTP_HEADERS as _HEADERS,
+    get_json as _get_json,
     search_hangar,
     search_modrinth,
     search_spiget,
@@ -101,17 +102,6 @@ class PluginSearch(commands.Cog):
         if self.session:
             await self.session.close()
 
-    async def _get_json(self, url: str, **kwargs) -> dict | list | None:
-        """Fetch JSON from a URL, returning None on failure."""
-        try:
-            async with self.session.get(url, **kwargs) as resp:
-                if resp.status == 200:
-                    return await resp.json()
-                logger.warning("GET %s returned %d", url, resp.status)
-        except Exception:
-            logger.exception("Failed to fetch %s", url)
-        return None
-
     # --- /plugin ---
 
     @app_commands.command(name='plugin', description='Pesquisa um plugin no Modrinth, Hangar e SpigotMC')
@@ -170,7 +160,7 @@ class PluginSearch(commands.Cog):
         await interaction.response.defer(thinking=True)
 
         safe_ip = urllib.parse.quote(ip, safe='')
-        data = await self._get_json(f'{MCSRVSTAT_API}/{safe_ip}')
+        data = await _get_json(self.session, f'{MCSRVSTAT_API}/{safe_ip}')
         if data is None:
             await interaction.followup.send(
                 'Não foi possível consultar o servidor. Verifique o IP e tente novamente.'
@@ -216,7 +206,7 @@ class PluginSearch(commands.Cog):
         await interaction.response.defer(thinking=True)
 
         url = f'{GITHUB_API}/commits?sha={DOCS_BRANCH}&per_page=5'
-        data = await self._get_json(url)
+        data = await _get_json(self.session, url)
         if not data or not isinstance(data, list):
             await interaction.followup.send(
                 'Não foi possível obter o changelog da documentação.'
