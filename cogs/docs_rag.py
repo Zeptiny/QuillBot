@@ -325,18 +325,18 @@ class DocsRAG(commands.Cog):
 
     @tasks.loop(hours=REINDEX_INTERVAL_HOURS)
     async def periodic_reindex(self):
-        """Check for doc updates and reindex if the primary repo has new commits."""
+        """Check for doc updates across all sources and reindex if anything changed."""
         try:
-            latest_sha = await self._get_latest_commit_sha()
+            latest_sha = await self._get_composite_sha()
             if latest_sha and latest_sha != self._last_commit_sha:
                 logger.info(
-                    "New commit detected (%s -> %s), reindexing...",
+                    "Doc source changes detected (%s -> %s), reindexing...",
                     self._last_commit_sha,
                     latest_sha,
                 )
                 await self.index_docs()
             else:
-                logger.info("Docs up to date (commit: %s)", self._last_commit_sha)
+                logger.info("All doc sources up to date (composite: %s)", self._last_commit_sha)
         except Exception:
             logger.exception("Error during periodic reindex check")
 
@@ -344,8 +344,34 @@ class DocsRAG(commands.Cog):
     async def _wait_for_bot(self):
         await self.bot.wait_until_ready()
 
+    async def _get_composite_sha(self) -> str | None:
+        """Fetch latest commit SHAs from all configured doc sources and return a composite hash."""
+        shas = []
+        for source in DOC_SOURCES:
+            url = f'https://api.github.com/repos/{source["repo"]}/commits/{source["branch"]}'
+            try:
+                async with self.session.get(url) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        sha = data.get('sha', '')
+                        if sha:
+                            shas.append(f'{source["repo"]}:{sha}')
+                    else:
+                        logger.warning(
+                            "Could not fetch commit SHA for %s (status %d)",
+                            source['repo'], resp.status,
+                        )
+            except Exception:
+                logger.exception("Failed to fetch commit SHA for %s", source['repo'])
+        if not shas:
+            return None
+        return hashlib.md5(':'.join(sorted(shas)).encode()).hexdigest()
+
     async def _get_latest_commit_sha(self) -> str | None:
-        """Fetch the latest commit SHA from the primary docs repo (MinersRefuge/docs)."""
+        """Fetch the latest commit SHA from the primary docs repo (MinersRefuge/docs).
+
+        Kept for backward compatibility; prefer _get_composite_sha for reindex checks.
+        """
         url = f'{GITHUB_API}/commits/{DOCS_BRANCH}'
         try:
             async with self.session.get(url) as resp:
@@ -559,8 +585,8 @@ class DocsRAG(commands.Cog):
         logger.info("Documentation indexed: %d chunks with embeddings", len(self.chunks))
         self._rebuild_matrix()
 
-        # Track primary source commit SHA and persist
-        self._last_commit_sha = await self._get_latest_commit_sha()
+        # Track composite commit SHA across all sources and persist
+        self._last_commit_sha = await self._get_composite_sha()
         self._save_vectors()
 
     # --- Search with Reranking ---
