@@ -712,7 +712,7 @@ class DocsRAG(commands.Cog):
                 model=CHAT_MODEL,
                 messages=messages,
                 tools=TOOLS,
-                max_tokens=1024,
+                max_tokens=2048,
             )
 
             choice = response.choices[0]
@@ -744,7 +744,7 @@ class DocsRAG(commands.Cog):
             response = await self.client.chat.completions.create(
                 model=CHAT_MODEL,
                 messages=messages,
-                max_tokens=1024,
+                max_tokens=2048,
             )
             choice = response.choices[0]
 

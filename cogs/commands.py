@@ -321,7 +321,7 @@ class Commands(commands.Cog):
         response = await self.client.chat.completions.create(
             model=CHAT_MODEL,
             messages=messages,
-            max_tokens=1024,
+            max_tokens=2048,
             tools=[{
                 'type': 'openrouter:web_search',
                 'parameters': {'max_results': 5, 'search_context_size': 'medium'},
