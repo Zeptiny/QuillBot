@@ -222,6 +222,8 @@ class DocsRAG(commands.Cog):
         self._emb_matrix: np.ndarray | None = None  # (N, dim) float32 for vectorized search
         # TTL cache: max 200 conversations, each expires after 30 min
         self._conversations: TTLCache = TTLCache(maxsize=200, ttl=1800)
+        # Per-user follow-up cooldown (same period as slash commands)
+        self._followup_cd: TTLCache = TTLCache(maxsize=500, ttl=COOLDOWN_PER)
 
     async def cog_load(self):
         self.session = aiohttp.ClientSession(
@@ -900,6 +902,12 @@ class DocsRAG(commands.Cog):
         conv = self._conversations.get(ref_id)
         if not conv:
             return
+
+        # Enforce per-user cooldown on follow-up replies
+        user_id = message.author.id
+        if user_id in self._followup_cd:
+            return
+        self._followup_cd[user_id] = True
 
         follow_up_question = message.content.strip()
         if not follow_up_question and not message.attachments:

@@ -42,6 +42,8 @@ class Commands(commands.Cog):
             )
         # TTL cache: max 200 conversations, each expires after 30 min
         self._conversations: TTLCache = TTLCache(maxsize=200, ttl=1800)
+        # Per-user follow-up cooldown (same period as slash commands)
+        self._followup_cd: TTLCache = TTLCache(maxsize=500, ttl=COOLDOWN_PER)
 
     @app_commands.command(name="plov", description="Informações necessárias para escolher um serviço de hospedagem")
     async def hosting_info(self, interaction: discord.Interaction):
@@ -369,6 +371,12 @@ class Commands(commands.Cog):
         conv = self._conversations.get(ref_id)
         if not conv:
             return
+
+        # Enforce per-user cooldown on follow-up replies
+        user_id = message.author.id
+        if user_id in self._followup_cd:
+            return
+        self._followup_cd[user_id] = True
 
         follow_up_question = message.content.strip()
         if not follow_up_question and not message.attachments:
