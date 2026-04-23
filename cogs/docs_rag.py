@@ -80,14 +80,21 @@ SYSTEM_PROMPT = (
 )
 
 # --- Tool definitions for the LLM (OpenAI function-calling format) ---
+_SOURCE_LABELS = [src['label'] for src in DOC_SOURCES]
+_SOURCE_LABELS_STR = ', '.join(f'"{s}"' for s in _SOURCE_LABELS)
+
 TOOLS = [
     {
         'type': 'function',
         'function': {
             'name': 'search_docs',
             'description': (
-                'Pesquisa na documentação do Miners\' Refuge, PaperMC e PurpurMC. '
+                'Pesquisa na documentação indexada. '
+                f'Fontes disponíveis: {_SOURCE_LABELS_STR}. '
                 'Use para qualquer pergunta sobre configuração, administração ou setup de servidores Minecraft. '
+                'Use o parâmetro `source` para restringir a busca a uma fonte específica quando a pergunta '
+                'claramente pertence a um projeto concreto (ex: Spark para profiling, PaperMC para configurações '
+                'Paper). Omita `source` para perguntas gerais ou que cruzam múltiplas documentações. '
                 'Não use para perguntas sobre plugins específicos — use search_plugins para isso.'
             ),
             'parameters': {
@@ -103,6 +110,15 @@ TOOLS = [
                             'Número máximo de resultados a retornar (1-12). '
                             'Use valores menores (3-5) para perguntas focadas e maiores (8-12) '
                             'para tópicos amplos que podem abranger múltiplas páginas. Default: 5.'
+                        ),
+                    },
+                    'source': {
+                        'type': 'string',
+                        'enum': _SOURCE_LABELS,
+                        'description': (
+                            f'Filtrar por fonte de documentação específica ({_SOURCE_LABELS_STR}). '
+                            'Use apenas quando a pergunta é claramente específica de um projeto. '
+                            'Se omitido, pesquisa em todas as fontes.'
                         ),
                     },
                 },
@@ -722,7 +738,8 @@ class DocsRAG(commands.Cog):
         if name == 'search_docs':
             query = args.get('query', '')
             top_k = max(1, min(12, int(args.get('max_results', 5))))
-            results = await self.search(query, top_k=top_k)
+            source_filter = args.get('source') or None
+            results = await self.search(query, top_k=top_k, source_filter=source_filter)
             if not results:
                 return 'Nenhum resultado encontrado na documentação.', []
             parts = []
