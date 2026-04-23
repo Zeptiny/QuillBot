@@ -47,6 +47,8 @@ async def on_app_command_error(
 @bot.event
 async def on_ready():
     logger.info('Logged on as %s', bot.user)
+    synced = await bot.tree.sync()
+    logger.info('Synced %d slash command(s) with Discord', len(synced))
 
 
 async def main():
