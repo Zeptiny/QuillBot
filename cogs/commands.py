@@ -18,8 +18,10 @@ GENERAL_SYSTEM_PROMPT = (
     "</role>\n\n"
     "<instructions>\n"
     "1. Responda perguntas gerais com base no seu conhecimento.\n"
-    "2. Seja honesto quando não souber a resposta — não invente informações.\n"
-    "3. Quando útil, termine com uma sugestão de acompanhamento na linha final, prefixada com '💡 '.\n"
+    "2. Para informações em tempo real ou recentes, use a busca web disponível.\n"
+    "3. Seja honesto quando não souber a resposta — não invente informações.\n"
+    "4. Quando citar resultados da web, inclua o título e o link da fonte.\n"
+    "5. Quando útil, termine com uma sugestão de acompanhamento na linha final, prefixada com '💡 '.\n"
     "</instructions>\n\n"
     "<response_format>\n"
     "Seja claro e conciso. Use markdown para formatação quando aplicável.\n"
@@ -320,6 +322,10 @@ class Commands(commands.Cog):
             model=CHAT_MODEL,
             messages=messages,
             max_tokens=1024,
+            tools=[{
+                'type': 'openrouter:web_search',
+                'parameters': {'max_results': 5, 'search_context_size': 'medium'},
+            }],
         )
         answer = response.choices[0].message.content or 'Não foi possível gerar uma resposta.'
 

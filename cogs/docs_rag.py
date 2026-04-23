@@ -41,11 +41,12 @@ SYSTEM_PROMPT = (
     "</role>\n\n"
     "<instructions>\n"
     "1. Use as ferramentas disponíveis para buscar informações antes de responder.\n"
-    "2. Se a pergunta for vaga ou ambígua, peça esclarecimentos diretamente — omita chamadas de ferramentas.\n"
-    "3. Baseie suas respostas exclusivamente nos dados retornados pelas ferramentas. "
+    "2. Use a busca web para informações em tempo real, versões recentes ou conteúdo não coberto pela documentação.\n"
+    "3. Se a pergunta for vaga ou ambígua, peça esclarecimentos diretamente — omita chamadas de ferramentas.\n"
+    "4. Baseie suas respostas nos dados retornados pelas ferramentas. "
     f"Se nenhuma retornar dados relevantes, diga que não encontrou e sugira visitar {DOCS_BASE_URL}.\n"
-    "4. Omita seções de fontes na resposta — as fontes são exibidas automaticamente pela interface.\n"
-    "5. Quando útil, termine com uma sugestão de acompanhamento na linha final, prefixada com '💡 '.\n"
+    "5. Omita seções de fontes na resposta — as fontes são exibidas automaticamente pela interface.\n"
+    "6. Quando útil, termine com uma sugestão de acompanhamento na linha final, prefixada com '💡 '.\n"
     "</instructions>\n\n"
     "<response_format>\n"
     "Seja claro e conciso. Use markdown para formatação. "
@@ -128,6 +129,10 @@ TOOLS = [
                 'required': ['query'],
             },
         },
+    },
+    {
+        'type': 'openrouter:web_search',
+        'parameters': {'max_results': 5, 'search_context_size': 'medium'},
     },
 ]
 
