@@ -136,9 +136,11 @@ SPARK_SYSTEM_PROMPT_SUFFIX = (
     "qual plugin, sistema ou entidade está consumindo CPU e exatamente quanto (%).\n"
     "7. **Configuração** — Use `get_config_key(file, key)` para verificar o valor "
     "atual da configuração suspeita.\n"
-    "8. **Recomendação fundamentada** — Chame `search_docs(query, source=\"PaperMC\")` "
-    "para obter valores recomendados e justificativa da documentação oficial. "
-    "Nunca invente valores de configuração.\n"
+    "8. **Recomendação fundamentada** — Chame `search_docs` para cada causa identificada, "
+    "independentemente de o servidor estar com lag ou não. "
+    "Se há problemas: busque valores recomendados (ex: 'entity activation range paper', 'villager lag'). "
+    "Se o servidor está saudável: confirme boas práticas (ex: 'paper performance best practices', 'view-distance recommendations'). "
+    "Nunca invente valores de configuração — toda recomendação deve vir dos resultados de `search_docs`.\n"
     "</diagnostic_protocol>\n\n"
     "<platform_awareness>\n"
     "Antes de recomendar qualquer configuração, identifique a plataforma do servidor a partir do campo "
@@ -1094,7 +1096,6 @@ class DocsRAG(commands.Cog):
         active_tools = TOOLS + SPARK_TOOLS if spark_report is not None else TOOLS
 
         all_sources: list[dict] = []
-        search_docs_called = False
 
         for _ in range(MAX_TOOL_ROUNDS):
             response = await self.client.chat.completions.create(
@@ -1129,9 +1130,6 @@ class DocsRAG(commands.Cog):
                     except discord.HTTPException:
                         pass
 
-                if tc.function.name == 'search_docs':
-                    search_docs_called = True
-
                 result_text, sources = await self._exec_tool(
                     tc.function.name, args, spark_report=spark_report
                 )
@@ -1150,59 +1148,6 @@ class DocsRAG(commands.Cog):
                 max_tokens=2048,
             )
             choice = response.choices[0]
-
-        # Guardrail: for Spark sessions, ensure search_docs was called at least once.
-        # If the model exhausted tool rounds on get_spark_detail/get_config_key without
-        # ever searching docs, force one search round now before the final answer.
-        if spark_report is not None and not search_docs_called:
-            messages.append({
-                'role': 'user',
-                'content': (
-                    'ATENÇÃO: Você ainda não chamou `search_docs` para fundamentar suas '
-                    'recomendações com a documentação oficial. '
-                    'Chame `search_docs` agora para cada problema identificado nos hotspots '
-                    'antes de gerar a resposta final. Nunca invente valores de configuração.'
-                ),
-            })
-            search_response = await self.client.chat.completions.create(
-                model=model,
-                messages=messages,
-                tools=active_tools,
-                max_tokens=2048,
-            )
-            search_choice = search_response.choices[0]
-            if search_choice.message.tool_calls:
-                messages.append(search_choice.message)
-                for tc in search_choice.message.tool_calls:
-                    try:
-                        args = json.loads(tc.function.arguments)
-                    except (json.JSONDecodeError, TypeError):
-                        args = {}
-                    if interaction is not None:
-                        try:
-                            await interaction.edit_original_response(
-                                content=self._status_label(tc.function.name, args)
-                            )
-                        except discord.HTTPException:
-                            pass
-                    result_text, sources = await self._exec_tool(
-                        tc.function.name, args, spark_report=spark_report
-                    )
-                    all_sources.extend(sources)
-                    messages.append({
-                        'role': 'tool',
-                        'tool_call_id': tc.id,
-                        'content': _truncate_safe(result_text, limit=6000),
-                    })
-                # Final answer after the forced search
-                final_response = await self.client.chat.completions.create(
-                    model=model,
-                    messages=messages,
-                    max_tokens=2048,
-                )
-                choice = final_response.choices[0]
-            else:
-                choice = search_choice
 
         answer = choice.message.content or 'Não foi possível gerar uma resposta.'
 
