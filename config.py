@@ -13,7 +13,7 @@ BOT_TOKEN: Final[str | None] = os.getenv('BOT_TOKEN')
 OPENROUTER_API_KEY: Final[str | None] = os.getenv('OPENROUTER_API_KEY')
 
 # --- AI Models ---
-CHAT_MODEL: Final[str] = os.getenv('CHAT_MODEL', 'qwen/qwen3-6b-plus')
+CHAT_MODEL: Final[str] = os.getenv('CHAT_MODEL', 'qwen/qwen3.6-plus')
 SPARK_MODEL: Final[str] = os.getenv('SPARK_MODEL', 'google/gemini-2.5-pro')
 EMBEDDING_MODEL: Final[str] = os.getenv('EMBEDDING_MODEL', 'qwen/qwen3-embedding-8b')
 RERANK_MODEL: Final[str] = os.getenv('RERANK_MODEL', 'cohere/rerank-4-fast')

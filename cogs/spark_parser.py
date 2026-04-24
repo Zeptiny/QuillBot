@@ -513,7 +513,7 @@ def _render_tree(
         ):
             skipped += 1
             current = current['children'][0]
-        if skipped >= 2:
+        if skipped >= 1:
             frame_word = 'frames' if skipped > 1 else 'frame'
             lines.append(
                 f'{child_prefix}   \u00b7\u00b7\u00b7 {skipped} intermediate '

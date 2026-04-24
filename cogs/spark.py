@@ -34,6 +34,7 @@ class SparkAnalyzeView(discord.ui.View):
         super().__init__(timeout=300)
         self.cog = cog
         self.code = code
+        self.message: discord.Message | None = None
 
     @discord.ui.button(
         label='Analisar com IA',
