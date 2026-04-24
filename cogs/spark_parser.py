@@ -968,6 +968,12 @@ async def fetch_report(
         async with s.get(fetch_url) as resp:
             if resp.status != 200:
                 body = await resp.text()
+                # 400 with a "404" body means the report code is unknown or expired.
+                if resp.status == 400 and '404' in body:
+                    raise ValueError(
+                        f'Relatório `{code}` não encontrado. '
+                        'O código pode ter expirado ou ser inválido.'
+                    )
                 raise RuntimeError(
                     f'spark-json-service returned HTTP {resp.status}: {body[:200]}'
                 )
