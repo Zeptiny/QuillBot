@@ -15,6 +15,12 @@ from openai import AsyncOpenAI, RateLimitError
 
 from cogs.plugin_apis import HTTP_HEADERS as _HTTP_HEADERS
 from cogs.plugin_apis import search_all as _search_plugins_all
+from cogs.spark_parser import (
+    AVAILABLE_SECTIONS as _SPARK_SECTIONS,
+    SparkReport,
+    build_detail as _spark_build_detail,
+    build_summary as _spark_build_summary,
+)
 from cogs.utils import PaginatedEmbedView, split_response, truncate_safe as _truncate_safe
 from config import (
     CHAT_MODEL,
@@ -28,6 +34,7 @@ from config import (
     OPENROUTER_API_KEY,
     REINDEX_INTERVAL_HOURS,
     RERANK_MODEL,
+    SPARK_MODEL,
     VECTOR_STORE_PATH,
 )
 
@@ -42,12 +49,11 @@ SYSTEM_PROMPT = (
     "</role>\n\n"
     "<instructions>\n"
     "1. Use as ferramentas disponíveis para buscar informações antes de responder.\n"
-    "2. Use a busca web para informações em tempo real, versões recentes ou conteúdo não coberto pela documentação.\n"
-    "3. Se a pergunta for vaga ou ambígua, peça esclarecimentos diretamente — omita chamadas de ferramentas.\n"
-    "4. Baseie suas respostas nos dados retornados pelas ferramentas. "
+    "2. Se a pergunta for vaga ou ambígua, peça esclarecimentos diretamente — omita chamadas de ferramentas.\n"
+    "3. Baseie suas respostas nos dados retornados pelas ferramentas. "
     f"Se nenhuma retornar dados relevantes, diga que não encontrou e sugira visitar {DOCS_BASE_URL}.\n"
-    "5. Omita seções de fontes na resposta — as fontes são exibidas automaticamente pela interface.\n"
-    "6. Quando útil, termine com uma sugestão de acompanhamento na linha final, prefixada com '💡 '.\n"
+    "4. Omita seções de fontes na resposta — as fontes são exibidas automaticamente pela interface.\n"
+    "5. Quando útil, termine com uma sugestão de acompanhamento na linha final, prefixada com '💡 '.\n"
     "</instructions>\n\n"
     "<response_format>\n"
     "Seja claro e conciso. Use markdown para formatação. "
@@ -78,7 +84,52 @@ SYSTEM_PROMPT = (
     "</example>\n"
     "</examples>"
 )
-
+# Appended to SYSTEM_PROMPT when a Spark report is active in the session.
+# Following Anthropic best-practice: XML tags separate role, instructions and
+# tool guidance; numbered steps encode the required diagnostic reasoning order.
+SPARK_SYSTEM_PROMPT_SUFFIX = (
+    "\n\n"
+    "<spark_analysis_context>\n"
+    "<role_extension>\n"
+    "Você também é um especialista em diagnóstico de desempenho de servidores "
+    "Minecraft. Um relatório do Spark Profiler foi carregado para esta conversa. "
+    "Seu objetivo é identificar a causa raiz de problemas de desempenho com base "
+    "nos dados do relatório. Seja preciso e fundamentado nos dados — não invente "
+    "valores de configuração.\n"
+    "</role_extension>\n\n"
+    "<diagnostic_protocol>\n"
+    "Ao analisar um relatório Spark, siga esta ordem:\n\n"
+    "1. **TPS** — O servidor está laggando? (< 20 TPS confirma lag; ≈ 20 TPS com "
+    "MSPT max alto indica spikes intermitentes.)\n"
+    "2. **MSPT median vs max** — Lag constante (median > 50 ms) ou spikes "
+    "intermitentes (median ok, max >> 50 ms)?\n"
+    "3. **Perfil de lag spike** — Se `tick_length_threshold_ms > 0`, os hotspots "
+    "mostram APENAS os ticks laggados, NÃO a carga normal. Adapte o diagnóstico: "
+    "100 % num perfil de spike ≠ servidor sempre a 100 %.\n"
+    "4. **`waitForNextTick()`** — Qual % do thread principal é sono?\n"
+    "   • ≥ 20 % → capacidade de sobra\n"
+    "   • < 20 % → trabalhando muito, vulnerável a spikes\n"
+    "   • < 5 % → provavelmente laggando constantemente\n"
+    "   • ≥ 80 % → servidor ocioso — perfil pode ter sido coletado no momento errado\n"
+    "5. **GC** — Pausas de GC coincidem com picos de MSPT? "
+    "Chame `get_spark_detail(\"jvm\")` se necessário.\n"
+    "6. **Hotspots** — Identifique o método com maior `self_pct`. "
+    "Chame `get_spark_detail(\"hotspots\")` para a árvore completa.\n"
+    "7. **Configuração** — Use `get_config_key(file, key)` para verificar o valor "
+    "atual da configuração suspeita.\n"
+    "8. **Recomendação fundamentada** — Chame `search_docs(query, source=\"PaperMC\")` "
+    "para obter valores recomendados e justificativa da documentação oficial. "
+    "Nunca invente valores de configuração.\n"
+    "</diagnostic_protocol>\n\n"
+    "<tool_guidance>\n"
+    "Use as ferramentas proativamente e na ordem indicada acima. "
+    "Prefira `get_config_key` quando precisar de apenas uma chave. "
+    "Use `get_spark_detail` para dados completos de uma seção. "
+    "Sempre baseie recomendações de configuração em `search_docs`, "
+    "não em conhecimento de treinamento.\n"
+    "</tool_guidance>\n"
+    "</spark_analysis_context>"
+)
 # --- Tool definitions for the LLM (OpenAI function-calling format) ---
 _SOURCE_LABELS = [src['label'] for src in DOC_SOURCES]
 _SOURCE_LABELS_STR = ', '.join(f'"{s}"' for s in _SOURCE_LABELS)
@@ -147,9 +198,67 @@ TOOLS = [
             },
         },
     },
+]
+
+# Additional tools injected only when a Spark report is active in the session.
+_SPARK_SECTIONS_STR = ', '.join(f'"{s}"' for s in _SPARK_SECTIONS)
+SPARK_TOOLS = [
     {
-        'type': 'openrouter:web_search',
-        'parameters': {'max_results': 5, 'search_context_size': 'medium'},
+        'type': 'function',
+        'function': {
+            'name': 'get_spark_detail',
+            'description': (
+                'Retorna dados detalhados de uma seção específica do relatório Spark '
+                'atualmente carregado. Use para obter informações além do resumo inicial. '
+                f'Seções disponíveis: {_SPARK_SECTIONS_STR}. '
+                'Use "hotspots" para identificar gargalos na árvore de chamadas completa. '
+                'Use "jvm" para verificar GC e flags da JVM. '
+                'Use "profiler" para estatísticas TPS/MSPT por janela de tempo. '
+                'Use "configs:<arquivo>" para obter um arquivo de configuração específico '
+                '(ex: "configs:server.properties", "configs:paper/").'
+            ),
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'section': {
+                        'type': 'string',
+                        'description': (
+                            'Nome da seção a retornar. Use "configs:<arquivo>" para '
+                            'configurações por arquivo (ex: "configs:spigot.yml").'
+                        ),
+                    },
+                },
+                'required': ['section'],
+            },
+        },
+    },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'get_config_key',
+            'description': (
+                'Lê uma única chave de configuração do servidor sem buscar o arquivo inteiro. '
+                'Use quando só precisar verificar um valor específico antes de recomendar uma mudança. '
+                'Mais eficiente que get_spark_detail para consultas pontuais.'
+            ),
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'file': {
+                        'type': 'string',
+                        'description': (
+                            'Nome do arquivo de configuração '
+                            '(ex: "server.properties", "spigot.yml", "paper/").'
+                        ),
+                    },
+                    'key': {
+                        'type': 'string',
+                        'description': 'Nome da chave de configuração a consultar.',
+                    },
+                },
+                'required': ['file', 'key'],
+            },
+        },
     },
 ]
 
@@ -735,7 +844,12 @@ class DocsRAG(commands.Cog):
 
     # --- Tool execution ---
 
-    async def _exec_tool(self, name: str, args: dict) -> tuple[str, list[dict]]:
+    async def _exec_tool(
+        self,
+        name: str,
+        args: dict,
+        spark_report: SparkReport | None = None,
+    ) -> tuple[str, list[dict]]:
         """Execute a tool call and return (result_text, source_chunks)."""
         if name == 'search_docs':
             query = args.get('query', '')
@@ -765,6 +879,31 @@ class DocsRAG(commands.Cog):
                 )
             return '\n\n'.join(lines), []
 
+        if name == 'get_spark_detail':
+            if spark_report is None:
+                return 'Nenhum relatório Spark carregado para esta conversa.', []
+            section = args.get('section', '')
+            return _spark_build_detail(spark_report, section), []
+
+        if name == 'get_config_key':
+            if spark_report is None:
+                return 'Nenhum relatório Spark carregado para esta conversa.', []
+            file_name = args.get('file', '')
+            key = args.get('key', '')
+            cfg = spark_report.configs.get(file_name)
+            if cfg is None:
+                available = ', '.join(spark_report.configs.keys()) or 'none'
+                return (
+                    f'Arquivo "{file_name}" não encontrado. '
+                    f'Disponíveis: {available}'
+                ), []
+            if isinstance(cfg, dict):
+                value = cfg.get(key)
+                if value is None:
+                    return f'Chave "{key}" não encontrada em "{file_name}".', []
+                return f'{file_name}/{key} = {json.dumps(value)}', []
+            return f'{file_name} = {cfg}', []
+
         return f'Ferramenta desconhecida: {name}', []
 
     # --- Agentic loop ---
@@ -774,15 +913,58 @@ class DocsRAG(commands.Cog):
         question: str,
         history: list[dict] | None = None,
         image_url: str | None = None,
-    ) -> tuple[str, discord.Embed]:
-        """Run the LLM with tool-calling in a loop until it produces a final answer."""
-        messages = [{'role': 'system', 'content': SYSTEM_PROMPT}]
+        spark_report: SparkReport | None = None,
+        title: str | None = None,
+    ) -> tuple[str, list[discord.Embed]]:
+        """Run the LLM with tool-calling in a loop until it produces a final answer.
 
+        When ``spark_report`` is provided the agent uses ``SPARK_MODEL``,
+        receives the report summary as a synthetic prior exchange, and gains
+        access to the ``get_spark_detail`` / ``get_config_key`` Spark tools.
+        """
+        # Build system prompt ----------------------------------------------------
+        system_content = SYSTEM_PROMPT
+        if spark_report is not None:
+            system_content += SPARK_SYSTEM_PROMPT_SUFFIX
+            if spark_report.tick_length_threshold_ms > 0:
+                system_content += (
+                    '\n\n<lag_spike_warning>\n'
+                    f'ATENÇÃO: Este é um PERFIL DE LAG SPIKE '
+                    f'(--only-ticks-over {spark_report.tick_length_threshold_ms}ms). '
+                    'Os hotspots representam a CAUSA dos spikes, NÃO a carga normal do servidor. '
+                    '100% num perfil de lag spike ≠ o servidor está sempre a 100% — significa que '
+                    'aquele método estava presente em todos os ticks que laggaram. '
+                    'Não sugira otimizações gerais de desempenho como resposta primária.\n'
+                    '</lag_spike_warning>'
+                )
+
+        messages: list[dict] = [{'role': 'system', 'content': system_content}]
+
+        # Inject Spark report summary as a synthetic prior exchange --------------
+        # Per Anthropic long-context guidance: put data before the user question.
+        if spark_report is not None:
+            messages.append({
+                'role': 'user',
+                'content': (
+                    '[Relatório Spark carregado]\n\n'
+                    + _spark_build_summary(spark_report)
+                ),
+            })
+            messages.append({
+                'role': 'assistant',
+                'content': (
+                    'Entendido. Analisei o resumo do relatório Spark e estou pronto '
+                    'para diagnosticar.'
+                ),
+            })
+
+        # Replay conversation history --------------------------------------------
         if history:
             for h in history[-3:]:
                 messages.append({'role': 'user', 'content': h['question']})
                 messages.append({'role': 'assistant', 'content': h['answer']})
 
+        # Current user message ---------------------------------------------------
         if image_url:
             messages.append({
                 'role': 'user',
@@ -794,13 +976,17 @@ class DocsRAG(commands.Cog):
         else:
             messages.append({'role': 'user', 'content': question})
 
+        # Choose model and tool set based on session type ------------------------
+        model = SPARK_MODEL if spark_report is not None else CHAT_MODEL
+        active_tools = TOOLS + SPARK_TOOLS if spark_report is not None else TOOLS
+
         all_sources: list[dict] = []
 
         for _ in range(MAX_TOOL_ROUNDS):
             response = await self.client.chat.completions.create(
-                model=CHAT_MODEL,
+                model=model,
                 messages=messages,
-                tools=TOOLS,
+                tools=active_tools,
                 max_tokens=2048,
             )
 
@@ -820,7 +1006,9 @@ class DocsRAG(commands.Cog):
                 except (json.JSONDecodeError, TypeError):
                     args = {}
 
-                result_text, sources = await self._exec_tool(tc.function.name, args)
+                result_text, sources = await self._exec_tool(
+                    tc.function.name, args, spark_report=spark_report
+                )
                 all_sources.extend(sources)
 
                 messages.append({
@@ -831,7 +1019,7 @@ class DocsRAG(commands.Cog):
         else:
             # If we exhausted rounds, get a final response without tools
             response = await self.client.chat.completions.create(
-                model=CHAT_MODEL,
+                model=model,
                 messages=messages,
                 max_tokens=2048,
             )
@@ -839,7 +1027,7 @@ class DocsRAG(commands.Cog):
 
         answer = choice.message.content or 'Não foi possível gerar uma resposta.'
 
-        # Build source links (attached to first page only)
+        # Build source links (attached to first page only) -----------------------
         sources_value: str | None = None
         if all_sources:
             seen_paths: set[str] = set()
@@ -848,14 +1036,16 @@ class DocsRAG(commands.Cog):
                 if r['path'] not in seen_paths:
                     seen_paths.add(r['path'])
                     doc_url = r.get('doc_url', path_to_docs_url(r['path']))
-                    title = r['title'] or _title_from_path(r['path'])
+                    doc_title = r['title'] or _title_from_path(r['path'])
                     source_label = r.get('source', "Miners' Refuge")
-                    source_lines.append(f'• [{title}]({doc_url}) — {source_label}')
+                    source_lines.append(f'• [{doc_title}]({doc_url}) — {source_label}')
                 if len(source_lines) >= 8:
                     break
             if source_lines:
                 sources_value = '\n'.join(source_lines)
 
+        # Build paginated embeds -------------------------------------------------
+        embed_title = title or f'❓ {question}'
         pages = split_response(answer)
         total = len(pages)
         footer_base = (
@@ -865,9 +1055,9 @@ class DocsRAG(commands.Cog):
         embeds: list[discord.Embed] = []
         for i, page_text in enumerate(pages):
             e = discord.Embed(
-                title=f'❓ {question}' if i == 0 else '',
+                title=embed_title if i == 0 else '',
                 description=page_text,
-                color=discord.Color.blue(),
+                color=discord.Color.orange() if spark_report is not None else discord.Color.blue(),
             )
             if i == 0 and sources_value:
                 e.add_field(
@@ -882,12 +1072,19 @@ class DocsRAG(commands.Cog):
 
         return answer, embeds
 
-    def _store_conversation(self, message_id: int, question: str, answer: str):
+    def _store_conversation(
+        self,
+        message_id: int,
+        question: str,
+        answer: str,
+        spark_report: SparkReport | None = None,
+    ) -> None:
         """Store a conversation exchange for follow-up replies."""
         self._conversations[message_id] = {
             'question': question,
             'answer': answer,
             'history': [],
+            'spark_report': spark_report,
         }
 
     @commands.Cog.listener()
@@ -922,13 +1119,19 @@ class DocsRAG(commands.Cog):
         if not follow_up_question:
             follow_up_question = 'Analise esta imagem.'
 
+        # Carry the Spark report forward through the conversation chain.
+        spark_report: SparkReport | None = conv.get('spark_report')
+
         async with message.channel.typing():
             try:
                 history = conv.get('history', []).copy()
                 history.append({'question': conv['question'], 'answer': conv['answer']})
 
                 answer, embeds = await self._run_agent(
-                    follow_up_question, history=history, image_url=image_url
+                    follow_up_question,
+                    history=history,
+                    image_url=image_url,
+                    spark_report=spark_report,
                 )
                 if len(embeds) == 1:
                     reply = await message.reply(embed=embeds[0])
@@ -941,6 +1144,7 @@ class DocsRAG(commands.Cog):
                     'question': follow_up_question,
                     'answer': answer,
                     'history': history,
+                    'spark_report': spark_report,
                 }
             except RateLimitError:
                 await message.reply(
@@ -951,6 +1155,49 @@ class DocsRAG(commands.Cog):
                 await message.reply(
                     'Ocorreu um erro ao processar sua pergunta. Tente novamente.'
                 )
+
+    # --- Public Spark integration point ---
+
+    async def run_spark_analysis(
+        self,
+        interaction: discord.Interaction,
+        report: SparkReport,
+    ) -> None:
+        """Fetch a Spark report summary from the LLM and store the conversation.
+
+        Called by ``SparkAnalyzer`` after fetching and parsing the report.
+        The interaction must already be deferred (``defer(thinking=True)``)
+        before this is called.
+        """
+        server_tag = f'{report.platform_brand} {report.minecraft_version}'.strip()
+        embed_title = f'🔥 Spark — {server_tag}' if server_tag else '🔥 Relatório Spark'
+        question = (
+            'Analise este relatório Spark e identifique os principais problemas de '
+            'desempenho, se houver. Siga o protocolo diagnóstico.'
+        )
+        try:
+            answer, embeds = await self._run_agent(
+                question,
+                spark_report=report,
+                title=embed_title,
+            )
+            if len(embeds) == 1:
+                msg = await interaction.followup.send(embed=embeds[0], wait=True)
+            else:
+                msg = await interaction.followup.send(
+                    embed=embeds[0], view=PaginatedEmbedView(embeds), wait=True
+                )
+            self._store_conversation(msg.id, question, answer, spark_report=report)
+
+        except RateLimitError:
+            await interaction.followup.send(
+                '⏳ Limite de requisições atingido. Tente novamente em alguns minutos.'
+            )
+        except Exception:
+            logger.exception("Error in Spark analysis")
+            await interaction.followup.send(
+                'Ocorreu um erro ao analisar o relatório. Tente novamente mais tarde.'
+            )
 
     @app_commands.command(name='reindex', description='Re-indexar a documentação (Admin)')
     @app_commands.checks.has_permissions(administrator=True)
