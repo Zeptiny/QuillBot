@@ -938,17 +938,41 @@ class DocsRAG(commands.Cog):
                     '</lag_spike_warning>'
                 )
 
-        messages: list[dict] = [{'role': 'system', 'content': system_content}]
+        messages: list[dict] = [
+            {
+                'role': 'system',
+                # Content-array format enables per-message cache_control breakpoints
+                # supported by both Gemini (SPARK_MODEL) and Anthropic providers via
+                # OpenRouter. The breakpoint is placed after the full system prompt so
+                # the entire static instruction block is cached (5-min TTL by default).
+                'content': [
+                    {
+                        'type': 'text',
+                        'text': system_content,
+                        'cache_control': {'type': 'ephemeral'},
+                    }
+                ],
+            }
+        ]
 
         # Inject Spark report summary as a synthetic prior exchange --------------
         # Per Anthropic long-context guidance: put data before the user question.
         if spark_report is not None:
+            summary_text = (
+                '[Relatório Spark carregado]\n\n'
+                + _spark_build_summary(spark_report)
+            )
             messages.append({
                 'role': 'user',
-                'content': (
-                    '[Relatório Spark carregado]\n\n'
-                    + _spark_build_summary(spark_report)
-                ),
+                # Cache the report summary so the agentic tool-call loop reuses
+                # it from cache on every subsequent round without re-billing.
+                'content': [
+                    {
+                        'type': 'text',
+                        'text': summary_text,
+                        'cache_control': {'type': 'ephemeral'},
+                    }
+                ],
             })
             messages.append({
                 'role': 'assistant',
