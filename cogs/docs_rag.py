@@ -837,7 +837,14 @@ class DocsRAG(commands.Cog):
         await interaction.response.defer(thinking=True)
 
         try:
-            answer, embeds = await self._run_agent(question, image_url=image_url)
+            answer, embeds = await self._run_agent(
+                question, image_url=image_url, interaction=interaction
+            )
+            # Clear any in-progress status message before sending the final embed.
+            try:
+                await interaction.edit_original_response(content=None)
+            except discord.HTTPException:
+                pass
             if len(embeds) == 1:
                 msg = await interaction.followup.send(embed=embeds[0], wait=True)
             else:
@@ -920,6 +927,43 @@ class DocsRAG(commands.Cog):
 
         return f'Ferramenta desconhecida: {name}', []
 
+    # --- Status helpers ---
+
+    @staticmethod
+    def _status_label(tool_name: str, args: dict) -> str:
+        """Return a short Portuguese status string shown while a tool runs."""
+        if tool_name == 'search_docs':
+            query = args.get('query', '')
+            source = args.get('source')
+            label = f'🔍 Pesquisando documentação: *{query[:60]}*'
+            if source:
+                label += f' ({source})'
+            return label
+        if tool_name == 'search_plugins':
+            query = args.get('query', '')
+            return f'🔌 Pesquisando plugins: *{query[:60]}*'
+        if tool_name == 'get_spark_detail':
+            section = args.get('section', '')
+            section_names = {
+                'hotspots': 'árvore de hotspots CPU',
+                'jvm': 'flags JVM e GC',
+                'profiler': 'estatísticas TPS/MSPT',
+                'configs': 'arquivos de configuração',
+                'game_rules': 'game rules',
+                'world': 'dados de mundo',
+                'plugins': 'plugins',
+            }
+            if section.startswith('configs:'):
+                file = section[len('configs:'):]
+                return f'📂 Lendo configuração: `{file}`'
+            readable = section_names.get(section, section)
+            return f'📊 Analisando relatório Spark — {readable}'
+        if tool_name == 'get_config_key':
+            file = args.get('file', '')
+            key = args.get('key', '')
+            return f'⚙️ Verificando `{key}` em `{file}`'
+        return f'🔧 Executando: {tool_name}'
+
     # --- Agentic loop ---
 
     async def _run_agent(
@@ -929,6 +973,7 @@ class DocsRAG(commands.Cog):
         image_url: str | None = None,
         spark_report: SparkReport | None = None,
         title: str | None = None,
+        interaction: discord.Interaction | None = None,
     ) -> tuple[str, list[discord.Embed]]:
         """Run the LLM with tool-calling in a loop until it produces a final answer.
 
@@ -1043,6 +1088,15 @@ class DocsRAG(commands.Cog):
                     args = json.loads(tc.function.arguments)
                 except (json.JSONDecodeError, TypeError):
                     args = {}
+
+                # Update the deferred interaction with a live status message.
+                if interaction is not None:
+                    try:
+                        await interaction.edit_original_response(
+                            content=self._status_label(tc.function.name, args)
+                        )
+                    except discord.HTTPException:
+                        pass
 
                 result_text, sources = await self._exec_tool(
                     tc.function.name, args, spark_report=spark_report
@@ -1218,7 +1272,13 @@ class DocsRAG(commands.Cog):
                 question,
                 spark_report=report,
                 title=embed_title,
+                interaction=interaction,
             )
+            # Clear any in-progress status message before sending the final embed.
+            try:
+                await interaction.edit_original_response(content=None)
+            except discord.HTTPException:
+                pass
             if len(embeds) == 1:
                 msg = await interaction.followup.send(embed=embeds[0], wait=True)
             else:
