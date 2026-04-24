@@ -898,9 +898,9 @@ class DocsRAG(commands.Cog):
                     f'Disponíveis: {available}'
                 ), []
             if isinstance(cfg, dict):
-                value = cfg.get(key)
-                if value is None:
+                if key not in cfg:
                     return f'Chave "{key}" não encontrada em "{file_name}".', []
+                value = cfg[key]
                 return f'{file_name}/{key} = {json.dumps(value)}', []
             return f'{file_name} = {cfg}', []
 

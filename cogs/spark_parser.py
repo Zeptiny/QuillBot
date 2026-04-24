@@ -767,7 +767,7 @@ def _detail_world(r: SparkReport) -> str:
         lines.append(f'  {etype}: {count}')
 
     for world in r.worlds:
-        lines += ['', f'--- {world["name"]} ({world.get("totalEntities", 0)} entities) ---']
+        lines += ['', f'--- {world.get("name", "<unknown>")} ({world.get("totalEntities", 0)} entities) ---']
         world_counts: dict[str, int] = {}
         for region in world.get('regions', []):
             for chunk in region.get('chunks', []):
@@ -972,12 +972,29 @@ async def fetch_report(
                     f'spark-json-service returned HTTP {resp.status}: {body[:200]}'
                 )
             # Guard against excessively large payloads before JSON parsing.
-            body_bytes = await resp.read()
-            if len(body_bytes) > _MAX_RESPONSE_BYTES:
-                raise ValueError(
-                    f'Response too large ({len(body_bytes):,} bytes > '
-                    f'{_MAX_RESPONSE_BYTES:,} byte limit)'
-                )
+            # Fast path: trust Content-Length header if present.
+            cl_header = resp.headers.get('Content-Length')
+            if cl_header is not None:
+                try:
+                    if int(cl_header) > _MAX_RESPONSE_BYTES:
+                        raise ValueError(
+                            f'Response too large ({int(cl_header):,} bytes > '
+                            f'{_MAX_RESPONSE_BYTES:,} byte limit)'
+                        )
+                except ValueError as exc:
+                    if 'too large' in str(exc):
+                        raise
+            # Streaming read: accumulate chunks and abort early if limit exceeded.
+            chunks: list[bytes] = []
+            total_bytes = 0
+            async for chunk in resp.content.iter_chunked(65536):
+                total_bytes += len(chunk)
+                if total_bytes > _MAX_RESPONSE_BYTES:
+                    raise ValueError(
+                        f'Response too large (> {_MAX_RESPONSE_BYTES:,} byte limit)'
+                    )
+                chunks.append(chunk)
+            body_bytes = b''.join(chunks)
             data = json.loads(body_bytes)
         return parse_report(data, code=code)
 

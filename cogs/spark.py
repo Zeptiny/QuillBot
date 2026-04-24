@@ -48,9 +48,13 @@ class SparkAnalyzeView(discord.ui.View):
         await self.cog._do_spark_analysis(interaction, self.code, followup=True)
 
     async def on_timeout(self) -> None:
-        # Disable button silently when the view expires.
         for item in self.children:
             item.disabled = True  # type: ignore[attr-defined]
+        if self.message is not None:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -157,11 +161,12 @@ class SparkAnalyzer(commands.Cog, name='SparkAnalyzer'):
             return
         code = match.group(1)
         view = SparkAnalyzeView(self, code)
-        await message.reply(
+        reply = await message.reply(
             '🔥 Relatório Spark detectado! Deseja analisar com IA?',
             view=view,
             mention_author=False,
         )
+        view.message = reply
 
 
 async def setup(bot: commands.Bot) -> None:
