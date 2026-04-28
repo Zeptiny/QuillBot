@@ -22,6 +22,9 @@ RERANK_MODEL: Final[str] = os.getenv('RERANK_MODEL', 'cohere/rerank-4-fast')
 COOLDOWN_RATE: Final[int] = int(os.getenv('COOLDOWN_RATE', '1'))
 COOLDOWN_PER: Final[float] = float(os.getenv('COOLDOWN_PER', '30'))
 
+# --- Feature Flags ---
+WEB_SEARCH_ENABLED: Final[bool] = os.getenv('WEB_SEARCH_ENABLED', 'true').strip().lower() in ('1', 'true', 'yes')
+
 # --- Logging ---
 LOG_LEVEL: Final[str] = os.getenv('LOG_LEVEL', 'INFO').upper()
 

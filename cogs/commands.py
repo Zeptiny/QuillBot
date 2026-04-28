@@ -9,9 +9,14 @@ from discord.ext import commands
 from openai import AsyncOpenAI, RateLimitError
 
 from cogs.utils import PaginatedEmbedView, split_response
-from config import CHAT_MODEL, COOLDOWN_PER, COOLDOWN_RATE, DOCS_BASE_URL, OPENROUTER_API_KEY
+from config import CHAT_MODEL, COOLDOWN_PER, COOLDOWN_RATE, DOCS_BASE_URL, OPENROUTER_API_KEY, WEB_SEARCH_ENABLED
 
 logger = logging.getLogger(__name__)
+
+_WEB_SEARCH_INSTRUCTIONS = (
+    "2. Para informações em tempo real ou recentes, use a busca web disponível.\n"
+    "4. Quando citar resultados da web, inclua o título e o link da fonte.\n"
+)
 
 GENERAL_SYSTEM_PROMPT = (
     "<role>\n"
@@ -20,10 +25,10 @@ GENERAL_SYSTEM_PROMPT = (
     "</role>\n\n"
     "<instructions>\n"
     "1. Responda perguntas gerais com base no seu conhecimento.\n"
-    "2. Para informações em tempo real ou recentes, use a busca web disponível.\n"
+    + (_WEB_SEARCH_INSTRUCTIONS if WEB_SEARCH_ENABLED else '') +
     "3. Seja honesto quando não souber a resposta — não invente informações.\n"
-    "4. Quando citar resultados da web, inclua o título e o link da fonte.\n"
-    "5. Quando útil, termine com uma sugestão de acompanhamento na linha final, prefixada com '💡 '.\n"
+    + ('5' if WEB_SEARCH_ENABLED else '4') +
+    ". Quando útil, termine com uma sugestão de acompanhamento na linha final, prefixada com '💡 '.\n"
     "</instructions>\n\n"
     "<response_format>\n"
     "Seja claro e conciso. Use markdown para formatação quando aplicável.\n"
@@ -434,14 +439,16 @@ class Commands(commands.Cog):
         else:
             messages.append({'role': 'user', 'content': question})
 
+        tools = [{
+            'type': 'openrouter:web_search',
+            'parameters': {'max_results': 5, 'search_context_size': 'medium'},
+        }] if WEB_SEARCH_ENABLED else None
+
         response = await self.client.chat.completions.create(
             model=CHAT_MODEL,
             messages=messages,
             max_tokens=2048,
-            tools=[{
-                'type': 'openrouter:web_search',
-                'parameters': {'max_results': 5, 'search_context_size': 'medium'},
-            }],
+            tools=tools,
         )
         answer = response.choices[0].message.content or 'Não foi possível gerar uma resposta.'
 
