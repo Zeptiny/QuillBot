@@ -22,6 +22,9 @@ RERANK_MODEL: Final[str] = os.getenv('RERANK_MODEL', 'cohere/rerank-4-fast')
 COOLDOWN_RATE: Final[int] = int(os.getenv('COOLDOWN_RATE', '1'))
 COOLDOWN_PER: Final[float] = float(os.getenv('COOLDOWN_PER', '30'))
 
+# --- Logging ---
+LOG_LEVEL: Final[str] = os.getenv('LOG_LEVEL', 'INFO').upper()
+
 # --- Docs / RAG ---
 DOCS_REPO: Final[str] = 'MinersRefuge/docs'
 DOCS_BRANCH: Final[str] = 'main'

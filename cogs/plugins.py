@@ -108,6 +108,10 @@ class PluginSearch(commands.Cog):
     @app_commands.describe(name='Nome do plugin para pesquisar')
     async def plugin_search(self, interaction: discord.Interaction, name: str):
         await interaction.response.defer(thinking=True)
+        logger.info(
+            "Processing /plugin user=%s guild=%s query=%r",
+            interaction.user.id, interaction.guild_id, name[:80],
+        )
 
         modrinth_results, hangar_results, spiget_results = await asyncio.gather(
             search_modrinth(self.session, name),

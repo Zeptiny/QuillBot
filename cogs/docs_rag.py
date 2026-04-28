@@ -859,6 +859,11 @@ class DocsRAG(commands.Cog):
 
         await interaction.response.defer(thinking=True)
 
+        logger.info(
+            "Processing /ask user=%s guild=%s question=%r",
+            interaction.user.id, interaction.guild_id, question[:80],
+        )
+
         try:
             answer, embeds = await self._run_agent(
                 question, image_url=image_url, interaction=interaction

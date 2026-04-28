@@ -381,6 +381,11 @@ class Commands(commands.Cog):
 
         await interaction.response.defer(thinking=True)
 
+        logger.info(
+            "Processing /chat user=%s guild=%s question=%r",
+            interaction.user.id, interaction.guild_id, question[:80],
+        )
+
         try:
             answer, embeds = await self._run_chat(question, image_url=image_url)
             if len(embeds) == 1:

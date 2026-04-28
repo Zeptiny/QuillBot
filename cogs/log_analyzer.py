@@ -284,6 +284,10 @@ class LogAnalyzer(commands.Cog):
 
         if fetch_url:
             await message.add_reaction('👀')
+            logger.info(
+                "Log link detected user=%s guild=%s url=%s",
+                message.author.id, message.guild_id, fetch_url[:80],
+            )
             link_content, _ = await self.read_file_content(fetch_url)
             if link_content and not response:
                 response = check_message(link_content)
@@ -421,6 +425,11 @@ class LogAnalyzer(commands.Cog):
                 return
 
         await interaction.response.defer(thinking=True)
+
+        logger.info(
+            "Processing /analyze user=%s guild=%s",
+            interaction.user.id, interaction.guild_id,
+        )
 
         log_content = None
         content_truncated = False

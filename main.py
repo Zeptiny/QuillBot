@@ -4,13 +4,13 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from config import BOT_TOKEN, validate_config
+from config import BOT_TOKEN, LOG_LEVEL, validate_config
 
 validate_config()
 assert BOT_TOKEN is not None  # narrowed by validate_config()
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
     format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
 )
 logger = logging.getLogger('quillbot')

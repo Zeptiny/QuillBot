@@ -90,6 +90,10 @@ class SparkAnalyzer(commands.Cog, name='SparkAnalyzer'):
     )
     async def spark(self, interaction: discord.Interaction, url: str) -> None:
         await interaction.response.defer(thinking=True)
+        logger.info(
+            "Processing /spark user=%s guild=%s url=%r",
+            interaction.user.id, interaction.guild_id, url[:80],
+        )
         await self._do_spark_analysis(interaction, url, followup=True)
 
     # --- Core analysis flow ---
