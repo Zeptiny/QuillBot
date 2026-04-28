@@ -1087,6 +1087,7 @@ class DocsRAG(commands.Cog):
         active_tools = TOOLS + SPARK_TOOLS if spark_report is not None else TOOLS
 
         all_sources: list[dict] = []
+        seen_chunk_paths: set[str] = set()
 
         for _ in range(MAX_TOOL_ROUNDS):
             response = await self.client.chat.completions.create(
@@ -1124,7 +1125,31 @@ class DocsRAG(commands.Cog):
                 result_text, sources = await self._exec_tool(
                     tc.function.name, args, spark_report=spark_report
                 )
-                all_sources.extend(sources)
+
+                # De-duplicate search_docs results across agentic rounds.
+                # Track which chunk paths have already been sent to the LLM
+                # so repeated search_docs calls with similar queries don't
+                # reintroduce the same content into the context window.
+                if sources:
+                    new_sources = [s for s in sources if s['path'] not in seen_chunk_paths]
+                    if len(new_sources) < len(sources):
+                        logger.info(
+                            "Filtered %d duplicate chunk(s) from %s tool result",
+                            len(sources) - len(new_sources),
+                            tc.function.name,
+                        )
+                    for s in sources:
+                        seen_chunk_paths.add(s['path'])
+                    all_sources.extend(new_sources)
+
+                    # If all results were duplicates, inform the LLM so it
+                    # doesn't assume empty results and retry the same query.
+                    if not new_sources and sources:
+                        result_text = (
+                            'Os resultados desta busca já foram retornados '
+                            'em uma rodada anterior. Use as informações já '
+                            'fornecidas para formular sua resposta.'
+                        )
 
                 messages.append({
                     'role': 'tool',
