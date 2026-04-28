@@ -1,5 +1,7 @@
 import logging
+import time
 
+import aiohttp
 import discord
 from cachetools import TTLCache
 from discord import app_commands
@@ -44,6 +46,7 @@ class Commands(commands.Cog):
         self._conversations: TTLCache = TTLCache(maxsize=200, ttl=1800)
         # Per-user follow-up cooldown (same period as slash commands)
         self._followup_cd: TTLCache = TTLCache(maxsize=500, ttl=COOLDOWN_PER)
+        self._start_time: float = time.monotonic()
 
     @app_commands.command(name="plov", description="Informações necessárias para escolher um serviço de hospedagem")
     async def hosting_info(self, interaction: discord.Interaction):
@@ -242,6 +245,112 @@ class Commands(commands.Cog):
         await interaction.followup.send(
             f'✅ {len(synced)} comandos sincronizados.', ephemeral=True
         )
+
+    @staticmethod
+    async def _ping_api(
+        session: aiohttp.ClientSession, url: str, label: str
+    ) -> tuple[str, str, float]:
+        """Ping an API endpoint and return (label, status_emoji, latency_ms)."""
+        try:
+            start = time.monotonic()
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                latency = (time.monotonic() - start) * 1000
+                if resp.status < 400:
+                    return label, '🟢', latency
+                return label, f'🟡 ({resp.status})', latency
+        except Exception:
+            return label, '🔴', 0.0
+
+    @app_commands.command(name='health', description='Status e diagnóstico do bot (Admin)')
+    @app_commands.checks.has_permissions(administrator=True)
+    async def health(self, interaction: discord.Interaction):
+        await interaction.response.defer(thinking=True, ephemeral=True)
+
+        # Uptime
+        elapsed = time.monotonic() - self._start_time
+        days, remainder = divmod(int(elapsed), 86400)
+        hours, remainder = divmod(remainder, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        uptime_parts = []
+        if days:
+            uptime_parts.append(f'{days}d')
+        if hours:
+            uptime_parts.append(f'{hours}h')
+        if minutes:
+            uptime_parts.append(f'{minutes}m')
+        uptime_parts.append(f'{seconds}s')
+        uptime_str = ' '.join(uptime_parts)
+
+        # API health checks (run concurrently)
+        async with aiohttp.ClientSession() as session:
+            checks = await self._check_apis(session)
+
+        # Vector store stats
+        docs_rag = self.bot.cogs.get('DocsRAG')
+        chunk_count = 0
+        reindex_info = 'N/A'
+        if docs_rag:
+            chunk_count = len(docs_rag.chunks)
+            if docs_rag._last_commit_sha:
+                reindex_info = f'`{docs_rag._last_commit_sha[:12]}`'
+            if docs_rag._indexing:
+                reindex_info = '⏳ Indexando...'
+
+        # Conversation cache stats
+        conv_count = len(self._conversations)
+        conv_max = self._conversations.maxsize
+
+        # Build embed
+        embed = discord.Embed(
+            title='🏥 Health — QuillBot',
+            color=discord.Color.green(),
+            description=f'Uptime: **{uptime_str}**',
+        )
+
+        # API status field
+        api_lines = [f'{emoji} **{label}**' + (f' ({lat:.0f}ms)' if lat > 0 else '')
+                     for label, emoji, lat in checks]
+        embed.add_field(
+            name='🔌 APIs',
+            value='\n'.join(api_lines) or 'Nenhuma verificada',
+            inline=False,
+        )
+
+        # Vector store field
+        embed.add_field(
+            name='📚 Documentação',
+            value=(
+                f'Chunks: **{chunk_count}**\n'
+                f'Último reindex: {reindex_info}'
+            ),
+            inline=True,
+        )
+
+        # Cache field
+        embed.add_field(
+            name='💬 Conversas',
+            value=f'{conv_count}/{conv_max} ativas',
+            inline=True,
+        )
+
+        embed.set_footer(text=f'Latência do WebSocket: {self.bot.latency * 1000:.0f}ms')
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    async def _check_apis(
+        self, session: aiohttp.ClientSession
+    ) -> list[tuple[str, str, float]]:
+        """Run API health checks concurrently and return results."""
+        endpoints = [
+            ('OpenRouter', 'https://openrouter.ai/api/v1/models'),
+            ('GitHub', 'https://api.github.com'),
+            ('mclo.gs', 'https://api.mclo.gs'),
+            ('Modrinth', 'https://api.modrinth.com/v2/search?limit=1'),
+        ]
+        import asyncio
+        results = await asyncio.gather(
+            *(self._ping_api(session, url, label) for label, url in endpoints)
+        )
+        return list(results)
 
     @app_commands.command(name='chat', description='Faça uma pergunta geral ao assistente')
     @app_commands.checks.cooldown(COOLDOWN_RATE, COOLDOWN_PER)
