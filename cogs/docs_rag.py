@@ -21,7 +21,7 @@ from cogs.spark_parser import (
     build_detail as _spark_build_detail,
     build_summary as _spark_build_summary,
 )
-from cogs.utils import PaginatedEmbedView, split_response, truncate_safe as _truncate_safe
+from cogs.utils import PaginatedEmbedView, build_source_pages, split_response, truncate_safe as _truncate_safe
 from config import (
     CHAT_MODEL,
     COOLDOWN_PER,
@@ -1173,10 +1173,9 @@ class DocsRAG(commands.Cog):
         answer = choice.message.content or 'Não foi possível gerar uma resposta.'
 
         # Build source links (attached to first page only) -----------------------
-        sources_value: str | None = None
+        source_lines: list[str] = []
         if all_sources:
             seen_paths: set[str] = set()
-            source_lines: list[str] = []
             for r in all_sources:
                 if r['path'] not in seen_paths:
                     seen_paths.add(r['path'])
@@ -1184,10 +1183,6 @@ class DocsRAG(commands.Cog):
                     doc_title = r['title'] or _title_from_path(r['path'])
                     source_label = r.get('source', "Miners' Refuge")
                     source_lines.append(f'• [{doc_title}]({doc_url}) — {source_label}')
-                if len(source_lines) >= 8:
-                    break
-            if source_lines:
-                sources_value = '\n'.join(source_lines)
 
         # Build paginated embeds -------------------------------------------------
         embed_title = title or f'❓ {question}'
@@ -1204,16 +1199,21 @@ class DocsRAG(commands.Cog):
                 description=page_text,
                 color=discord.Color.orange() if spark_report is not None else discord.Color.blue(),
             )
-            if i == 0 and sources_value:
-                e.add_field(
-                    name='📄 Fontes da Documentação',
-                    value=sources_value,
-                    inline=False,
-                )
             e.set_footer(
                 text=f"Página {i + 1}/{total} • {footer_base}" if total > 1 else footer_base
             )
             embeds.append(e)
+
+        if source_lines:
+            embed_color = discord.Color.orange() if spark_report is not None else discord.Color.blue()
+            embeds.extend(
+                build_source_pages(
+                    source_lines,
+                    title='📄 Fontes da Documentação',
+                    color=embed_color,
+                    footer_base=footer_base,
+                )
+            )
 
         return answer, embeds
 

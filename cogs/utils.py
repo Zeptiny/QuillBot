@@ -30,6 +30,56 @@ def split_response(text: str, chunk_size: int = 3500) -> list[str]:
     return chunks
 
 
+def build_source_pages(
+    source_lines: list[str],
+    title: str,
+    color: discord.Color,
+    footer_base: str,
+    page_size: int = 4000,
+) -> list[discord.Embed]:
+    """Paginate *source_lines* into embeds using the description field (4096 limit).
+
+    Each embed's description stays under *page_size* chars.  Sources are
+    always placed on their own page(s) so they never hit the 1024-char
+    field-value limit.
+    """
+    if not source_lines:
+        return []
+
+    pages: list[discord.Embed] = []
+    current_lines: list[str] = []
+    current_len = 0
+
+    for line in source_lines:
+        added_len = len(line) + (1 if current_lines else 0)
+        if current_lines and current_len + added_len > page_size:
+            e = discord.Embed(
+                title=title,
+                description='\n'.join(current_lines),
+                color=color,
+            )
+            pages.append(e)
+            current_lines = []
+            current_len = 0
+        current_lines.append(line)
+        current_len += added_len
+
+    if current_lines:
+        e = discord.Embed(
+            title=title,
+            description='\n'.join(current_lines),
+            color=color,
+        )
+        pages.append(e)
+
+    total = len(pages) + 0  # pages of sources only
+    for i, e in enumerate(pages):
+        src_idx = i + 1
+        e.set_footer(text=f"Fontes {src_idx}/{len(pages)} • {footer_base}")
+
+    return pages
+
+
 class PaginatedEmbedView(discord.ui.View):
     """Navigation view for multi-page embed responses."""
 

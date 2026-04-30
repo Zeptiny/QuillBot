@@ -13,7 +13,7 @@ from cogs.tavily_tools import TOOLS as TAVILY_TOOLS
 from cogs.tavily_tools import exec_tool as tavily_exec_tool
 from cogs.tavily_tools import status_label as tavily_status_label
 from cogs.tavily_tools import MAX_TOOL_ROUNDS as TAVILY_MAX_ROUNDS
-from cogs.utils import PaginatedEmbedView, split_response, truncate_safe
+from cogs.utils import PaginatedEmbedView, build_source_pages, split_response, truncate_safe
 from config import CHAT_MODEL, COOLDOWN_PER, COOLDOWN_RATE, DOCS_BASE_URL, OPENROUTER_API_KEY, TAVILY_API_KEY, TAVILY_AVAILABLE
 
 logger = logging.getLogger(__name__)
@@ -536,10 +536,9 @@ class Commands(commands.Cog):
 
         answer = response.choices[0].message.content or 'Não foi possível gerar uma resposta.'
 
-        sources_value: str | None = None
+        source_lines: list[str] = []
         if all_sources:
             seen_src: set[str] = set()
-            source_lines: list[str] = []
             for s in all_sources:
                 url = s.get('url', '')
                 if url in seen_src:
@@ -547,10 +546,6 @@ class Commands(commands.Cog):
                 seen_src.add(url)
                 title = s.get('title', url)
                 source_lines.append(f'• [{title}]({url})')
-                if len(source_lines) >= 8:
-                    break
-            if source_lines:
-                sources_value = '\n'.join(source_lines)
 
         pages = split_response(answer)
         total = len(pages)
@@ -562,16 +557,21 @@ class Commands(commands.Cog):
                 description=page_text,
                 color=discord.Color.teal(),
             )
-            if i == 0 and sources_value:
-                e.add_field(
-                    name='🌐 Fontes da Web',
-                    value=sources_value,
-                    inline=False,
-                )
+            page_num = i + 1
             e.set_footer(
-                text=f"Página {i + 1}/{total} • {footer_base}" if total > 1 else footer_base
+                text=f"Página {page_num}/{total} • {footer_base}" if total > 1 else footer_base
             )
             embeds.append(e)
+
+        if source_lines:
+            embeds.extend(
+                build_source_pages(
+                    source_lines,
+                    title='🌐 Fontes da Web',
+                    color=discord.Color.teal(),
+                    footer_base=footer_base,
+                )
+            )
 
         return answer, embeds
 
