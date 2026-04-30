@@ -11,6 +11,7 @@ load_dotenv()
 # --- Required ---
 BOT_TOKEN: Final[str | None] = os.getenv('BOT_TOKEN')
 OPENROUTER_API_KEY: Final[str | None] = os.getenv('OPENROUTER_API_KEY')
+TAVILY_API_KEY: Final[str | None] = os.getenv('TAVILY_API_KEY')
 
 # --- AI Models ---
 CHAT_MODEL: Final[str] = os.getenv('CHAT_MODEL', 'qwen/qwen3.6-plus')
@@ -24,6 +25,7 @@ COOLDOWN_PER: Final[float] = float(os.getenv('COOLDOWN_PER', '30'))
 
 # --- Feature Flags ---
 WEB_SEARCH_ENABLED: Final[bool] = os.getenv('WEB_SEARCH_ENABLED', 'true').strip().lower() in ('1', 'true', 'yes')
+TAVILY_AVAILABLE: Final[bool] = bool(TAVILY_API_KEY) and WEB_SEARCH_ENABLED
 
 # --- Logging ---
 LOG_LEVEL: Final[str] = os.getenv('LOG_LEVEL', 'INFO').upper()
@@ -91,3 +93,9 @@ def validate_config() -> None:
     if not BOT_TOKEN:
         print('FATAL: BOT_TOKEN environment variable is not set. Cannot start.', file=sys.stderr)
         sys.exit(1)
+    if WEB_SEARCH_ENABLED and not TAVILY_API_KEY:
+        print(
+            'WARNING: WEB_SEARCH_ENABLED is true but TAVILY_API_KEY is not set. '
+            'Web search will be disabled.',
+            file=sys.stderr,
+        )

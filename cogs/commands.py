@@ -1,3 +1,4 @@
+import json
 import logging
 import time
 
@@ -8,13 +9,21 @@ from discord import app_commands
 from discord.ext import commands
 from openai import AsyncOpenAI, RateLimitError
 
-from cogs.utils import PaginatedEmbedView, split_response
-from config import CHAT_MODEL, COOLDOWN_PER, COOLDOWN_RATE, DOCS_BASE_URL, OPENROUTER_API_KEY, WEB_SEARCH_ENABLED
+from cogs.tavily_tools import TOOLS as TAVILY_TOOLS
+from cogs.tavily_tools import exec_tool as tavily_exec_tool
+from cogs.tavily_tools import status_label as tavily_status_label
+from cogs.tavily_tools import MAX_TOOL_ROUNDS as TAVILY_MAX_ROUNDS
+from cogs.utils import PaginatedEmbedView, split_response, truncate_safe
+from config import CHAT_MODEL, COOLDOWN_PER, COOLDOWN_RATE, DOCS_BASE_URL, OPENROUTER_API_KEY, TAVILY_API_KEY, TAVILY_AVAILABLE
 
 logger = logging.getLogger(__name__)
 
 _WEB_SEARCH_INSTRUCTIONS = (
-    "2. Para informações em tempo real ou recentes, use a busca web disponível.\n"
+    "2. Para informações em tempo real ou recentes, use as ferramentas de busca web.\n"
+    "   - Use `web_search` para buscar informações atualizadas na web.\n"
+    "   - Use `web_extract` quando precisar ler o conteúdo completo de uma URL específica.\n"
+    "   - Prefira `web_search` primeiro; use `web_extract` para se aprofundar em fontes relevantes.\n"
+    "   - Use `search_depth='advanced'` para buscas mais precisas quando necessário.\n"
     "4. Quando citar resultados da web, inclua o título e o link da fonte.\n"
 )
 
@@ -25,9 +34,9 @@ GENERAL_SYSTEM_PROMPT = (
     "</role>\n\n"
     "<instructions>\n"
     "1. Responda perguntas gerais com base no seu conhecimento.\n"
-    + (_WEB_SEARCH_INSTRUCTIONS if WEB_SEARCH_ENABLED else '') +
+    + (_WEB_SEARCH_INSTRUCTIONS if TAVILY_AVAILABLE else '') +
     "3. Seja honesto quando não souber a resposta — não invente informações.\n"
-    + ('5' if WEB_SEARCH_ENABLED else '4') +
+    + ('5' if TAVILY_AVAILABLE else '4') +
     ". Quando útil, termine com uma sugestão de acompanhamento na linha final, prefixada com '💡 '.\n"
     "</instructions>\n\n"
     "<response_format>\n"
@@ -290,6 +299,9 @@ class Commands(commands.Cog):
         async with aiohttp.ClientSession() as session:
             checks = await self._check_apis(session)
 
+        # Web search status
+        tavily_status = '🟢 Ativa' if TAVILY_AVAILABLE else ('🔴 Desativada' if not TAVILY_API_KEY else '🟡 Sem API key')
+
         # Vector store stats
         docs_rag = self.bot.cogs.get('DocsRAG')
         chunk_count = 0
@@ -331,6 +343,13 @@ class Commands(commands.Cog):
             inline=True,
         )
 
+        # Web search field
+        embed.add_field(
+            name='🌐 Busca Web',
+            value=tavily_status,
+            inline=True,
+        )
+
         # Cache field
         embed.add_field(
             name='💬 Conversas',
@@ -347,6 +366,7 @@ class Commands(commands.Cog):
         """Run API health checks concurrently and return results."""
         endpoints = [
             ('OpenRouter', 'https://openrouter.ai/api/v1/models'),
+            ('Tavily', 'https://api.tavily.com'),
             ('GitHub', 'https://api.github.com'),
             ('mclo.gs', 'https://api.mclo.gs'),
             ('Modrinth', 'https://api.modrinth.com/v2/search?limit=1'),
@@ -392,7 +412,12 @@ class Commands(commands.Cog):
         )
 
         try:
-            answer, embeds = await self._run_chat(question, image_url=image_url)
+            answer, embeds = await self._run_chat(question, image_url=image_url, interaction=interaction)
+            # Clear any in-progress status message before sending the final embed.
+            try:
+                await interaction.edit_original_response(content=None)
+            except discord.HTTPException:
+                pass
             if len(embeds) == 1:
                 msg = await interaction.followup.send(embed=embeds[0], wait=True)
             else:
@@ -420,6 +445,7 @@ class Commands(commands.Cog):
         question: str,
         history: list[dict] | None = None,
         image_url: str | None = None,
+        interaction: discord.Interaction | None = None,
     ) -> tuple[str, list[discord.Embed]]:
         messages = [{'role': 'system', 'content': GENERAL_SYSTEM_PROMPT}]
 
@@ -439,18 +465,92 @@ class Commands(commands.Cog):
         else:
             messages.append({'role': 'user', 'content': question})
 
-        tools = [{
-            'type': 'openrouter:web_search',
-            'parameters': {'max_results': 5, 'search_context_size': 'medium'},
-        }] if WEB_SEARCH_ENABLED else None
+        active_tools = TAVILY_TOOLS if TAVILY_AVAILABLE else None
 
-        response = await self.client.chat.completions.create(
-            model=CHAT_MODEL,
-            messages=messages,
-            max_tokens=2048,
-            tools=tools,
-        )
+        all_sources: list[dict] = []
+        seen_urls: set[str] = set()
+
+        for _ in range(TAVILY_MAX_ROUNDS):
+            response = await self.client.chat.completions.create(
+                model=CHAT_MODEL,
+                messages=messages,
+                max_tokens=2048,
+                tools=active_tools,
+            )
+
+            choice = response.choices[0]
+
+            if not choice.message.tool_calls:
+                break
+
+            messages.append(choice.message)
+
+            for tc in choice.message.tool_calls:
+                try:
+                    args = json.loads(tc.function.arguments)
+                except (json.JSONDecodeError, TypeError):
+                    args = {}
+
+                if interaction is not None:
+                    try:
+                        await interaction.edit_original_response(
+                            content=tavily_status_label(tc.function.name, args)
+                        )
+                    except discord.HTTPException:
+                        pass
+
+                result_text, sources = await tavily_exec_tool(tc.function.name, args)
+
+                if sources:
+                    new_sources = [s for s in sources if s.get('url', '') not in seen_urls]
+                    if len(new_sources) < len(sources):
+                        logger.info(
+                            "Filtered %d duplicate web source(s) from %s tool result",
+                            len(sources) - len(new_sources),
+                            tc.function.name,
+                        )
+                    for s in sources:
+                        url = s.get('url', '')
+                        if url:
+                            seen_urls.add(url)
+                    all_sources.extend(new_sources)
+
+                    if not new_sources and sources:
+                        result_text = (
+                            'Os resultados desta busca já foram retornados '
+                            'em uma rodada anterior. Use as informações já '
+                            'fornecidas para formular sua resposta.'
+                        )
+
+                messages.append({
+                    'role': 'tool',
+                    'tool_call_id': tc.id,
+                    'content': truncate_safe(result_text, limit=6000),
+                })
+        else:
+            response = await self.client.chat.completions.create(
+                model=CHAT_MODEL,
+                messages=messages,
+                max_tokens=2048,
+            )
+
         answer = response.choices[0].message.content or 'Não foi possível gerar uma resposta.'
+
+        sources_value: str | None = None
+        if all_sources:
+            seen_src: set[str] = set()
+            source_lines: list[str] = []
+            for s in all_sources:
+                url = s.get('url', '')
+                if url in seen_src:
+                    continue
+                seen_src.add(url)
+                title = s.get('title', url)
+                source_lines.append(f'• [{title}]({url})')
+                if len(source_lines) >= 8:
+                    break
+            if source_lines:
+                sources_value = '\n'.join(source_lines)
 
         pages = split_response(answer)
         total = len(pages)
@@ -462,6 +562,12 @@ class Commands(commands.Cog):
                 description=page_text,
                 color=discord.Color.teal(),
             )
+            if i == 0 and sources_value:
+                e.add_field(
+                    name='🌐 Fontes da Web',
+                    value=sources_value,
+                    inline=False,
+                )
             e.set_footer(
                 text=f"Página {i + 1}/{total} • {footer_base}" if total > 1 else footer_base
             )
