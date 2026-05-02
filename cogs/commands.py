@@ -1,4 +1,3 @@
-import json
 import logging
 import time
 
@@ -13,7 +12,7 @@ from cogs.tavily_tools import TOOLS as TAVILY_TOOLS
 from cogs.tavily_tools import exec_tool as tavily_exec_tool
 from cogs.tavily_tools import status_label as tavily_status_label
 from cogs.tavily_tools import MAX_TOOL_ROUNDS as TAVILY_MAX_ROUNDS
-from cogs.utils import PaginatedEmbedView, build_source_pages, split_response, truncate_safe
+from cogs.utils import PaginatedEmbedView, build_source_pages, run_tool_loop, split_response
 from config import CHAT_MODEL, COOLDOWN_PER, COOLDOWN_RATE, DOCS_BASE_URL, OPENROUTER_API_KEY, TAVILY_API_KEY, TAVILY_AVAILABLE
 
 logger = logging.getLogger(__name__)
@@ -477,74 +476,17 @@ class Commands(commands.Cog):
 
         active_tools = TAVILY_TOOLS if TAVILY_AVAILABLE else None
 
-        all_sources: list[dict] = []
-        seen_urls: set[str] = set()
-
-        for _ in range(TAVILY_MAX_ROUNDS):
-            response = await self.client.chat.completions.create(
-                model=CHAT_MODEL,
-                messages=messages,
-                max_tokens=2048,
-                tools=active_tools,
-            )
-
-            choice = response.choices[0]
-
-            if not choice.message.tool_calls:
-                break
-
-            messages.append(choice.message)
-
-            for tc in choice.message.tool_calls:
-                try:
-                    args = json.loads(tc.function.arguments)
-                except (json.JSONDecodeError, TypeError):
-                    args = {}
-
-                if interaction is not None:
-                    try:
-                        await interaction.edit_original_response(
-                            content=tavily_status_label(tc.function.name, args)
-                        )
-                    except discord.HTTPException:
-                        pass
-
-                result_text, sources = await tavily_exec_tool(tc.function.name, args)
-
-                if sources:
-                    new_sources = [s for s in sources if s.get('url', '') not in seen_urls]
-                    if len(new_sources) < len(sources):
-                        logger.info(
-                            "Filtered %d duplicate web source(s) from %s tool result",
-                            len(sources) - len(new_sources),
-                            tc.function.name,
-                        )
-                    for s in sources:
-                        url = s.get('url', '')
-                        if url:
-                            seen_urls.add(url)
-                    all_sources.extend(new_sources)
-
-                    if not new_sources and sources:
-                        result_text = (
-                            'Os resultados desta busca já foram retornados '
-                            'em uma rodada anterior. Use as informações já '
-                            'fornecidas para formular sua resposta.'
-                        )
-
-                messages.append({
-                    'role': 'tool',
-                    'tool_call_id': tc.id,
-                    'content': truncate_safe(result_text, limit=6000),
-                })
-        else:
-            response = await self.client.chat.completions.create(
-                model=CHAT_MODEL,
-                messages=messages,
-                max_tokens=2048,
-            )
-
-        answer = response.choices[0].message.content or 'Não foi possível gerar uma resposta.'
+        answer, all_sources = await run_tool_loop(
+            client=self.client,
+            model=CHAT_MODEL,
+            messages=messages,
+            tools=active_tools,
+            exec_tool=tavily_exec_tool,
+            status_label=tavily_status_label,
+            interaction=interaction,
+            max_rounds=TAVILY_MAX_ROUNDS,
+            dedup_key=lambda s: s.get('url', ''),
+        )
 
         source_lines: list[str] = []
         if all_sources:

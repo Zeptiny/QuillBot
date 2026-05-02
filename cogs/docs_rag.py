@@ -21,7 +21,7 @@ from cogs.spark_parser import (
     build_detail as _spark_build_detail,
     build_summary as _spark_build_summary,
 )
-from cogs.utils import PaginatedEmbedView, build_source_pages, split_response, truncate_safe as _truncate_safe
+from cogs.utils import PaginatedEmbedView, build_source_pages, run_tool_loop, split_response
 from config import (
     CHAT_MODEL,
     COOLDOWN_PER,
@@ -1130,86 +1130,21 @@ class DocsRAG(commands.Cog):
         model = SPARK_MODEL if spark_report is not None else CHAT_MODEL
         active_tools = TOOLS + SPARK_TOOLS if spark_report is not None else TOOLS
 
-        all_sources: list[dict] = []
-        seen_chunk_paths: set[str] = set()
+        exec_tool = (
+            lambda name, args: self._exec_tool(name, args, spark_report=spark_report)
+        )
 
-        for _ in range(MAX_TOOL_ROUNDS):
-            response = await self.client.chat.completions.create(
-                model=model,
-                messages=messages,
-                tools=active_tools,
-                max_tokens=2048,
-            )
-
-            choice = response.choices[0]
-
-            # No tool calls → final answer
-            if not choice.message.tool_calls:
-                break
-
-            # Append the assistant message with tool calls
-            messages.append(choice.message)
-
-            # Execute each tool call
-            for tc in choice.message.tool_calls:
-                try:
-                    args = json.loads(tc.function.arguments)
-                except (json.JSONDecodeError, TypeError):
-                    args = {}
-
-                # Update the deferred interaction with a live status message.
-                if interaction is not None:
-                    try:
-                        await interaction.edit_original_response(
-                            content=self._status_label(tc.function.name, args)
-                        )
-                    except discord.HTTPException:
-                        pass
-
-                result_text, sources = await self._exec_tool(
-                    tc.function.name, args, spark_report=spark_report
-                )
-
-                # De-duplicate search_docs results across agentic rounds.
-                # Track which chunk paths have already been sent to the LLM
-                # so repeated search_docs calls with similar queries don't
-                # reintroduce the same content into the context window.
-                if sources:
-                    new_sources = [s for s in sources if s['path'] not in seen_chunk_paths]
-                    if len(new_sources) < len(sources):
-                        logger.info(
-                            "Filtered %d duplicate chunk(s) from %s tool result",
-                            len(sources) - len(new_sources),
-                            tc.function.name,
-                        )
-                    for s in sources:
-                        seen_chunk_paths.add(s['path'])
-                    all_sources.extend(new_sources)
-
-                    # If all results were duplicates, inform the LLM so it
-                    # doesn't assume empty results and retry the same query.
-                    if not new_sources and sources:
-                        result_text = (
-                            'Os resultados desta busca já foram retornados '
-                            'em uma rodada anterior. Use as informações já '
-                            'fornecidas para formular sua resposta.'
-                        )
-
-                messages.append({
-                    'role': 'tool',
-                    'tool_call_id': tc.id,
-                    'content': _truncate_safe(result_text, limit=6000),
-                })
-        else:
-            # If we exhausted rounds, get a final response without tools
-            response = await self.client.chat.completions.create(
-                model=model,
-                messages=messages,
-                max_tokens=2048,
-            )
-            choice = response.choices[0]
-
-        answer = choice.message.content or 'Não foi possível gerar uma resposta.'
+        answer, all_sources = await run_tool_loop(
+            client=self.client,
+            model=model,
+            messages=messages,
+            tools=active_tools,
+            exec_tool=exec_tool,
+            status_label=self._status_label,
+            interaction=interaction,
+            max_rounds=MAX_TOOL_ROUNDS,
+            dedup_key=lambda s: s.get('path', ''),
+        )
 
         # Build source links (attached to first page only) -----------------------
         source_lines: list[str] = []
