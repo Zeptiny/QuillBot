@@ -82,7 +82,7 @@ SYSTEM_PROMPT = (
     "Para servidores com 20–50 jogadores, valores entre 6 e 8 oferecem bom equilíbrio.\n\n"
     "💡 Quer otimizar também o `simulation-distance`?\n"
     "</assistant>\n"
-    "</exemple>\n"
+    "</example>\n"
     "<example>\n"
     "<user>meu server tá com problema</user>\n"
     "<assistant>\n"
@@ -91,7 +91,7 @@ SYSTEM_PROMPT = (
     "- O problema é lag, crash ou erro ao conectar?\n"
     "- Você tem um log ou relatório do Spark para compartilhar?\n"
     "</assistant>\n"
-    "</exemple>\n"
+    "</example>\n"
     "</examples>"
 )
 # Appended to SYSTEM_PROMPT when a Spark report is active in the session.
