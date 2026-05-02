@@ -305,12 +305,21 @@ class Commands(commands.Cog):
         docs_rag = self.bot.cogs.get('DocsRAG')
         chunk_count = 0
         reindex_info = 'N/A'
+        source_info = ''
         if docs_rag:
             chunk_count = len(docs_rag.chunks)
             if docs_rag._last_commit_sha:
                 reindex_info = f'`{docs_rag._last_commit_sha[:12]}`'
             if docs_rag._indexing:
                 reindex_info = '⏳ Indexando...'
+            # Per-source last index timestamps
+            if hasattr(docs_rag, '_source_last_index') and docs_rag._source_last_index:
+                import datetime
+                lines = []
+                for label, ts in docs_rag._source_last_index.items():
+                    dt = datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc)
+                    lines.append(f'{label}: {dt.strftime("%Y-%m-%d %H:%M UTC")}')
+                source_info = '\n'.join(lines)
 
         # Conversation cache stats
         conv_count = len(self._conversations)
@@ -333,12 +342,14 @@ class Commands(commands.Cog):
         )
 
         # Vector store field
+        doc_lines = [f'Chunks: **{chunk_count}**']
+        if reindex_info != 'N/A':
+            doc_lines.append(f'Último reindex: {reindex_info}')
+        if source_info:
+            doc_lines.append(f'Fontes:\n{source_info}')
         embed.add_field(
             name='📚 Documentação',
-            value=(
-                f'Chunks: **{chunk_count}**\n'
-                f'Último reindex: {reindex_info}'
-            ),
+            value='\n'.join(doc_lines),
             inline=True,
         )
 

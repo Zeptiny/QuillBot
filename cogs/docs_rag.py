@@ -366,6 +366,9 @@ class DocsRAG(commands.Cog):
         self._last_commit_sha: str | None = None
         self._indexing: bool = False
         self._emb_matrix: np.ndarray | None = None  # (N, dim) float32 for vectorized search
+        # Per-source SHA tracking for granular reindex
+        self._source_shas: dict[str, str] = {}  # label -> latest commit SHA
+        self._source_last_index: dict[str, float] = {}  # label -> timestamp
         # TTL cache: max 200 conversations, each expires after 30 min
         self._conversations: TTLCache = TTLCache(maxsize=200, ttl=1800)
         # Per-user follow-up cooldown (same period as slash commands)
@@ -703,31 +706,37 @@ class DocsRAG(commands.Cog):
         )
         return chunks
 
-    async def index_docs(self):
-        """Fetch all docs from all configured sources and create embeddings."""
+    async def index_docs(self, sources: list[dict] | None = None):
+        """Fetch docs from all configured sources (or only *sources* if provided) and create embeddings."""
         if self._indexing:
             logger.info("index_docs() called while already indexing; skipping")
             return
         self._indexing = True
         try:
-            await self._index_docs_inner()
+            await self._index_docs_inner(sources)
         finally:
             self._indexing = False
 
-    async def _index_docs_inner(self):
-        logger.info("Indexing %d documentation source(s)...", len(DOC_SOURCES))
+    async def _index_docs_inner(self, sources: list[dict] | None = None):
+        sources_to_index = sources if sources is not None else DOC_SOURCES
+        logger.info(
+            "Indexing %d documentation source(s)...",
+            len(sources_to_index),
+        )
 
         # All sources share a semaphore to cap total concurrent HTTP fetches
         semaphore = asyncio.Semaphore(5)
-        source_tasks = [self._index_source(src, semaphore) for src in DOC_SOURCES]
+        source_tasks = [self._index_source(src, semaphore) for src in sources_to_index]
         source_results = await asyncio.gather(*source_tasks, return_exceptions=True)
 
         all_chunks = []
-        for src, result in zip(DOC_SOURCES, source_results, strict=True):
+        indexed_labels: list[str] = []
+        for src, result in zip(sources_to_index, source_results, strict=True):
             if isinstance(result, Exception):
                 logger.error("Error indexing source '%s': %s", src['label'], result)
             else:
                 all_chunks.extend(result)
+                indexed_labels.append(src['label'])
 
         logger.info("Total chunks before embedding: %d", len(all_chunks))
         if not all_chunks:
@@ -749,8 +758,38 @@ class DocsRAG(commands.Cog):
         logger.info("Documentation indexed: %d chunks with embeddings", len(self.chunks))
         self._rebuild_matrix()
 
-        # Track composite commit SHA across all sources and persist
-        self._last_commit_sha = await self._get_composite_sha()
+        # Track per-source SHAs and timestamps
+        if sources is not None:
+            # Partial reindex: update only the requested sources
+            for src in sources_to_index:
+                label = src['label']
+                url = f'https://api.github.com/repos/{src["repo"]}/commits/{src["branch"]}'
+                try:
+                    async with self.session.get(url) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            self._source_shas[label] = data.get('sha', '')
+                except Exception:
+                    logger.exception("Failed to fetch commit SHA for %s", label)
+                self._source_last_index[label] = __import__('time').monotonic()
+        else:
+            # Full reindex: update all sources and composite SHA
+            self._last_commit_sha = await self._get_composite_sha()
+            for src in DOC_SOURCES:
+                label = src['label']
+                sha = self._source_shas.get(label, '')
+                if not sha:
+                    url = f'https://api.github.com/repos/{src["repo"]}/commits/{src["branch"]}'
+                    try:
+                        async with self.session.get(url) as resp:
+                            if resp.status == 200:
+                                data = await resp.json()
+                                sha = data.get('sha', '')
+                                self._source_shas[label] = sha
+                    except Exception:
+                        logger.exception("Failed to fetch commit SHA for %s", label)
+                self._source_last_index[label] = __import__('time').monotonic()
+
         self._save_vectors()
 
     # --- Search with Reranking ---
@@ -1350,19 +1389,48 @@ class DocsRAG(commands.Cog):
                 'Ocorreu um erro ao analisar o relatório. Tente novamente mais tarde.'
             )
 
-    @app_commands.command(name='reindex', description='Re-indexar a documentação (Admin)')
+    @app_commands.command(
+        name='reindex',
+        description='Re-indexar a documentação (Admin)',
+    )
     @app_commands.checks.has_permissions(administrator=True)
-    async def reindex(self, interaction: discord.Interaction):
+    @app_commands.describe(
+        source='Fonte específica para reindexar (opcional; omitir para reindexar tudo)',
+    )
+    async def reindex(
+        self,
+        interaction: discord.Interaction,
+        source: str | None = None,
+    ):
         if self._indexing:
             await interaction.response.send_message(
                 '📚 Já há uma indexação em andamento, aguarde a conclusão.',
                 ephemeral=True,
             )
             return
+
+        # Validate source name if provided
+        if source:
+            source_labels = [s['label'] for s in DOC_SOURCES]
+            matching = [s for s in DOC_SOURCES if s['label'] == source]
+            if not matching:
+                await interaction.response.send_message(
+                    f'Fonte "{source}" não encontrada. Fontes disponíveis: '
+                    f'{", ".join(source_labels)}',
+                    ephemeral=True,
+                )
+                return
+            sources_to_index = matching
+            description = f'Somente a fonte "{source}"'
+        else:
+            sources_to_index = None
+            description = 'Toda a documentação'
+
         await interaction.response.defer(thinking=True)
-        await self.index_docs()
+        await self.index_docs(sources_to_index)
         await interaction.followup.send(
-            f'✅ Documentação re-indexada! ({len(self.chunks)} chunks)'
+            f'✅ {description} re-indexada! '
+            f'({len(self.chunks)} chunks totais)'
         )
 
 
