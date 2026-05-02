@@ -4,13 +4,15 @@ import json
 import logging
 from typing import Any
 
-from tavily import TavilyClient
+from tavily import AsyncTavilyClient
 
 from config import TAVILY_API_KEY, TAVILY_AVAILABLE
 
 logger = logging.getLogger(__name__)
 
 MAX_TOOL_ROUNDS = 6
+
+_client: AsyncTavilyClient | None = None
 
 WEB_SEARCH_TOOL = {
     'type': 'function',
@@ -114,14 +116,25 @@ WEB_EXTRACT_TOOL = {
 TOOLS = [WEB_SEARCH_TOOL, WEB_EXTRACT_TOOL]
 
 
-def _get_tavily_client() -> TavilyClient | None:
+def _get_tavily_client() -> AsyncTavilyClient | None:
+    global _client
     if not TAVILY_API_KEY:
         return None
-    try:
-        return TavilyClient(api_key=TAVILY_API_KEY)
-    except Exception:
-        logger.exception("Failed to initialize Tavily client")
-        return None
+    if _client is None:
+        try:
+            _client = AsyncTavilyClient(api_key=TAVILY_API_KEY)
+        except Exception:
+            logger.exception("Failed to initialize Tavily client")
+            return None
+    return _client
+
+
+async def close_client() -> None:
+    """Close the module-level Tavily client (call during bot shutdown)."""
+    global _client
+    if _client is not None:
+        await _client.close()
+        _client = None
 
 
 async def exec_web_search(args: dict) -> tuple[str, list[dict]]:
@@ -160,7 +173,7 @@ async def exec_web_search(args: dict) -> tuple[str, list[dict]]:
         kwargs['exclude_domains'] = exclude_domains
 
     try:
-        response = client.search(**kwargs)
+        response = await client.search(**kwargs)
     except Exception:
         logger.exception("Tavily search failed for query: %s", query[:80])
         return 'Erro ao realizar busca web. Tente novamente.', []
@@ -208,7 +221,7 @@ async def exec_web_extract(args: dict) -> tuple[str, list[dict]]:
         kwargs['query'] = query
 
     try:
-        response = client.extract(**kwargs)
+        response = await client.extract(**kwargs)
     except Exception:
         logger.exception("Tavily extract failed for URLs: %s", urls)
         return 'Erro ao extrair conteúdo das URLs. Tente novamente.', []
