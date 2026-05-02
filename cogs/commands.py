@@ -612,6 +612,10 @@ class Commands(commands.Cog):
         # Enforce per-user cooldown on follow-up replies
         user_id = message.author.id
         if user_id in self._followup_cd:
+            try:
+                await message.reply('⏳ Aguarde antes de enviar outra resposta.', delete_after=5)
+            except discord.HTTPException:
+                pass
             return
         self._followup_cd[user_id] = True
 
