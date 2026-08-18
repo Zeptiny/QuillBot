@@ -304,7 +304,7 @@ class LogAnalyzer(commands.Cog):
             await message.add_reaction('👀')
             logger.info(
                 "Log link detected user=%s guild=%s url=%s",
-                message.author.id, message.guild_id, fetch_url[:80],
+                message.author.id, message.guild.id if message.guild else None, fetch_url[:80],
             )
             link_content, _ = await self.read_file_content(fetch_url)
             if link_content and not response:

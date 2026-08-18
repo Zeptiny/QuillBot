@@ -764,7 +764,7 @@ class Commands(commands.Cog):
         if not clean_question and image_url:
             clean_question = 'Analise esta imagem.'
         self._followup_cd[user_id] = True
-        logger.info("Processing @mention chat user=%s guild=%s question=%r", message.author.id, message.guild_id, clean_question[:80])
+        logger.info("Processing @mention chat user=%s guild=%s question=%r", message.author.id, message.guild.id if message.guild else None, clean_question[:80])
         async with message.channel.typing():
             try:
                 answer, embeds = await self._run_chat(
