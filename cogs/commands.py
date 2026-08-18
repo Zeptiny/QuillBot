@@ -1,4 +1,5 @@
 import logging
+import re
 import time
 
 import aiohttp
@@ -13,7 +14,7 @@ from cogs.tavily_tools import exec_tool as tavily_exec_tool
 from cogs.tavily_tools import status_label as tavily_status_label
 from cogs.tavily_tools import MAX_TOOL_ROUNDS as TAVILY_MAX_ROUNDS
 from cogs.utils import PaginatedEmbedView, build_source_pages, run_tool_loop, split_response
-from config import CHAT_MODEL, COOLDOWN_PER, COOLDOWN_RATE, DOCS_BASE_URL, OPENROUTER_API_KEY, TAVILY_API_KEY, TAVILY_AVAILABLE
+from config import CHAT_MENTION_ENABLED, CHAT_MODEL, COOLDOWN_PER, COOLDOWN_RATE, DOCS_BASE_URL, OPENAI_API_KEY, OPENAI_BASE_URL, TAVILY_AVAILABLE
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +25,17 @@ _WEB_SEARCH_INSTRUCTIONS = (
     "  - Prefira `web_search` primeiro; use `web_extract` para se aprofundar em fontes relevantes.\n"
     "  - Use `search_depth='advanced'` para buscas mais precisas quando necessário.\n"
     "- Quando citar resultados da web, inclua o título e o link da fonte.\n"
+)
+
+_DISCORD_FORMAT = (
+    "A resposta será exibida no Discord (embed description) — use APENAS sintaxe que o Discord renderiza:\n"
+    "- Permitido: **negrito**, *itálico*, __sublinhado__, ~~tachado~~, `código inline`, "
+    "```bloco de código``` com linguagem (yaml, properties, json, toml, bash, log), "
+    "> citação, - lista, 1. lista numerada, ||spoiler||, ### título / ## título, [texto](url).\n"
+    "- Proibido: tabelas markdown com |, separadores --- ou ***, HTML (<br>, <div>), LaTeX ($$), footnotes.\n"
+    "- Para comparações use listas com **Chave**: valor — NUNCA tabelas com pipes.\n"
+    "- Para títulos de seção use ### Título ou **Negrito** — nunca ---.\n"
+    "- Blocos de código sempre com linguagem; valores de config em ```yaml ou ```properties.\n"
 )
 
 GENERAL_SYSTEM_PROMPT = (
@@ -38,7 +50,7 @@ GENERAL_SYSTEM_PROMPT = (
     "- Quando útil, termine com uma sugestão de acompanhamento na linha final, prefixada com '💡 '.\n"
     "</instructions>\n\n"
     "<response_format>\n"
-    "Seja claro e conciso. Use markdown para formatação quando aplicável.\n"
+    + _DISCORD_FORMAT +
     "</response_format>"
 )
 
@@ -49,11 +61,17 @@ class Commands(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.client: AsyncOpenAI | None = None
-        if OPENROUTER_API_KEY:
+        api_key = OPENAI_API_KEY or "not-needed"
+        try:
             self.client = AsyncOpenAI(
-                base_url='https://openrouter.ai/api/v1',
-                api_key=OPENROUTER_API_KEY,
+                base_url=OPENAI_BASE_URL,
+                api_key=api_key,
             )
+            if not OPENAI_API_KEY and 'openrouter.ai' in OPENAI_BASE_URL:
+                logger.warning("OPENAI_API_KEY not set -- /chat will fail until configured")
+        except Exception:
+            logger.exception("Failed to initialize OpenAI client for Commands cog")
+            self.client = None
         # TTL cache: max 200 conversations, each expires after 30 min
         self._conversations: TTLCache = TTLCache(maxsize=200, ttl=1800)
         # Per-user follow-up cooldown (same period as slash commands)
@@ -540,70 +558,119 @@ class Commands(commands.Cog):
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
-        """Handle reply-based follow-up conversations for /chat."""
+        """Handle reply-based follow-up conversations and @mention chat mode."""
         if message.author.bot:
             return
-        if not message.reference or not message.reference.message_id:
+        # --- 1) Reply-based follow-up (existing conversation) ---
+        if message.reference and message.reference.message_id:
+            ref_id = message.reference.message_id
+            conv = self._conversations.get(ref_id)
+            if conv:
+                user_id = message.author.id
+                if user_id in self._followup_cd:
+                    try:
+                        await message.reply('⏳ Aguarde antes de enviar outra resposta.', delete_after=5)
+                    except discord.HTTPException:
+                        pass
+                    return
+                self._followup_cd[user_id] = True
+                follow_up_question = message.content.strip()
+                if not follow_up_question and not message.attachments:
+                    return
+                image_url = None
+                for att in message.attachments:
+                    if att.content_type and att.content_type.startswith('image/'):
+                        image_url = att.url
+                        break
+                if not follow_up_question:
+                    follow_up_question = 'Analise esta imagem.'
+                async with message.channel.typing():
+                    try:
+                        history = conv.get('history', []).copy()
+                        history.append({'question': conv['question'], 'answer': conv['answer']})
+                        answer, embeds = await self._run_chat(
+                            follow_up_question, history=history, image_url=image_url
+                        )
+                        if len(embeds) == 1:
+                            reply = await message.reply(embed=embeds[0])
+                        else:
+                            reply = await message.reply(
+                                embed=embeds[0], view=PaginatedEmbedView(embeds)
+                            )
+                        self._conversations[reply.id] = {
+                            'question': follow_up_question,
+                            'answer': answer,
+                            'history': history,
+                        }
+                    except RateLimitError:
+                        await message.reply(
+                            '⏳ Limite de requisições atingido. Tente novamente em alguns minutos.'
+                        )
+                    except Exception:
+                        logger.exception("Error in /chat follow-up reply")
+                        await message.reply(
+                            'Ocorreu um erro ao processar sua pergunta. Tente novamente.'
+                        )
+                return
+        # --- 2) @mention chat mode (same as /chat) ---
+        if not CHAT_MENTION_ENABLED:
             return
-
-        ref_id = message.reference.message_id
-        conv = self._conversations.get(ref_id)
-        if not conv:
+        if not self.bot.user or not self.bot.user.mentioned_in(message):
             return
-
-        # Enforce per-user cooldown on follow-up replies
-        user_id = message.author.id
-        if user_id in self._followup_cd:
+        if not self.client:
             try:
-                await message.reply('⏳ Aguarde antes de enviar outra resposta.', delete_after=5)
+                await message.reply('⚠️ Chat indisponível: chave de API não configurada.', mention_author=False)
             except discord.HTTPException:
                 pass
             return
-        self._followup_cd[user_id] = True
-
-        follow_up_question = message.content.strip()
-        if not follow_up_question and not message.attachments:
+        # Per-user cooldown for mentions (reuse followup cooldown)
+        user_id = message.author.id
+        if user_id in self._followup_cd:
+            try:
+                await message.reply('⏳ Aguarde antes de enviar outra pergunta.', delete_after=5)
+            except discord.HTTPException:
+                pass
             return
-
+        # Strip bot mention to get clean question
+        mention_pattern = re.compile(rf'<@!?{self.bot.user.id}>')
+        clean_question = mention_pattern.sub('', message.content).strip()
+        # Also strip any extra mention artifacts and whitespace
+        clean_question = re.sub(r'\s+', ' ', clean_question).strip()
         image_url = None
         for att in message.attachments:
             if att.content_type and att.content_type.startswith('image/'):
                 image_url = att.url
                 break
-
-        if not follow_up_question:
-            follow_up_question = 'Analise esta imagem.'
-
+        if not clean_question and not image_url:
+            try:
+                await message.reply(
+                    f'Olá {message.author.mention}! Me mencione com uma pergunta. Ex: @{self.bot.user.display_name} como otimizar meu servidor?',
+                    mention_author=False,
+                )
+            except discord.HTTPException:
+                pass
+            return
+        if not clean_question and image_url:
+            clean_question = 'Analise esta imagem.'
+        self._followup_cd[user_id] = True
+        logger.info("Processing @mention chat user=%s guild=%s question=%r", message.author.id, message.guild_id, clean_question[:80])
         async with message.channel.typing():
             try:
-                history = conv.get('history', []).copy()
-                history.append({'question': conv['question'], 'answer': conv['answer']})
-
-                answer, embeds = await self._run_chat(
-                    follow_up_question, history=history, image_url=image_url
-                )
-
+                answer, embeds = await self._run_chat(clean_question, image_url=image_url)
                 if len(embeds) == 1:
-                    reply = await message.reply(embed=embeds[0])
+                    reply = await message.reply(embed=embeds[0], mention_author=False)
                 else:
-                    reply = await message.reply(
-                        embed=embeds[0], view=PaginatedEmbedView(embeds)
-                    )
-
+                    reply = await message.reply(embed=embeds[0], view=PaginatedEmbedView(embeds), mention_author=False)
                 self._conversations[reply.id] = {
-                    'question': follow_up_question,
+                    'question': clean_question,
                     'answer': answer,
-                    'history': history,
+                    'history': [],
                 }
             except RateLimitError:
-                await message.reply(
-                    '⏳ Limite de requisições atingido. Tente novamente em alguns minutos.'
-                )
+                await message.reply('⏳ Limite de requisições atingido. Tente novamente em alguns minutos.', mention_author=False)
             except Exception:
-                logger.exception("Error in /chat follow-up reply")
-                await message.reply(
-                    'Ocorreu um erro ao processar sua pergunta. Tente novamente.'
-                )
+                logger.exception("Error in @mention chat")
+                await message.reply('Ocorreu um erro ao processar sua pergunta. Tente novamente.', mention_author=False)
 
 
 async def setup(bot: commands.Bot):

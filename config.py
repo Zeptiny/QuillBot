@@ -13,11 +13,41 @@ BOT_TOKEN: Final[str | None] = os.getenv('BOT_TOKEN')
 OPENROUTER_API_KEY: Final[str | None] = os.getenv('OPENROUTER_API_KEY')
 TAVILY_API_KEY: Final[str | None] = os.getenv('TAVILY_API_KEY')
 
+# --- LLM (OpenAI-compatible) ---
+# OPENAI_* is the canonical name for any OpenAI-compatible endpoint.
+# OPENROUTER_* and LLM_* are kept as aliases for backward compatibility.
+OPENAI_API_KEY: Final[str | None] = (
+    os.getenv('OPENAI_API_KEY') or os.getenv('LLM_API_KEY') or OPENROUTER_API_KEY
+)
+OPENAI_BASE_URL: Final[str] = (
+    os.getenv('OPENAI_BASE_URL')
+    or os.getenv('LLM_BASE_URL')
+    or os.getenv('OPENROUTER_BASE_URL')
+    or 'https://openrouter.ai/api/v1'
+).rstrip('/')
+# Aliases for code that still imports the old names
+LLM_API_KEY: Final[str | None] = OPENAI_API_KEY
+LLM_BASE_URL: Final[str] = OPENAI_BASE_URL
+
 # --- AI Models ---
 CHAT_MODEL: Final[str] = os.getenv('CHAT_MODEL', 'qwen/qwen3.6-plus')
 SPARK_MODEL: Final[str] = os.getenv('SPARK_MODEL', 'google/gemini-2.5-pro')
 EMBEDDING_MODEL: Final[str] = os.getenv('EMBEDDING_MODEL', 'qwen/qwen3-embedding-8b')
 RERANK_MODEL: Final[str] = os.getenv('RERANK_MODEL', 'cohere/rerank-4-fast')
+
+# --- Embeddings (local vs remote) ---
+EMBEDDING_PROVIDER: Final[str] = os.getenv('EMBEDDING_PROVIDER', 'openai').strip().lower()
+LOCAL_EMBEDDING_MODEL: Final[str] = os.getenv(
+    'LOCAL_EMBEDDING_MODEL', 'sentence-transformers/all-MiniLM-L6-v2'
+)
+LOCAL_EMBEDDING_DEVICE: Final[str] = os.getenv('LOCAL_EMBEDDING_DEVICE', 'cpu')
+RERANK_ENABLED: Final[bool] = os.getenv('RERANK_ENABLED', 'true').strip().lower() in ('1', 'true', 'yes')
+def _is_openrouter_url(url: str) -> bool:
+    return 'openrouter.ai' in url
+RERANK_AVAILABLE: Final[bool] = RERANK_ENABLED and _is_openrouter_url(OPENAI_BASE_URL)
+
+# --- Chat Mention ---
+CHAT_MENTION_ENABLED: Final[bool] = os.getenv('CHAT_MENTION_ENABLED', 'true').strip().lower() in ('1', 'true', 'yes')
 
 # --- Rate Limiting (per-user) ---
 COOLDOWN_RATE: Final[int] = int(os.getenv('COOLDOWN_RATE', '1'))

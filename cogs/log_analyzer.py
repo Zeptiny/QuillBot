@@ -14,7 +14,8 @@ from config import (
     COOLDOWN_RATE,
     MAX_CONTENT_SIZE,
     MAX_LOG_CONTEXT,
-    OPENROUTER_API_KEY,
+    OPENAI_API_KEY,
+    OPENAI_BASE_URL,
 )
 from responses.errors import patterns
 
@@ -22,6 +23,16 @@ logger = logging.getLogger(__name__)
 
 MCLO_GS_PATTERN = re.compile(r'https://mclo\.gs/(\w+)')
 PASTEBIN_PATTERN = re.compile(r'https://pastebin\.com/(\w+)')
+
+_DISCORD_FORMAT = (
+    "A resposta será exibida no Discord (embed description) — use APENAS sintaxe que o Discord renderiza:\n"
+    "- Permitido: **negrito**, *itálico*, __sublinhado__, ~~tachado~~, `código inline`, "
+    "```bloco de código``` com linguagem (yaml, properties, json, log), "
+    "> citação, - lista, 1. lista numerada, ||spoiler||, ### título / ## título, [texto](url).\n"
+    "- Proibido: tabelas com |, separadores --- ou ***, HTML, LaTeX, footnotes.\n"
+    "- Para comparações use listas com **Chave**: valor — NUNCA tabelas.\n"
+    "- Títulos de seção com ### ou **Negrito** — nunca ---.\n"
+)
 
 ANALYZE_SYSTEM_PROMPT = (
     "<role>\n"
@@ -33,16 +44,17 @@ ANALYZE_SYSTEM_PROMPT = (
     "Seja direto e prático.\n"
     "</instructions>\n\n"
     "<response_format>\n"
-    "Use apenas as seções que tiverem conteúdo:\n\n"
-    "## 🔍 Resumo\n"
+    + _DISCORD_FORMAT
+    + "Use apenas seções que tiverem conteúdo, neste padrão:\n\n"
+    "### 🔍 Resumo\n"
     "Uma frase sobre o estado geral.\n\n"
-    "## ❌ Erros Encontrados\n"
+    "### ❌ Erros Encontrados\n"
     "- **Erro**: descrição\n"
     "- **Causa provável**: explicação\n"
-    "- **Solução**: passos\n\n"
-    "## ⚠️ Avisos\n"
+    "- **Solução**: passos em lista numerada\n\n"
+    "### ⚠️ Avisos\n"
     "Avisos não críticos relevantes.\n\n"
-    "## 💡 Recomendações\n"
+    "### 💡 Recomendações\n"
     "Sugestões de otimização baseadas no log.\n"
     "</response_format>"
 )
@@ -184,11 +196,17 @@ class LogAnalyzer(commands.Cog):
         self.bot = bot
         self.session: aiohttp.ClientSession | None = None
         self.ai_client: AsyncOpenAI | None = None
-        if OPENROUTER_API_KEY:
+        api_key = OPENAI_API_KEY or "not-needed"
+        try:
             self.ai_client = AsyncOpenAI(
-                base_url='https://openrouter.ai/api/v1',
-                api_key=OPENROUTER_API_KEY,
+                base_url=OPENAI_BASE_URL,
+                api_key=api_key,
             )
+            if not OPENAI_API_KEY and 'openrouter.ai' in OPENAI_BASE_URL:
+                logger.warning("OPENAI_API_KEY not set -- log analysis will fail until configured")
+        except Exception:
+            logger.exception("Failed to initialize OpenAI client for LogAnalyzer")
+            self.ai_client = None
 
     async def cog_load(self):
         self.session = aiohttp.ClientSession(

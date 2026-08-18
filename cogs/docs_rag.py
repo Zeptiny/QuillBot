@@ -30,9 +30,15 @@ from config import (
     DOCS_BASE_URL,
     DOCS_BRANCH,
     EMBEDDING_MODEL,
+    EMBEDDING_PROVIDER,
     GITHUB_API,
+    LOCAL_EMBEDDING_DEVICE,
+    LOCAL_EMBEDDING_MODEL,
+    OPENAI_API_KEY,
+    OPENAI_BASE_URL,
     OPENROUTER_API_KEY,
     REINDEX_INTERVAL_HOURS,
+    RERANK_AVAILABLE,
     RERANK_MODEL,
     SPARK_MODEL,
     VECTOR_STORE_PATH,
@@ -41,6 +47,18 @@ from config import (
 logger = logging.getLogger(__name__)
 
 MAX_TOOL_ROUNDS = 6  # Safety cap on tool-calling iterations
+
+_DISCORD_FORMAT_GUIDE = (
+    "A resposta será exibida no Discord (embed description) — use APENAS sintaxe que o Discord renderiza:\n"
+    "- Permitido: **negrito**, *itálico*, __sublinhado__, ~~tachado~~, `código inline`, "
+    "```bloco de código``` com linguagem (yaml, properties, json, toml, bash, log), "
+    "> citação, - lista, 1. lista numerada, ||spoiler||, ### título / ## título, [texto](url).\n"
+    "- Proibido: tabelas markdown com |, separadores --- ou ***, HTML (<br>, <div>), LaTeX ($$), footnotes.\n"
+    "- Para comparações use listas com **Chave**: valor — NUNCA tabelas com pipes.\n"
+    "- Para títulos de seção use ### Título ou **Negrito** — nunca ---.\n"
+    "- Blocos de código sempre com linguagem para highlight; valores de config em ```yaml ou ```properties.\n"
+    "- Cite arquivos/chaves com `inline code` (ex: `paper.yml`, `view-distance`).\n"
+)
 
 SYSTEM_PROMPT = (
     "<role>\n"
@@ -60,15 +78,8 @@ SYSTEM_PROMPT = (
     "Se múltiplas buscas independentes forem necessárias, execute-as em paralelo na mesma rodada.\n"
     "</instructions>\n\n"
     "<response_format>\n"
-    "Seja claro e conciso. A resposta será exibida no Discord — siga estas regras de formatação:\n"
-    "- **Negrito** com **texto**, _itálico_ com _texto_, `código inline` com backticks.\n"
-    "- Blocos de código com triple backtick e linguagem: ```yaml, ```properties, ```json.\n"
-    "- Listas com - ou 1. 2. 3.\n"
-    "- Títulos de seção com **Negrito** ou __Sublinhado__ (# headings não renderizam no Discord).\n"
-    "- Para comparações, use listas com **Chave**: valor em vez de tabelas markdown.\n"
-    "- Separe seções com **Negrito** como título em vez de `---`.\n"
-    "- Para comparações lado a lado, use blocos de código ou listas separadas por seção.\n"
-    "</response_format>\n\n"
+    + _DISCORD_FORMAT_GUIDE
+    + "</response_format>\n\n"
     "<examples>\n"
     "<example>\n"
     "<user>Como configurar o view-distance para melhorar o desempenho?</user>\n"
@@ -156,15 +167,13 @@ SPARK_SYSTEM_PROMPT_SUFFIX = (
     "(ex: 'villager lag optimization paper', 'entity activation range') — nunca invente valores.\n"
     "</tool_guidance>\n\n"
     "<spark_response_format>\n"
-    "Ao apresentar a análise do relatório Spark, use este padrão de formatação Discord:\n"
-    "- Liste métricas chave com **Negrito**: valor (ex: **TPS**: 18.5, **MSPT mediana**: 62 ms).\n"
-    "- NUNCA use tabelas markdown (pipes |) — o Discord não as renderiza.\n"
-    "- NUNCA use `---` (linhas horizontais) — não renderizam no Discord. Use **Negrito** para separar seções.\n"
-    "- Para múltiplos hotspots ou configurações, use listas com `-` e `código inline`.\n"
-    "- Agrupe por seção usando **Negrito** como título (ex: **Diagnóstico**, **Recomendações**).\n"
-    "- Valores de configuração sempre em bloco de código com a linguagem correta.\n"
+    + _DISCORD_FORMAT_GUIDE
+    + "Regras adicionais para Spark:\n"
+    "- Liste métricas com **Negrito**: valor (ex: **TPS**: 18.5, **MSPT mediana**: 62 ms).\n"
+    "- Agrupe por seção com ### Título ou **Negrito** (ex: ### Diagnóstico).\n"
     "- Ao citar hotspots, sempre inclua o percentual exato: `NomeDoMétodo` — **XX,X% self_pct**.\n"
     "- Para cada problema: causa raiz + percentual de impacto + configuração atual + valor recomendado (da documentação).\n"
+    "- Valores de configuração sempre em bloco ```yaml / ```properties com linguagem.\n"
     "</spark_response_format>\n"
     "</spark_analysis_context>"
 )
@@ -356,11 +365,19 @@ class DocsRAG(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.client: AsyncOpenAI | None = None
-        if OPENROUTER_API_KEY:
+        api_key = OPENAI_API_KEY or "not-needed"
+        try:
             self.client = AsyncOpenAI(
-                base_url='https://openrouter.ai/api/v1',
-                api_key=OPENROUTER_API_KEY,
+                base_url=OPENAI_BASE_URL,
+                api_key=api_key,
             )
+            if not OPENAI_API_KEY and 'openrouter.ai' in OPENAI_BASE_URL:
+                logger.warning("OPENAI_API_KEY/OPENROUTER_API_KEY not set -- LLM calls will fail until configured")
+        except Exception:
+            logger.exception("Failed to initialize OpenAI client")
+            self.client = None
+        self._local_embed_model = None
+        self._local_embed_dim: int | None = None
         self.session: aiohttp.ClientSession | None = None
         self.chunks: list[dict] = []  # {content, path, title, embedding, source, doc_url}
         self._last_commit_sha: str | None = None
@@ -374,11 +391,35 @@ class DocsRAG(commands.Cog):
         # Per-user follow-up cooldown (same period as slash commands)
         self._followup_cd: TTLCache = TTLCache(maxsize=500, ttl=COOLDOWN_PER)
 
+    def _get_local_model(self):
+        if self._local_embed_model is not None:
+            return self._local_embed_model
+        try:
+            from sentence_transformers import SentenceTransformer
+            logger.info("Loading local embedding model: %s (device=%s)", LOCAL_EMBEDDING_MODEL, LOCAL_EMBEDDING_DEVICE)
+            self._local_embed_model = SentenceTransformer(LOCAL_EMBEDDING_MODEL, device=LOCAL_EMBEDDING_DEVICE)
+            test_emb = self._local_embed_model.encode(["test"], normalize_embeddings=True)
+            self._local_embed_dim = test_emb.shape[1] if hasattr(test_emb, 'shape') else len(test_emb[0])
+            logger.info("Local embedding model loaded (dim=%s)", self._local_embed_dim)
+        except ImportError:
+            logger.error("sentence-transformers not installed -- install with pip install sentence-transformers to use EMBEDDING_PROVIDER=local")
+            raise
+        except Exception:
+            logger.exception("Failed to load local embedding model %s", LOCAL_EMBEDDING_MODEL)
+            raise
+        return self._local_embed_model
+
+
     async def cog_load(self):
         self.session = aiohttp.ClientSession(
             headers=_HTTP_HEADERS,
             timeout=aiohttp.ClientTimeout(total=15),
         )
+        if EMBEDDING_PROVIDER == 'local':
+            try:
+                await asyncio.to_thread(self._get_local_model)
+            except Exception:
+                logger.warning("Falling back to remote embeddings due to local model load failure")
         loaded = self._load_vectors()
         if not loaded:
             await self.index_docs()
@@ -455,6 +496,12 @@ class DocsRAG(commands.Cog):
                     logger.warning(
                         "Embedding count mismatch (%d vs %d chunks), will reindex",
                         len(embeddings), len(chunks),
+                    )
+                    return False
+                if EMBEDDING_PROVIDER == 'local' and self._local_embed_dim and embeddings.shape[1] != self._local_embed_dim:
+                    logger.warning(
+                        "Embedding dim mismatch (stored %d vs local model %d), will reindex",
+                        embeddings.shape[1], self._local_embed_dim,
                     )
                     return False
                 for chunk, emb in zip(chunks, embeddings):
@@ -612,6 +659,14 @@ class DocsRAG(commands.Cog):
         return result
 
     async def _embed_batch(self, texts: list[str]) -> list[list[float]]:
+        if EMBEDDING_PROVIDER == 'local':
+            model = self._get_local_model()
+            embeddings = await asyncio.to_thread(model.encode, texts, normalize_embeddings=True, show_progress_bar=False)
+            if hasattr(embeddings, 'tolist'):
+                return embeddings.tolist()
+            return [list(e) for e in embeddings]
+        if not self.client:
+            raise RuntimeError("OpenAI client not initialized -- check OPENAI_API_KEY / OPENAI_BASE_URL")
         response = await self.client.embeddings.create(
             model=EMBEDDING_MODEL,
             input=texts,
@@ -795,10 +850,12 @@ class DocsRAG(commands.Cog):
     # --- Search with Reranking ---
 
     async def _rerank(self, query: str, documents: list[dict], top_n: int = 5) -> list[dict]:
-        """Rerank documents using the reranking model via OpenRouter."""
+        """Rerank documents using the reranking model via OpenAI-compatible API."""
+        if not RERANK_AVAILABLE:
+            return documents[:top_n]
         try:
             headers = {
-                'Authorization': f'Bearer {OPENROUTER_API_KEY}',
+                'Authorization': f'Bearer {OPENAI_API_KEY}',
                 'Content-Type': 'application/json',
             }
             payload = {
@@ -808,7 +865,7 @@ class DocsRAG(commands.Cog):
                 'top_n': top_n,
             }
             async with self.session.post(
-                'https://openrouter.ai/api/v1/rerank',
+                f'{OPENAI_BASE_URL}/rerank',
                 headers=headers,
                 json=payload,
             ) as resp:
@@ -1374,7 +1431,6 @@ class DocsRAG(commands.Cog):
 
 
 async def setup(bot: commands.Bot):
-    if not OPENROUTER_API_KEY:
-        logger.warning("OPENROUTER_API_KEY not set -- DocsRAG cog will not be loaded")
-        return
+    if not OPENAI_API_KEY and 'openrouter.ai' in OPENAI_BASE_URL:
+        logger.warning("OPENAI_API_KEY/OPENROUTER_API_KEY not set -- DocsRAG will use base_url %s with dummy key", OPENAI_BASE_URL)
     await bot.add_cog(DocsRAG(bot))
