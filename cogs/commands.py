@@ -16,13 +16,16 @@ from cogs.tavily_tools import status_label as tavily_status_label
 from cogs.tavily_tools import MAX_TOOL_ROUNDS as TAVILY_MAX_ROUNDS
 from cogs.utils import (
     CHANNEL_HISTORY_TOOL,
+    GET_MESSAGE_CONTEXT_TOOL,
     GUILD_INFO_TOOL,
     PaginatedEmbedView,
+    SEARCH_HISTORY_TOOL,
     build_full_context_block,
     build_guild_context,
     build_temporal_context,
     build_user_context,
     fetch_channel_history,
+    fetch_message_context,
     build_source_pages,
     run_tool_loop,
     split_response,
@@ -526,9 +529,10 @@ class Commands(commands.Cog):
             messages.append({'role': 'user', 'content': question})
 
         base_tools = list(TAVILY_TOOLS) if TAVILY_AVAILABLE else []
-        base_tools.extend([CHANNEL_HISTORY_TOOL, GUILD_INFO_TOOL])
+        base_tools.extend([CHANNEL_HISTORY_TOOL, GUILD_INFO_TOOL, SEARCH_HISTORY_TOOL, GET_MESSAGE_CONTEXT_TOOL])
         active_tools = base_tools if base_tools else None
         fallback_channel = channel or (interaction.channel if interaction else None)
+        fallback_guild = guild or (interaction.guild if interaction else None)
 
         async def _exec(name: str, args: dict) -> tuple[str, list[dict]]:
             if name in ('web_search', 'web_extract'):
@@ -549,6 +553,34 @@ class Commands(commands.Cog):
                 except Exception:
                     pass
                 return text, []
+            if name == 'search_history':
+                hist = self.bot.get_cog('HistoryRAG')
+                if not hist:
+                    return "Histórico não disponível.", []
+                g = fallback_guild
+                if not g:
+                    return "Busca no histórico requer estar em um servidor.", []
+                query = args.get('query', '')
+                limit = max(1, min(12, int(args.get('limit', 5))))
+                cid = args.get('channel_id')
+                try:
+                    results = await hist.search(query, g.id, limit=limit, channel_id=cid)  # type: ignore
+                except Exception:
+                    logger.exception("search_history failed")
+                    return "Erro ao buscar no histórico.", []
+                if not results:
+                    return "Nenhuma mensagem relevante encontrada no histórico.", []
+                parts = []
+                for r in results:
+                    jump = r.get('jump_url', '')
+                    link = f"[ver]({jump})" if jump else ""
+                    window = r.get('chunk_text', r.get('content', ''))[:1200]
+                    header = f"**{r.get('author_full','?')}** em #{r.get('channel_name','?')} — {r.get('ts','')} {link} (score {r.get('_score',0):.2f})"
+                    parts.append(f"{header}\n```\n{window}\n```\n`msg_id={r.get('msg_id')} channel_id={r.get('channel_id')}`")
+                return "\n\n---\n\n".join(parts), []
+            if name == 'get_message_context':
+                text = await fetch_message_context(self.bot, channel_id=args.get('channel_id',''), message_id=args.get('message_id',''), window=args.get('window', 5))
+                return text, []
             return f'Ferramenta desconhecida: {name}', []
 
         def _status(name: str, args: dict) -> str:
@@ -560,6 +592,11 @@ class Commands(commands.Cog):
                 return f'📜 Lendo histórico ({lim} msgs)' + (f' canal {cid}' if cid else '')
             if name == 'get_guild_info':
                 return '🏰 Coletando informações do servidor'
+            if name == 'search_history':
+                q = args.get('query','')[:40]
+                return f'🔎 Buscando no histórico: *{q}*'
+            if name == 'get_message_context':
+                return f'🧩 Contexto da mensagem {args.get("message_id","")}…'
             return f'🔧 Executando: {name}'
 
         answer, all_sources = await run_tool_loop(

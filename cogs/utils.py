@@ -56,6 +56,66 @@ GUILD_INFO_TOOL = {
     },
 }
 
+SEARCH_HISTORY_TOOL = {
+    'type': 'function',
+    'function': {
+        'name': 'search_history',
+        'description': (
+            'Busca semanticamente no histórico completo do servidor (RAG). '
+            'Use quando o usuário perguntar sobre conversas anteriores, decisões, '
+            'problemas já discutidos, ou contexto que pode estar no chat. Retorna '
+            'mensagens relevantes com autor, canal, horário e link, incluindo 5 mensagens de contexto local.'
+        ),
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'query': {
+                    'type': 'string',
+                    'description': 'Consulta em linguagem natural sobre o histórico.',
+                },
+                'limit': {
+                    'type': 'integer',
+                    'description': 'Número de resultados (padrão 5, máximo 12).',
+                },
+                'channel_id': {
+                    'type': 'string',
+                    'description': 'Opcional: restringir busca a um canal específico (ID).',
+                },
+            },
+            'required': ['query'],
+        },
+    },
+}
+
+GET_MESSAGE_CONTEXT_TOOL = {
+    'type': 'function',
+    'function': {
+        'name': 'get_message_context',
+        'description': (
+            'Retorna o contexto local ao redor de uma mensagem específica (5 antes e 5 depois). '
+            'Use após search_history para expandir o contexto de um resultado relevante.'
+        ),
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'message_id': {
+                    'type': 'string',
+                    'description': 'ID da mensagem central.',
+                },
+                'channel_id': {
+                    'type': 'string',
+                    'description': 'ID do canal da mensagem.',
+                },
+                'window': {
+                    'type': 'integer',
+                    'description': 'Janela de contexto (padrão 5, máximo 10).',
+                },
+            },
+            'required': ['message_id', 'channel_id'],
+        },
+    },
+}
+
 
 def _fmt_dt(dt: datetime.datetime | None) -> str:
     if not dt:
@@ -204,6 +264,69 @@ async def fetch_channel_history(
         return "Nenhuma mensagem encontrada no histórico."
     lines.reverse()
     header = f"Histórico de #{getattr(target, 'name', target.id)} (últimas {len(lines)} mensagens, cronológica):\n"
+    return header + "\n".join(lines)
+
+
+async def fetch_message_context(
+    bot: discord.Client,
+    channel_id: str,
+    message_id: str,
+    window: int = 5,
+) -> str:
+    window = max(1, min(10, int(window)))
+    try:
+        cid = int(channel_id)
+        mid = int(message_id)
+    except ValueError:
+        return "IDs inválidos."
+    channel = bot.get_channel(cid)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(cid)
+        except Exception:
+            return f"Canal {channel_id} não encontrado."
+    if not hasattr(channel, "fetch_message") or not hasattr(channel, "history"):
+        return "Canal não suporta histórico."
+    try:
+        target = await channel.fetch_message(mid)
+    except discord.NotFound:
+        return f"Mensagem {message_id} não encontrada."
+    except discord.Forbidden:
+        return "Sem permissão para ler esta mensagem."
+    except Exception as e:
+        return f"Erro ao buscar mensagem: {e}"
+    before: list[discord.Message] = []
+    after: list[discord.Message] = []
+    try:
+        async for m in channel.history(limit=window, before=target):
+            before.append(m)
+        before.reverse()
+    except Exception:
+        pass
+    try:
+        async for m in channel.history(limit=window, after=target):
+            after.append(m)
+    except Exception:
+        pass
+    def fmt(m: discord.Message, highlight: bool = False) -> str:
+        ts = _fmt_dt(m.created_at)
+        author = getattr(m.author, 'display_name', str(m.author))
+        content = (m.content or "").replace("\n", " ").strip()
+        if m.attachments:
+            content += " " + " ".join(f"[anexo:{a.filename}]" for a in m.attachments)
+        if not content:
+            content = "[sem texto]"
+        if len(content) > 350:
+            content = content[:350] + "…"
+        prefix = "▶ " if highlight else "  "
+        return f"{prefix}[{ts}] {author}: {content} (id={m.id})"
+    lines: list[str] = []
+    for m in before:
+        lines.append(fmt(m))
+    lines.append(fmt(target, True) + "  ← alvo")
+    for m in after:
+        lines.append(fmt(m))
+    header = f"Contexto ao redor de {message_id} em #{getattr(channel, 'name', channel_id)} (±{window}):\n"
     return header + "\n".join(lines)
 
 

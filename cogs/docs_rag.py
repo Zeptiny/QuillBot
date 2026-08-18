@@ -25,10 +25,13 @@ from cogs.spark_parser import (
 from cogs.utils import PaginatedEmbedView, build_source_pages, run_tool_loop, split_response
 from cogs.utils import (
     CHANNEL_HISTORY_TOOL as _CHANNEL_HISTORY_TOOL,
+    GET_MESSAGE_CONTEXT_TOOL as _GET_MESSAGE_CONTEXT_TOOL,
     GUILD_INFO_TOOL as _GUILD_INFO_TOOL,
+    SEARCH_HISTORY_TOOL as _SEARCH_HISTORY_TOOL,
     build_full_context_block as _build_full_context_block,
     build_guild_context as _build_guild_context,
     fetch_channel_history as _fetch_channel_history,
+    fetch_message_context as _fetch_message_context,
 )
 from config import (
     CHAT_MODEL,
@@ -254,6 +257,8 @@ TOOLS = [
     },
     _CHANNEL_HISTORY_TOOL,
     _GUILD_INFO_TOOL,
+    _SEARCH_HISTORY_TOOL,
+    _GET_MESSAGE_CONTEXT_TOOL,
 ]
 
 # Additional tools injected only when a Spark report is active in the session.
@@ -1058,6 +1063,36 @@ class DocsRAG(commands.Cog):
                 pass
             return text, []
 
+        if name == 'search_history':
+            hist = self.bot.get_cog('HistoryRAG')
+            if not hist:
+                return "Histórico não disponível.", []
+            g = guild
+            if not g:
+                return "Busca no histórico requer estar em um servidor.", []
+            query = args.get('query', '')
+            limit = max(1, min(12, int(args.get('limit', 5))))
+            cid = args.get('channel_id')
+            try:
+                results = await hist.search(query, g.id, limit=limit, channel_id=cid)  # type: ignore
+            except Exception:
+                logger.exception("search_history failed in docs_rag")
+                return "Erro ao buscar no histórico.", []
+            if not results:
+                return "Nenhuma mensagem relevante encontrada no histórico.", []
+            parts = []
+            for r in results:
+                jump = r.get('jump_url', '')
+                link = f"[ver]({jump})" if jump else ""
+                window = r.get('chunk_text', r.get('content', ''))[:1200]
+                header = f"**{r.get('author_full','?')}** em #{r.get('channel_name','?')} — {r.get('ts','')} {link} (score {r.get('_score',0):.2f})"
+                parts.append(f"{header}\n```\n{window}\n```\n`msg_id={r.get('msg_id')} channel_id={r.get('channel_id')}`")
+            return "\n\n---\n\n".join(parts), []
+
+        if name == 'get_message_context':
+            text = await _fetch_message_context(self.bot, channel_id=args.get('channel_id',''), message_id=args.get('message_id',''), window=args.get('window', 5))
+            return text, []
+
         if name == 'get_spark_detail':
             if spark_report is None:
                 return 'Nenhum relatório Spark carregado para esta conversa.', []
@@ -1106,6 +1141,11 @@ class DocsRAG(commands.Cog):
             return f'📜 Lendo histórico ({lim} msgs)' + (f' canal {cid}' if cid else '')
         if tool_name == 'get_guild_info':
             return '🏰 Coletando informações do servidor'
+        if tool_name == 'search_history':
+            q = args.get('query','')[:40]
+            return f'🔎 Buscando no histórico: *{q}*'
+        if tool_name == 'get_message_context':
+            return f'🧩 Contexto da mensagem {args.get("message_id","")}…'
         if tool_name == 'get_spark_detail':
             section = args.get('section', '')
             section_names = {

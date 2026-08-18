@@ -49,6 +49,14 @@ RERANK_AVAILABLE: Final[bool] = RERANK_ENABLED and _is_openrouter_url(OPENAI_BAS
 # --- Chat Mention ---
 CHAT_MENTION_ENABLED: Final[bool] = os.getenv('CHAT_MENTION_ENABLED', 'true').strip().lower() in ('1', 'true', 'yes')
 
+# --- History RAG (entire server) ---
+HISTORY_ENABLED: Final[bool] = os.getenv('HISTORY_ENABLED', 'true').strip().lower() in ('1', 'true', 'yes')
+HISTORY_VECTOR_STORE_DIR: Final[str] = os.getenv('HISTORY_VECTOR_STORE_DIR', 'data/history')
+HISTORY_WINDOW_SIZE: Final[int] = int(os.getenv('HISTORY_WINDOW_SIZE', '5'))
+HISTORY_BACKFILL_LIMIT: Final[int | None] = int(v) if (v := os.getenv('HISTORY_BACKFILL_LIMIT', '').strip()) else None
+HISTORY_MAX_MSG_LENGTH: Final[int] = int(os.getenv('HISTORY_MAX_MSG_LENGTH', '800'))
+HISTORY_EXCLUDE_BOTS: Final[bool] = os.getenv('HISTORY_EXCLUDE_BOTS', 'true').strip().lower() in ('1', 'true', 'yes')
+
 # --- Rate Limiting (per-user) ---
 COOLDOWN_RATE: Final[int] = int(os.getenv('COOLDOWN_RATE', '1'))
 COOLDOWN_PER: Final[float] = float(os.getenv('COOLDOWN_PER', '30'))
