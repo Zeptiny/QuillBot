@@ -45,6 +45,18 @@ RERANK_ENABLED: Final[bool] = os.getenv('RERANK_ENABLED', 'true').strip().lower(
 def _is_openrouter_url(url: str) -> bool:
     return 'openrouter.ai' in url
 RERANK_AVAILABLE: Final[bool] = RERANK_ENABLED and _is_openrouter_url(OPENAI_BASE_URL)
+RERANK_PROVIDER: Final[str] = os.getenv('RERANK_PROVIDER', 'auto').strip().lower()
+LOCAL_RERANK_MODEL: Final[str] = os.getenv(
+    'LOCAL_RERANK_MODEL', 'cross-encoder/ms-marco-MiniLM-L-6-v2'
+)
+LOCAL_RERANK_DEVICE: Final[str] = os.getenv('LOCAL_RERANK_DEVICE', LOCAL_EMBEDDING_DEVICE)
+HISTORY_RERANK_ENABLED: Final[bool] = os.getenv('HISTORY_RERANK_ENABLED', 'true').strip().lower() in ('1', 'true', 'yes')
+HISTORY_RERANK_PROVIDER: Final[str] = os.getenv('HISTORY_RERANK_PROVIDER', RERANK_PROVIDER).strip().lower()
+HISTORY_RERANK_MODEL: Final[str] = os.getenv('HISTORY_RERANK_MODEL', LOCAL_RERANK_MODEL)
+HISTORY_TIME_DECAY_LAMBDA: Final[float] = float(os.getenv('HISTORY_TIME_DECAY_LAMBDA', '0.0'))
+HISTORY_HYBRID_WEIGHT_SEMANTIC: Final[float] = float(os.getenv('HISTORY_HYBRID_WEIGHT_SEMANTIC', '0.65'))
+HISTORY_HYBRID_WEIGHT_KEYWORD: Final[float] = float(os.getenv('HISTORY_HYBRID_WEIGHT_KEYWORD', '0.35'))
+HISTORY_RRF_K: Final[int] = int(os.getenv('HISTORY_RRF_K', '60'))
 
 # --- Chat Mention ---
 CHAT_MENTION_ENABLED: Final[bool] = os.getenv('CHAT_MENTION_ENABLED', 'true').strip().lower() in ('1', 'true', 'yes')
@@ -54,11 +66,13 @@ HISTORY_ENABLED: Final[bool] = os.getenv('HISTORY_ENABLED', 'true').strip().lowe
 HISTORY_VECTOR_STORE_DIR: Final[str] = os.getenv('HISTORY_VECTOR_STORE_DIR', 'data/history')
 HISTORY_DB_PATH: Final[str] = os.getenv('HISTORY_DB_PATH', os.path.join(HISTORY_VECTOR_STORE_DIR, 'history.db'))
 HISTORY_WINDOW_SIZE: Final[int] = int(os.getenv('HISTORY_WINDOW_SIZE', '5'))
+HISTORY_WINDOW_OVERLAP: Final[int] = int(os.getenv('HISTORY_WINDOW_OVERLAP', '1'))
 HISTORY_BACKFILL_LIMIT: Final[int | None] = int(v) if (v := os.getenv('HISTORY_BACKFILL_LIMIT', '').strip()) else None
 HISTORY_MAX_MSG_LENGTH: Final[int] = int(os.getenv('HISTORY_MAX_MSG_LENGTH', '800'))
 HISTORY_EXCLUDE_BOTS: Final[bool] = os.getenv('HISTORY_EXCLUDE_BOTS', 'true').strip().lower() in ('1', 'true', 'yes')
 HISTORY_INGEST_BATCH_SIZE: Final[int] = int(os.getenv('HISTORY_INGEST_BATCH_SIZE', '10'))
 HISTORY_INGEST_FLUSH_SECONDS: Final[float] = float(os.getenv('HISTORY_INGEST_FLUSH_SECONDS', '2.0'))
+HISTORY_QUERY_CACHE_SIZE: Final[int] = int(os.getenv('HISTORY_QUERY_CACHE_SIZE', '200'))
 
 # --- Rate Limiting (per-user) ---
 COOLDOWN_RATE: Final[int] = int(os.getenv('COOLDOWN_RATE', '1'))
