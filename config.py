@@ -52,10 +52,13 @@ CHAT_MENTION_ENABLED: Final[bool] = os.getenv('CHAT_MENTION_ENABLED', 'true').st
 # --- History RAG (entire server) ---
 HISTORY_ENABLED: Final[bool] = os.getenv('HISTORY_ENABLED', 'true').strip().lower() in ('1', 'true', 'yes')
 HISTORY_VECTOR_STORE_DIR: Final[str] = os.getenv('HISTORY_VECTOR_STORE_DIR', 'data/history')
+HISTORY_DB_PATH: Final[str] = os.getenv('HISTORY_DB_PATH', os.path.join(HISTORY_VECTOR_STORE_DIR, 'history.db'))
 HISTORY_WINDOW_SIZE: Final[int] = int(os.getenv('HISTORY_WINDOW_SIZE', '5'))
 HISTORY_BACKFILL_LIMIT: Final[int | None] = int(v) if (v := os.getenv('HISTORY_BACKFILL_LIMIT', '').strip()) else None
 HISTORY_MAX_MSG_LENGTH: Final[int] = int(os.getenv('HISTORY_MAX_MSG_LENGTH', '800'))
 HISTORY_EXCLUDE_BOTS: Final[bool] = os.getenv('HISTORY_EXCLUDE_BOTS', 'true').strip().lower() in ('1', 'true', 'yes')
+HISTORY_INGEST_BATCH_SIZE: Final[int] = int(os.getenv('HISTORY_INGEST_BATCH_SIZE', '10'))
+HISTORY_INGEST_FLUSH_SECONDS: Final[float] = float(os.getenv('HISTORY_INGEST_FLUSH_SECONDS', '2.0'))
 
 # --- Rate Limiting (per-user) ---
 COOLDOWN_RATE: Final[int] = int(os.getenv('COOLDOWN_RATE', '1'))
