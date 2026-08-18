@@ -90,6 +90,10 @@ class SparkAnalyzer(commands.Cog, name='SparkAnalyzer'):
     )
     async def spark(self, interaction: discord.Interaction, url: str) -> None:
         await interaction.response.defer(thinking=True)
+        try:
+            await interaction.edit_original_response(content='🔥 Carregando relatório Spark…')
+        except discord.HTTPException:
+            pass
         logger.info(
             "Processing /spark user=%s guild=%s url=%r",
             interaction.user.id, interaction.guild_id, url[:80],
@@ -120,11 +124,20 @@ class SparkAnalyzer(commands.Cog, name='SparkAnalyzer'):
         """
         async def _send(content: str, *, ephemeral: bool = False) -> None:
             if followup:
+                try:
+                    await interaction.edit_original_response(content=None)
+                except discord.HTTPException:
+                    pass
                 await interaction.followup.send(content, ephemeral=ephemeral)
             else:
                 await interaction.response.send_message(content, ephemeral=ephemeral)
 
         # Fetch report -------------------------------------------------------
+        if followup:
+            try:
+                await interaction.edit_original_response(content='🔥 Baixando relatório Spark…')
+            except discord.HTTPException:
+                pass
         try:
             report: SparkReport = await fetch_report(url_or_code, session=self.session)
         except ValueError as exc:
@@ -152,6 +165,11 @@ class SparkAnalyzer(commands.Cog, name='SparkAnalyzer'):
             )
             return
 
+        if followup:
+            try:
+                await interaction.edit_original_response(content='🤖 Analisando desempenho com IA…')
+            except discord.HTTPException:
+                pass
         await docs_rag.run_spark_analysis(interaction, report)  # type: ignore[attr-defined]
 
     # --- Passive URL detection ---

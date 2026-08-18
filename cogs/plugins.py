@@ -108,6 +108,10 @@ class PluginSearch(commands.Cog):
     @app_commands.describe(name='Nome do plugin para pesquisar')
     async def plugin_search(self, interaction: discord.Interaction, name: str):
         await interaction.response.defer(thinking=True)
+        try:
+            await interaction.edit_original_response(content=f'🔍 Pesquisando plugins: *{name[:60]}*')
+        except discord.HTTPException:
+            pass
         logger.info(
             "Processing /plugin user=%s guild=%s query=%r",
             interaction.user.id, interaction.guild_id, name[:80],
@@ -128,10 +132,18 @@ class PluginSearch(commands.Cog):
             pages.append(('🟠 SpigotMC', _format_plugin_list(spiget_results)))
 
         if not pages:
+            try:
+                await interaction.edit_original_response(content=None)
+            except discord.HTTPException:
+                pass
             await interaction.followup.send(f'Nenhum plugin encontrado para `{name}`.')
             return
 
         view = PluginResultView(name, pages)
+        try:
+            await interaction.edit_original_response(content=None)
+        except discord.HTTPException:
+            pass
         await interaction.followup.send(embed=view.current_embed(), view=view)
 
     @plugin_search.autocomplete('name')
@@ -162,10 +174,18 @@ class PluginSearch(commands.Cog):
             )
             return
         await interaction.response.defer(thinking=True)
+        try:
+            await interaction.edit_original_response(content=f'📡 Consultando status de `{ip}`…')
+        except discord.HTTPException:
+            pass
 
         safe_ip = urllib.parse.quote(ip, safe='')
         data = await _get_json(self.session, f'{MCSRVSTAT_API}/{safe_ip}')
         if data is None:
+            try:
+                await interaction.edit_original_response(content=None)
+            except discord.HTTPException:
+                pass
             await interaction.followup.send(
                 'Não foi possível consultar o servidor. Verifique o IP e tente novamente.'
             )
@@ -179,6 +199,10 @@ class PluginSearch(commands.Cog):
                 description=f'`{ip}` está offline ou não foi encontrado.',
                 color=discord.Color.red(),
             )
+            try:
+                await interaction.edit_original_response(content=None)
+            except discord.HTTPException:
+                pass
             await interaction.followup.send(embed=embed)
             return
 
@@ -198,6 +222,10 @@ class PluginSearch(commands.Cog):
         embed.add_field(name='👥 Jogadores', value=f'{online_count}/{max_count}', inline=True)
         embed.add_field(name='🎮 Versão', value=version, inline=True)
         embed.set_footer(text='Dados fornecidos por mcsrvstat.us')
+        try:
+            await interaction.edit_original_response(content=None)
+        except discord.HTTPException:
+            pass
         await interaction.followup.send(embed=embed)
 
     # --- /changelog ---
@@ -208,10 +236,18 @@ class PluginSearch(commands.Cog):
     )
     async def changelog(self, interaction: discord.Interaction):
         await interaction.response.defer(thinking=True)
+        try:
+            await interaction.edit_original_response(content='📋 Buscando changelog da documentação…')
+        except discord.HTTPException:
+            pass
 
         url = f'{GITHUB_API}/commits?sha={DOCS_BRANCH}&per_page=5'
         data = await _get_json(self.session, url)
         if not data or not isinstance(data, list):
+            try:
+                await interaction.edit_original_response(content=None)
+            except discord.HTTPException:
+                pass
             await interaction.followup.send(
                 'Não foi possível obter o changelog da documentação.'
             )
@@ -234,6 +270,10 @@ class PluginSearch(commands.Cog):
 
         embed.description = '\n\n'.join(lines)
         embed.set_footer(text='MinersRefuge/docs')
+        try:
+            await interaction.edit_original_response(content=None)
+        except discord.HTTPException:
+            pass
         await interaction.followup.send(embed=embed)
 
 

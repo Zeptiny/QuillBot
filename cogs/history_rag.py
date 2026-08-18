@@ -947,8 +947,16 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
     @app_commands.choices(mode=[app_commands.Choice(name="hybrid", value="hybrid"), app_commands.Choice(name="semantic", value="semantic"), app_commands.Choice(name="keyword", value="keyword")])
     async def history_cmd(self, interaction: discord.Interaction, query: str, user: discord.Member | None = None, channel: discord.TextChannel | None = None, after: str | None = None, before: str | None = None, limit: int = 5, mode: str = "hybrid"):
         await interaction.response.defer(thinking=True)
+        try:
+            await interaction.edit_original_response(content=f'🔎 Buscando no histórico: *{query[:60]}*')
+        except discord.HTTPException:
+            pass
         guild_id = interaction.guild_id
         if not guild_id:
+            try:
+                await interaction.edit_original_response(content=None)
+            except discord.HTTPException:
+                pass
             await interaction.followup.send("Este comando só funciona em servidores.", ephemeral=True)
             return
         limit = max(1, min(12, limit))
@@ -956,9 +964,17 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
             results = await self.search(query, guild_id, limit=limit, channel_id=str(channel.id) if channel else None, author_id=str(user.id) if user else None, after=after, before=before, search_mode=mode)
         except Exception:
             logger.exception("history cmd search failed")
+            try:
+                await interaction.edit_original_response(content=None)
+            except discord.HTTPException:
+                pass
             await interaction.followup.send("Erro ao buscar no histórico.")
             return
         if not results:
+            try:
+                await interaction.edit_original_response(content=None)
+            except discord.HTTPException:
+                pass
             await interaction.followup.send(f"Nenhum resultado para `{query}` com os filtros aplicados.")
             return
         embed = discord.Embed(title=f"🔎 Histórico: {query}", color=discord.Color.blurple())
@@ -974,14 +990,27 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
             desc = desc[:3990] + "\n…"
         embed.description = desc
         embed.set_footer(text=f"{len(results)} resultados • modo {mode}")
+        try:
+            await interaction.edit_original_response(content=None)
+        except discord.HTTPException:
+            pass
         await interaction.followup.send(embed=embed)
 
     @app_commands.command(name="userstats", description="Estatísticas de um usuário no histórico")
     @app_commands.describe(user="Usuário (menção ou ID)", nome="Nome parcial se não puder mencionar")
     async def userstats_cmd(self, interaction: discord.Interaction, user: discord.Member | None = None, nome: str | None = None):
         await interaction.response.defer(thinking=True)
+        target_label = (user.display_name if user else (nome or "usuário"))[:40]
+        try:
+            await interaction.edit_original_response(content=f'📊 Coletando estatísticas de *{target_label}*…')
+        except discord.HTTPException:
+            pass
         guild_id = interaction.guild_id
         if not guild_id:
+            try:
+                await interaction.edit_original_response(content=None)
+            except discord.HTTPException:
+                pass
             await interaction.followup.send("Só em servidores.", ephemeral=True)
             return
         author_id = str(user.id) if user else None
@@ -989,10 +1018,18 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
         if not author_id and not author_name and interaction.guild:
             pass
         if not author_id and not author_name:
+            try:
+                await interaction.edit_original_response(content=None)
+            except discord.HTTPException:
+                pass
             await interaction.followup.send("Informe `user` ou `nome`.", ephemeral=True)
             return
         stats = await self.get_user_stats(guild_id, author_id=author_id, author_name=author_name)
         if "error" in stats:
+            try:
+                await interaction.edit_original_response(content=None)
+            except discord.HTTPException:
+                pass
             await interaction.followup.send(stats["error"], ephemeral=True)
             return
         embed = discord.Embed(title=f"📊 {stats['author_full']}", color=discord.Color.gold())
@@ -1005,6 +1042,10 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
         embed.add_field(name="Período", value=f"{stats['first_seen'][:10]} → {stats['last_seen'][:10]}", inline=True)
         if stats.get("example_jump"):
             embed.add_field(name="Exemplo recente", value=f"[{stats['example_content'][:150]}]({stats['example_jump']})", inline=False)
+        try:
+            await interaction.edit_original_response(content=None)
+        except discord.HTTPException:
+            pass
         await interaction.followup.send(embed=embed)
 
     @app_commands.command(name="timeline", description="Timeline/heatmap de um tópico ou usuário")
@@ -1012,12 +1053,24 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
     @app_commands.choices(bucket=[app_commands.Choice(name="day", value="day"), app_commands.Choice(name="week", value="week")])
     async def timeline_cmd(self, interaction: discord.Interaction, topic: str, user: discord.Member | None = None, channel: discord.TextChannel | None = None, bucket: str = "day", limit: int = 10):
         await interaction.response.defer(thinking=True)
+        try:
+            await interaction.edit_original_response(content=f'🕰️ Montando timeline: *{topic[:60]}*')
+        except discord.HTTPException:
+            pass
         guild_id = interaction.guild_id
         if not guild_id:
+            try:
+                await interaction.edit_original_response(content=None)
+            except discord.HTTPException:
+                pass
             await interaction.followup.send("Só em servidores.", ephemeral=True)
             return
         limit = max(1, min(20, limit))
         timeline = await self.get_user_timeline(guild_id, author_id=str(user.id) if user else None, query=topic, limit=limit, channel_id=str(channel.id) if channel else None, sort_by="recent")
+        try:
+            await interaction.edit_original_response(content=f'📅 Gerando heatmap: *{topic[:40]}*')
+        except discord.HTTPException:
+            pass
         heat = await self.get_temporal_heatmap(guild_id, topic, bucket=bucket)
         embed = discord.Embed(title=f"🕰️ Timeline: {topic}", color=discord.Color.teal())
         if timeline:
@@ -1033,6 +1086,10 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
             heat_str = " • ".join(f"{h['bucket']}: {h['count']}" for h in heat[:15])
             embed.add_field(name=f"Heatmap ({bucket})", value=heat_str[:1024], inline=False)
         embed.set_footer(text=f"{len(timeline)} itens • bucket {bucket}")
+        try:
+            await interaction.edit_original_response(content=None)
+        except discord.HTTPException:
+            pass
         await interaction.followup.send(embed=embed)
 
 async def setup(bot: commands.Bot):

@@ -979,6 +979,10 @@ class DocsRAG(commands.Cog):
             image_url = image.url
 
         await interaction.response.defer(thinking=True)
+        try:
+            await interaction.edit_original_response(content='💭 Pensando…')
+        except discord.HTTPException:
+            pass
 
         logger.info(
             "Processing /ask user=%s guild=%s question=%r",
@@ -1003,11 +1007,19 @@ class DocsRAG(commands.Cog):
             self._store_conversation(msg.id, question, answer)
 
         except RateLimitError:
+            try:
+                await interaction.edit_original_response(content=None)
+            except discord.HTTPException:
+                pass
             await interaction.followup.send(
                 '⏳ Limite de requisições atingido. Tente novamente em alguns minutos.'
             )
         except Exception:
             logger.exception("Error in /ask command")
+            try:
+                await interaction.edit_original_response(content=None)
+            except discord.HTTPException:
+                pass
             await interaction.followup.send(
                 'Ocorreu um erro ao processar sua pergunta. Tente novamente mais tarde.'
             )
@@ -1633,7 +1645,16 @@ class DocsRAG(commands.Cog):
             description = 'Toda a documentação'
 
         await interaction.response.defer(thinking=True)
+        target_msg = f'📚 Reindexando {description}…' if description else '📚 Reindexando documentação…'
+        try:
+            await interaction.edit_original_response(content=target_msg)
+        except discord.HTTPException:
+            pass
         await self.index_docs(sources_to_index)
+        try:
+            await interaction.edit_original_response(content=None)
+        except discord.HTTPException:
+            pass
         await interaction.followup.send(
             f'✅ {description} re-indexada! '
             f'({len(self.chunks)} chunks totais)'

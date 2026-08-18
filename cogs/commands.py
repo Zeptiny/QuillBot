@@ -138,7 +138,15 @@ class Commands(commands.Cog):
                 return
             if docs_rag and hasattr(docs_rag, 'search') and docs_rag.chunks:
                 await interaction.response.defer(thinking=True)
+                try:
+                    await interaction.edit_original_response(content=f'🔍 Pesquisando documentação: *{query[:60]}*')
+                except discord.HTTPException:
+                    pass
                 results = await docs_rag.search(query, top_k=5)
+                try:
+                    await interaction.edit_original_response(content=None)
+                except discord.HTTPException:
+                    pass
                 if results:
                     embed = discord.Embed(
                         title=f"🔍 Resultados para: {query}",
@@ -292,7 +300,15 @@ class Commands(commands.Cog):
     @app_commands.checks.has_permissions(administrator=True)
     async def sync_commands(self, interaction: discord.Interaction):
         await interaction.response.defer(thinking=True, ephemeral=True)
+        try:
+            await interaction.edit_original_response(content='🔄 Sincronizando comandos…')
+        except discord.HTTPException:
+            pass
         synced = await self.bot.tree.sync()
+        try:
+            await interaction.edit_original_response(content=None)
+        except discord.HTTPException:
+            pass
         await interaction.followup.send(
             f'✅ {len(synced)} comandos sincronizados.', ephemeral=True
         )
@@ -316,6 +332,10 @@ class Commands(commands.Cog):
     @app_commands.checks.has_permissions(administrator=True)
     async def health(self, interaction: discord.Interaction):
         await interaction.response.defer(thinking=True, ephemeral=True)
+        try:
+            await interaction.edit_original_response(content='🏥 Verificando saúde do bot…')
+        except discord.HTTPException:
+            pass
 
         # Uptime
         elapsed = time.monotonic() - self._start_time
@@ -406,6 +426,10 @@ class Commands(commands.Cog):
         )
 
         embed.set_footer(text=f'Latência do WebSocket: {self.bot.latency * 1000:.0f}ms')
+        try:
+            await interaction.edit_original_response(content=None)
+        except discord.HTTPException:
+            pass
         await interaction.followup.send(embed=embed, ephemeral=True)
 
     async def _check_apis(
@@ -453,6 +477,10 @@ class Commands(commands.Cog):
             image_url = image.url
 
         await interaction.response.defer(thinking=True)
+        try:
+            await interaction.edit_original_response(content='💭 Pensando…')
+        except discord.HTTPException:
+            pass
 
         logger.info(
             "Processing /chat user=%s guild=%s question=%r",
@@ -487,11 +515,19 @@ class Commands(commands.Cog):
             }
 
         except RateLimitError:
+            try:
+                await interaction.edit_original_response(content=None)
+            except discord.HTTPException:
+                pass
             await interaction.followup.send(
                 '⏳ Limite de requisições atingido. Tente novamente em alguns minutos.'
             )
         except Exception:
             logger.exception("Error in /chat command")
+            try:
+                await interaction.edit_original_response(content=None)
+            except discord.HTTPException:
+                pass
             await interaction.followup.send(
                 'Ocorreu um erro ao processar sua pergunta. Tente novamente mais tarde.'
             )
