@@ -1295,6 +1295,7 @@ class DocsRAG(commands.Cog):
         question: str,
         history: list[dict] | None = None,
         image_url: str | None = None,
+        image_urls: list[str] | None = None,
         spark_report: SparkReport | None = None,
         title: str | None = None,
         interaction: discord.Interaction | None = None,
@@ -1390,14 +1391,16 @@ class DocsRAG(commands.Cog):
                 messages.append({'role': 'assistant', 'content': h['answer']})
 
         # Current user message ---------------------------------------------------
-        if image_url:
-            messages.append({
-                'role': 'user',
-                'content': [
-                    {'type': 'text', 'text': question},
-                    {'type': 'image_url', 'image_url': {'url': image_url}},
-                ],
-            })
+        urls: list[str] = []
+        if image_urls:
+            urls.extend([u for u in image_urls if u])
+        elif image_url:
+            urls.append(image_url)
+        if urls:
+            content_parts: list[dict] = [{'type': 'text', 'text': question}]
+            for url in urls[:4]:
+                content_parts.append({'type': 'image_url', 'image_url': {'url': url}})
+            messages.append({'role': 'user', 'content': content_parts})
         else:
             messages.append({'role': 'user', 'content': question})
 
@@ -1508,11 +1511,7 @@ class DocsRAG(commands.Cog):
         if not follow_up_question and not message.attachments:
             return
 
-        image_url = None
-        for att in message.attachments:
-            if att.content_type and att.content_type.startswith('image/'):
-                image_url = att.url
-                break
+        image_urls: list[str] = [att.url for att in message.attachments if att.content_type and att.content_type.startswith('image/')]
 
         if not follow_up_question:
             follow_up_question = 'Analise esta imagem.'
@@ -1528,7 +1527,7 @@ class DocsRAG(commands.Cog):
                 answer, embeds = await self._run_agent(
                     follow_up_question,
                     history=history,
-                    image_url=image_url,
+                    image_urls=image_urls if image_urls else None,
                     spark_report=spark_report,
                     user=message.author,
                     guild=message.guild,

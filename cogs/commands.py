@@ -537,6 +537,7 @@ class Commands(commands.Cog):
         question: str,
         history: list[dict] | None = None,
         image_url: str | None = None,
+        image_urls: list[str] | None = None,
         interaction: discord.Interaction | None = None,
         user: discord.abc.User | discord.Member | None = None,
         guild: discord.Guild | None = None,
@@ -558,14 +559,16 @@ class Commands(commands.Cog):
                 messages.append({'role': 'user', 'content': h['question']})
                 messages.append({'role': 'assistant', 'content': h['answer']})
 
-        if image_url:
-            messages.append({
-                'role': 'user',
-                'content': [
-                    {'type': 'text', 'text': question},
-                    {'type': 'image_url', 'image_url': {'url': image_url}},
-                ],
-            })
+        urls: list[str] = []
+        if image_urls:
+            urls.extend([u for u in image_urls if u])
+        elif image_url:
+            urls.append(image_url)
+        if urls:
+            content_parts: list[dict] = [{'type': 'text', 'text': question}]
+            for url in urls[:4]:
+                content_parts.append({'type': 'image_url', 'image_url': {'url': url}})
+            messages.append({'role': 'user', 'content': content_parts})
         else:
             messages.append({'role': 'user', 'content': question})
 
@@ -816,11 +819,7 @@ class Commands(commands.Cog):
                 follow_up_question = message.content.strip()
                 if not follow_up_question and not message.attachments:
                     return
-                image_url = None
-                for att in message.attachments:
-                    if att.content_type and att.content_type.startswith('image/'):
-                        image_url = att.url
-                        break
+                image_urls = [att.url for att in message.attachments if att.content_type and att.content_type.startswith('image/')]
                 if not follow_up_question:
                     follow_up_question = 'Analise esta imagem.'
                 async with message.channel.typing():
@@ -830,7 +829,7 @@ class Commands(commands.Cog):
                         answer, embeds = await self._run_chat(
                             follow_up_question,
                             history=history,
-                            image_url=image_url,
+                            image_urls=image_urls if image_urls else None,
                             user=message.author,
                             guild=message.guild,
                             channel=message.channel,
@@ -881,12 +880,55 @@ class Commands(commands.Cog):
         clean_question = mention_pattern.sub('', message.content).strip()
         # Also strip any extra mention artifacts and whitespace
         clean_question = re.sub(r'\s+', ' ', clean_question).strip()
-        image_url = None
-        for att in message.attachments:
-            if att.content_type and att.content_type.startswith('image/'):
-                image_url = att.url
-                break
-        if not clean_question and not image_url:
+        current_image_urls = [att.url for att in message.attachments if att.content_type and att.content_type.startswith('image/')]
+        ref_context = ""
+        ref_image_urls: list[str] = []
+        if message.reference and message.reference.message_id:
+            ref_msg = message.reference.resolved
+            if ref_msg is None:
+                try:
+                    ref_msg = await message.channel.fetch_message(message.reference.message_id)
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    ref_msg = None
+                except Exception:
+                    logger.exception("Failed to fetch referenced message %s", message.reference.message_id)
+                    ref_msg = None
+            if ref_msg:
+                try:
+                    ref_author = getattr(ref_msg.author, 'display_name', str(ref_msg.author))
+                    ref_content = (ref_msg.content or "").strip()
+                    if len(ref_content) > 1500:
+                        ref_content = ref_content[:1500] + "…"
+                    for att in getattr(ref_msg, 'attachments', []):
+                        if att.content_type and att.content_type.startswith('image/'):
+                            ref_image_urls.append(att.url)
+                    attach_names = [att.filename for att in getattr(ref_msg, 'attachments', []) if not (att.content_type and att.content_type.startswith('image/'))]
+                    parts = [f"[Mensagem respondida — {ref_author} (@{ref_msg.author.name})]"]
+                    if ref_content:
+                        parts.append(f"Conteúdo: {ref_content}")
+                    if attach_names:
+                        parts.append(f"Anexos: {', '.join(attach_names[:5])}")
+                    if ref_msg.attachments and not ref_content and not attach_names and ref_image_urls:
+                        parts.append(f"Anexos: {len(ref_image_urls)} imagem(ns)")
+                    if not ref_content and not ref_msg.attachments and ref_msg.embeds:
+                        try:
+                            embed = ref_msg.embeds[0]
+                            embed_text = (embed.description or embed.title or "")[:500]
+                            if embed_text:
+                                parts.append(f"Embed: {embed_text}")
+                        except Exception:
+                            pass
+                    if len(parts) > 1:
+                        ref_context = "\n".join(parts)
+                except Exception:
+                    logger.exception("Failed to build ref context")
+        all_image_urls = current_image_urls + ref_image_urls
+        if ref_context:
+            if clean_question:
+                clean_question = f"{ref_context}\n---\n{clean_question}"
+            else:
+                clean_question = f"{ref_context}\n---\nAnalise a mensagem e imagem(ns) respondida(s) acima."
+        if not clean_question and not all_image_urls:
             try:
                 await message.reply(
                     f'Olá {message.author.mention}! Me mencione com uma pergunta. Ex: @{self.bot.user.display_name} como otimizar meu servidor?',
@@ -895,15 +937,15 @@ class Commands(commands.Cog):
             except discord.HTTPException:
                 pass
             return
-        if not clean_question and image_url:
+        if not clean_question and all_image_urls:
             clean_question = 'Analise esta imagem.'
         self._followup_cd[user_id] = True
-        logger.info("Processing @mention chat user=%s guild=%s question=%r", message.author.id, message.guild.id if message.guild else None, clean_question[:80])
+        logger.info("Processing @mention chat user=%s guild=%s question=%r ref=%s images=%d", message.author.id, message.guild.id if message.guild else None, clean_question[:80], bool(ref_context), len(all_image_urls))
         async with message.channel.typing():
             try:
                 answer, embeds = await self._run_chat(
                     clean_question,
-                    image_url=image_url,
+                    image_urls=all_image_urls if all_image_urls else None,
                     user=message.author,
                     guild=message.guild,
                     channel=message.channel,
