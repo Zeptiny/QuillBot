@@ -35,6 +35,7 @@ from config import (
     HISTORY_RERANK_MODEL,
     HISTORY_RERANK_PROVIDER,
     HISTORY_RRF_K,
+    HISTORY_SNAPSHOT_INTERVAL,
     HISTORY_TIME_DECAY_LAMBDA,
     HISTORY_VECTOR_STORE_DIR,
     HISTORY_WINDOW_OVERLAP,
@@ -207,6 +208,8 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
         self._msg_index: dict[int, dict[int, int]] = {}
         self._queue: asyncio.Queue = asyncio.Queue()
         self._worker_task: asyncio.Task | None = None
+        self._snapshot_task: asyncio.Task | None = None
+        self._dirty: set[int] = set()
 
     def _get_local_model(self):
         if self._local_model is not None:
@@ -380,6 +383,56 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
         finally:
             con.close()
 
+    def _upsert_chunks_to_db(self, guild_id: int, chunks: list[dict]):
+        if not chunks:
+            return
+        path = self._db_path()
+        self._ensure_db()
+        con = sqlite3.connect(path, timeout=30)
+        try:
+            rows = []
+            for c in chunks:
+                emb = c.get("embedding")
+                if emb is None:
+                    continue
+                if isinstance(emb, np.ndarray):
+                    blob = emb.astype(np.float32).tobytes()
+                else:
+                    blob = np.array(emb, dtype=np.float32).tobytes()
+                rows.append((
+                    str(c["msg_id"]), int(guild_id), str(c["channel_id"]), c.get("channel_name", ""), str(c["author_id"]), c.get("author_name", ""), c.get("author_full", ""), c.get("content", ""), c.get("chunk_text", ""), c.get("window_line", ""), json.dumps(c.get("window_lines", []), ensure_ascii=False), c.get("ts", ""), c.get("jump_url", ""), blob
+                ))
+            con.executemany("""
+            INSERT OR REPLACE INTO chunks (msg_id, guild_id, channel_id, channel_name, author_id, author_name, author_full, content, chunk_text, window_line, window_lines, ts, jump_url, embedding)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, rows)
+            try:
+                con.executemany(
+                    "INSERT OR REPLACE INTO chunks_fts (msg_id, guild_id, chunk_text, content) VALUES (?,?,?,?)",
+                    [(r[0], r[1], r[8], r[7]) for r in rows],
+                )
+            except Exception:
+                logger.debug("FTS upsert skipped", exc_info=True)
+            con.commit()
+        except Exception:
+            logger.exception("Failed upserting %d history chunks guild %s", len(chunks), guild_id)
+        finally:
+            con.close()
+
+    def _delete_chunk_from_db(self, guild_id: int, msg_id: str):
+        con = sqlite3.connect(self._db_path(), timeout=30)
+        try:
+            con.execute("DELETE FROM chunks WHERE guild_id=? AND msg_id=?", (guild_id, msg_id))
+            try:
+                con.execute("DELETE FROM chunks_fts WHERE guild_id=? AND msg_id=?", (guild_id, msg_id))
+            except Exception:
+                pass
+            con.commit()
+        except Exception:
+            logger.exception("Failed deleting history chunk guild %s msg %s", guild_id, msg_id)
+        finally:
+            con.close()
+
     def _load_guild(self, guild_id: int) -> bool:
         if self._load_guild_from_db(guild_id):
             return True
@@ -434,14 +487,10 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
                 recent.append(ch.get("window_line") or _format_line_from_chunk(ch))
             self._recent[cid] = recent
 
-    def _save_guild(self, guild_id: int):
-        chunks = self._chunks.get(guild_id, [])
+    def _save_guild_json(self, guild_id: int):
+        chunks = list(self._chunks.get(guild_id, []))
         if not chunks:
             return
-        try:
-            self._save_guild_to_db(guild_id)
-        except Exception:
-            logger.exception("DB save failed, falling back to JSON")
         json_path, npy_path = self._store_path(guild_id)
         os.makedirs(os.path.dirname(json_path), exist_ok=True)
         meta = {
@@ -455,13 +504,30 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
             json.dump(meta, f, ensure_ascii=False)
         embs = np.array([c["embedding"] for c in chunks], dtype=np.float32)
         np.save(npy_path, embs)
-        self._matrices[guild_id] = embs
-        logger.info("Saved history %d chunks for guild %s (JSON+DB)", len(chunks), guild_id)
 
     def _lock(self, guild_id: int) -> asyncio.Lock:
         if guild_id not in self._locks:
             self._locks[guild_id] = asyncio.Lock()
         return self._locks[guild_id]
+
+    def _load_all_guilds(self):
+        if os.path.exists(HISTORY_VECTOR_STORE_DIR):
+            for fname in os.listdir(HISTORY_VECTOR_STORE_DIR):
+                if fname.endswith(".json"):
+                    try:
+                        gid = int(fname[:-5])
+                        self._load_guild(gid)
+                    except ValueError:
+                        continue
+        path = self._db_path()
+        if os.path.exists(path):
+            con = sqlite3.connect(path)
+            cur = con.execute("SELECT DISTINCT guild_id FROM chunks")
+            for row in cur.fetchall():
+                gid = int(row[0])
+                if gid not in self._chunks:
+                    self._load_guild_from_db(gid)
+            con.close()
 
     async def cog_load(self):
         if not HISTORY_ENABLED:
@@ -473,39 +539,42 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
             except Exception:
                 logger.warning("HistoryRAG local model failed, will fallback to remote if possible")
         try:
-            self._ensure_db()
+            await asyncio.to_thread(self._ensure_db)
         except Exception:
             logger.exception("Failed to ensure DB")
         try:
-            if os.path.exists(HISTORY_VECTOR_STORE_DIR):
-                for fname in os.listdir(HISTORY_VECTOR_STORE_DIR):
-                    if fname.endswith(".json"):
-                        try:
-                            gid = int(fname[:-5])
-                            self._load_guild(gid)
-                        except ValueError:
-                            continue
-            path = self._db_path()
-            if os.path.exists(path):
-                con = sqlite3.connect(path)
-                cur = con.execute("SELECT DISTINCT guild_id FROM chunks")
-                for row in cur.fetchall():
-                    gid = int(row[0])
-                    if gid not in self._chunks:
-                        self._load_guild_from_db(gid)
-                con.close()
+            await asyncio.to_thread(self._load_all_guilds)
         except Exception:
             logger.exception("Failed to scan history store")
         self._worker_task = asyncio.create_task(self._ingest_worker())
+        self._snapshot_task = asyncio.create_task(self._snapshot_loop())
         self.bot.loop.create_task(self._background_backfill_all())
 
-    async def cog_unload(self):
-        if self._worker_task:
-            self._worker_task.cancel()
+    async def _snapshot_loop(self):
+        while True:
+            await asyncio.sleep(HISTORY_SNAPSHOT_INTERVAL)
+            await self._flush_dirty_snapshots()
+
+    async def _flush_dirty_snapshots(self):
+        if not self._dirty:
+            return
+        gids = list(self._dirty)
+        self._dirty.clear()
+        for gid in gids:
             try:
-                await self._worker_task
-            except asyncio.CancelledError:
-                pass
+                await asyncio.to_thread(self._save_guild_json, gid)
+            except Exception:
+                logger.exception("Snapshot failed guild %s", gid)
+
+    async def cog_unload(self):
+        for task in (self._worker_task, self._snapshot_task):
+            if task:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+        await self._flush_dirty_snapshots()
 
     async def _ingest_worker(self):
         batch: list[tuple[discord.Guild, discord.abc.Messageable, discord.Message]] = []
@@ -553,7 +622,6 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
             try:
                 await self._index_batch(guild, channel, msgs)
                 await asyncio.sleep(0.2)
-                self._save_guild(gid)
             except Exception:
                 logger.exception("Flush batch failed guild %s channel %s", gid, cid)
 
@@ -607,7 +675,7 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
                 for channel in channels:
                     await self._backfill_channel(guild, channel)
                 if self._chunks[guild.id]:
-                    self._save_guild(guild.id)
+                    self._dirty.add(guild.id)
         except Exception:
             logger.exception("Backfill failed for guild %s", guild.id)
         finally:
@@ -643,6 +711,22 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
             logger.warning("No permission to read history %s/%s", guild.id, cid)
         except Exception:
             logger.exception("Failed backfill channel %s", cid)
+
+    def _append_chunks(self, gid: int, chunks: list[dict], embeddings: list):
+        new_embs = []
+        for ch, emb in zip(chunks, embeddings):
+            ch["embedding"] = np.asarray(emb, dtype=np.float32)
+            self._chunks[gid].append(ch)
+            self._msg_index[gid][int(ch["msg_id"])] = len(self._chunks[gid]) - 1
+            new_embs.append(ch["embedding"])
+        if not new_embs:
+            return
+        stacked = np.stack(new_embs)
+        mat = self._matrices.get(gid)
+        if mat is None or mat.shape[0] == 0:
+            self._matrices[gid] = stacked
+        else:
+            self._matrices[gid] = np.vstack([mat, stacked])
 
     async def _index_batch(self, guild: discord.Guild, channel: discord.abc.Messageable, msgs: list[discord.Message]):
         if not msgs:
@@ -690,19 +774,16 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
             return
         lock = self._lock(gid)
         if lock.locked():
-            for ch, emb in zip(chunks, embeddings):
-                ch["embedding"] = np.array(emb, dtype=np.float32) if not isinstance(emb, np.ndarray) else emb.astype(np.float32)
-                self._chunks[gid].append(ch)
-                self._msg_index[gid][int(ch["msg_id"])] = len(self._chunks[gid]) - 1
-            self._matrices[gid] = np.array([c["embedding"] for c in self._chunks[gid]], dtype=np.float32)
+            self._append_chunks(gid, chunks, embeddings)
         else:
             async with lock:
-                for ch, emb in zip(chunks, embeddings):
-                    ch["embedding"] = np.array(emb, dtype=np.float32) if not isinstance(emb, np.ndarray) else emb.astype(np.float32)
-                    self._chunks[gid].append(ch)
-                    self._msg_index[gid][int(ch["msg_id"])] = len(self._chunks[gid]) - 1
-                self._matrices[gid] = np.array([c["embedding"] for c in self._chunks[gid]], dtype=np.float32)
+                self._append_chunks(gid, chunks, embeddings)
         logger.info("Indexed %d msgs guild %s channel %s (total %d)", len(chunks), gid, cid, len(self._chunks[gid]))
+        try:
+            await asyncio.to_thread(self._upsert_chunks_to_db, gid, chunks)
+        except Exception:
+            logger.exception("Failed persisting history batch guild %s", gid)
+        self._dirty.add(gid)
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
@@ -717,7 +798,7 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
             self._chunks[gid] = []
             self._matrices[gid] = None
             self._msg_index[gid] = {}
-            self._load_guild(gid)
+            await asyncio.to_thread(self._load_guild, gid)
         if message.id in self._msg_index.get(gid, {}):
             return
         await self._queue.put((message.guild, message.channel, message))
@@ -743,7 +824,8 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
             emb = (await self._embed_batch([chunk["chunk_text"]]))[0]
             chunk["embedding"] = np.array(emb, dtype=np.float32)
             self._matrices[gid][idx] = chunk["embedding"]
-            self._save_guild(gid)
+            await asyncio.to_thread(self._upsert_chunks_to_db, gid, [chunk])
+            self._dirty.add(gid)
         except Exception:
             logger.exception("Failed to update edited message %s", after.id)
 
@@ -761,7 +843,8 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
             self._msg_index[gid] = {int(c["msg_id"]): i for i, c in enumerate(chunks)}
             if chunks:
                 self._matrices[gid] = np.array([c["embedding"] for c in chunks], dtype=np.float32)
-                self._save_guild(gid)
+                await asyncio.to_thread(self._delete_chunk_from_db, gid, str(message.id))
+                self._dirty.add(gid)
             else:
                 self._matrices[gid] = None
                 j, n = self._store_path(gid)
@@ -771,10 +854,19 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
                 except FileNotFoundError:
                     pass
                 try:
-                    con = sqlite3.connect(self._db_path())
-                    con.execute("DELETE FROM chunks WHERE guild_id=?", (gid,))
-                    con.commit()
-                    con.close()
+                    def _purge_guild():
+                        con = sqlite3.connect(self._db_path(), timeout=30)
+                        try:
+                            con.execute("DELETE FROM chunks WHERE guild_id=?", (gid,))
+                            try:
+                                con.execute("DELETE FROM chunks_fts WHERE guild_id=?", (gid,))
+                            except Exception:
+                                pass
+                            con.commit()
+                        finally:
+                            con.close()
+                    await asyncio.to_thread(_purge_guild)
+                    self._dirty.discard(gid)
                 except Exception:
                     pass
 
@@ -898,7 +990,7 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
         except Exception:
             pass
         if search_mode == "keyword":
-            fts_scores = self._fts_search(query, guild_id, limit=max(limit * 5, 100))
+            fts_scores = await asyncio.to_thread(self._fts_search, query, guild_id, max(limit * 5, 100))
             if fts_scores:
                 allowed = {chunks[i]["msg_id"] for i in indices}
                 filtered_fts = {k: v for k, v in fts_scores.items() if k in allowed}
@@ -950,7 +1042,7 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
         with np.errstate(invalid='ignore', divide='ignore'):
             vec_scores = np.where(norms > 0, dots / norms, 0.0)
         if search_mode == "hybrid":
-            fts_scores_map = self._fts_search(query, guild_id, limit=200)
+            fts_scores_map = await asyncio.to_thread(self._fts_search, query, guild_id, 200)
             if fts_scores_map:
                 vec_rank = {chunks_f[i]["msg_id"]: float(vec_scores[i]) for i in range(len(chunks_f))}
                 allowed_ids = {chunks_f[i]["msg_id"] for i in range(len(chunks_f))}

@@ -445,7 +445,7 @@ class DocsRAG(commands.Cog):
                 await asyncio.to_thread(self._get_local_model)
             except Exception:
                 logger.warning("Falling back to remote embeddings due to local model load failure")
-        loaded = self._load_vectors()
+        loaded = await asyncio.to_thread(self._load_vectors)
         if not loaded:
             await self.index_docs()
         self.periodic_reindex.start()
@@ -870,7 +870,7 @@ class DocsRAG(commands.Cog):
                         logger.exception("Failed to fetch commit SHA for %s", label)
                 self._source_last_index[label] = __import__('time').monotonic()
 
-        self._save_vectors()
+        await asyncio.to_thread(self._save_vectors)
 
     # --- Search with Reranking ---
 
