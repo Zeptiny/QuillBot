@@ -1,4 +1,5 @@
 import asyncio
+import datetime
 import hashlib
 import json
 import logging
@@ -22,6 +23,13 @@ from cogs.spark_parser import (
     build_summary as _spark_build_summary,
 )
 from cogs.utils import PaginatedEmbedView, build_source_pages, run_tool_loop, split_response
+from cogs.utils import (
+    CHANNEL_HISTORY_TOOL as _CHANNEL_HISTORY_TOOL,
+    GUILD_INFO_TOOL as _GUILD_INFO_TOOL,
+    build_full_context_block as _build_full_context_block,
+    build_guild_context as _build_guild_context,
+    fetch_channel_history as _fetch_channel_history,
+)
 from config import (
     CHAT_MODEL,
     COOLDOWN_PER,
@@ -244,6 +252,8 @@ TOOLS = [
             },
         },
     },
+    _CHANNEL_HISTORY_TOOL,
+    _GUILD_INFO_TOOL,
 ]
 
 # Additional tools injected only when a Spark report is active in the session.
@@ -994,6 +1004,9 @@ class DocsRAG(commands.Cog):
         name: str,
         args: dict,
         spark_report: SparkReport | None = None,
+        bot: discord.Client | None = None,
+        channel: discord.abc.Messageable | None = None,
+        guild: discord.Guild | None = None,
     ) -> tuple[str, list[dict]]:
         """Execute a tool call and return (result_text, source_chunks)."""
         if name == 'search_docs':
@@ -1023,6 +1036,27 @@ class DocsRAG(commands.Cog):
                     f"URL: {r['url']}"
                 )
             return '\n\n'.join(lines), []
+
+        if name == 'get_channel_history':
+            b = bot or self.bot
+            ch = channel
+            limit = args.get('limit', 20)
+            cid = args.get('channel_id')
+            text = await _fetch_channel_history(b, ch, limit=limit, channel_id=cid)
+            return text, []
+
+        if name == 'get_guild_info':
+            g = guild
+            if not g:
+                return "Fora de um servidor (DM).", []
+            text = _build_guild_context(g)
+            try:
+                chs = [f"#{c.name} ({c.id})" for c in g.channels if isinstance(c, discord.TextChannel)][:30]
+                if chs:
+                    text += "\nCanais de texto: " + ", ".join(chs)
+            except Exception:
+                pass
+            return text, []
 
         if name == 'get_spark_detail':
             if spark_report is None:
@@ -1066,6 +1100,12 @@ class DocsRAG(commands.Cog):
         if tool_name == 'search_plugins':
             query = args.get('query', '')
             return f'🔌 Pesquisando plugins: *{query[:60]}*'
+        if tool_name == 'get_channel_history':
+            lim = args.get('limit', 20)
+            cid = args.get('channel_id')
+            return f'📜 Lendo histórico ({lim} msgs)' + (f' canal {cid}' if cid else '')
+        if tool_name == 'get_guild_info':
+            return '🏰 Coletando informações do servidor'
         if tool_name == 'get_spark_detail':
             section = args.get('section', '')
             section_names = {
@@ -1098,6 +1138,10 @@ class DocsRAG(commands.Cog):
         spark_report: SparkReport | None = None,
         title: str | None = None,
         interaction: discord.Interaction | None = None,
+        user: discord.abc.User | discord.Member | None = None,
+        guild: discord.Guild | None = None,
+        channel: discord.abc.Messageable | None = None,
+        created_at: datetime.datetime | None = None,
     ) -> tuple[str, list[discord.Embed]]:
         """Run the LLM with tool-calling in a loop until it produces a final answer.
 
@@ -1105,6 +1149,12 @@ class DocsRAG(commands.Cog):
         receives the report summary as a synthetic prior exchange, and gains
         access to the ``get_spark_detail`` / ``get_config_key`` Spark tools.
         """
+        # Resolve context from interaction if not explicitly passed
+        if interaction is not None:
+            user = user or interaction.user
+            guild = guild or interaction.guild
+            channel = channel or interaction.channel
+            created_at = created_at or interaction.created_at
         # Build system prompt ----------------------------------------------------
         system_content = SYSTEM_PROMPT
         if spark_report is not None:
@@ -1138,6 +1188,14 @@ class DocsRAG(commands.Cog):
             }
         ]
 
+        # Inject user/guild/channel/temporal awareness ---------------------------
+        if user or guild or channel or created_at:
+            try:
+                ctx_block = _build_full_context_block(user, guild, channel, created_at)
+                messages.append({'role': 'system', 'content': ctx_block})
+            except Exception:
+                logger.exception("Failed to build context block for _run_agent")
+
         # Inject Spark report summary as a synthetic prior exchange --------------
         # Per Anthropic long-context guidance: put data before the user question.
         if spark_report is not None:
@@ -1167,7 +1225,7 @@ class DocsRAG(commands.Cog):
 
         # Replay conversation history --------------------------------------------
         if history:
-            for h in history[-3:]:
+            for h in history[-16:]:
                 messages.append({'role': 'user', 'content': h['question']})
                 messages.append({'role': 'assistant', 'content': h['answer']})
 
@@ -1188,7 +1246,7 @@ class DocsRAG(commands.Cog):
         active_tools = TOOLS + SPARK_TOOLS if spark_report is not None else TOOLS
 
         exec_tool = (
-            lambda name, args: self._exec_tool(name, args, spark_report=spark_report)
+            lambda name, args: self._exec_tool(name, args, spark_report=spark_report, bot=self.bot, channel=channel, guild=guild)
         )
 
         answer, all_sources = await run_tool_loop(
@@ -1312,6 +1370,10 @@ class DocsRAG(commands.Cog):
                     history=history,
                     image_url=image_url,
                     spark_report=spark_report,
+                    user=message.author,
+                    guild=message.guild,
+                    channel=message.channel,
+                    created_at=message.created_at,
                 )
                 if len(embeds) == 1:
                     reply = await message.reply(embed=embeds[0])

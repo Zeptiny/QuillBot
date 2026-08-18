@@ -1,14 +1,210 @@
 """Shared text utilities used across multiple cogs."""
 
+import datetime
 import json
 import logging
 from collections.abc import Awaitable, Callable
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import discord
 from openai import AsyncOpenAI
 
 logger = logging.getLogger(__name__)
+
+BR_TZ = ZoneInfo("America/Sao_Paulo")
+
+CHANNEL_HISTORY_TOOL = {
+    'type': 'function',
+    'function': {
+        'name': 'get_channel_history',
+        'description': (
+            'Busca mensagens recentes do canal atual ou de outro canal do servidor. '
+            'Use quando o usuário perguntar sobre conversas anteriores, contexto recente, '
+            'ou quando precisar entender o que foi discutido antes. Retorna autor, horário e conteúdo.'
+        ),
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'limit': {
+                    'type': 'integer',
+                    'description': 'Número de mensagens a buscar (padrão 20, máximo 50).',
+                },
+                'channel_id': {
+                    'type': 'string',
+                    'description': 'ID do canal para buscar. Omita para usar o canal atual.',
+                },
+            },
+            'required': [],
+        },
+    },
+}
+
+GUILD_INFO_TOOL = {
+    'type': 'function',
+    'function': {
+        'name': 'get_guild_info',
+        'description': (
+            'Retorna informações detalhadas sobre o servidor Discord atual: nome, '
+            'quantidade de membros, canais, cargos e dono.'
+        ),
+        'parameters': {
+            'type': 'object',
+            'properties': {},
+            'required': [],
+        },
+    },
+}
+
+
+def _fmt_dt(dt: datetime.datetime | None) -> str:
+    if not dt:
+        return "—"
+    try:
+        return dt.astimezone(BR_TZ).strftime("%d/%m/%Y %H:%M BRT")
+    except Exception:
+        return dt.isoformat()
+
+
+def build_user_context(member: discord.abc.User | discord.Member | None) -> str:
+    if not member:
+        return "Usuário: desconhecido"
+    lines = [f"- Usuário: {getattr(member, 'display_name', str(member))} (@{member.name}) id={member.id}"]
+    created = getattr(member, 'created_at', None)
+    if created:
+        lines.append(f"  Conta criada: {_fmt_dt(created)}")
+    if isinstance(member, discord.Member):
+        joined = getattr(member, 'joined_at', None)
+        if joined:
+            lines.append(f"  Entrou no servidor: {_fmt_dt(joined)}")
+        try:
+            roles = [r.name for r in member.roles if r.name != "@everyone"]
+            if roles:
+                lines.append(f"  Cargos: {', '.join(roles[:10])}")
+            if member.guild_permissions.administrator:
+                lines.append("  Permissão: Administrador")
+            elif member.guild_permissions.manage_guild:
+                lines.append("  Permissão: Gerenciador do servidor")
+        except Exception:
+            pass
+        if member.nick and member.nick != member.display_name:
+            lines.append(f"  Apelido: {member.nick}")
+    return "\n".join(lines)
+
+
+def build_guild_context(guild: discord.Guild | None) -> str:
+    if not guild:
+        return "Servidor: DM / mensagem direta (sem guild)"
+    try:
+        owner = getattr(guild, 'owner', None)
+        owner_str = f"{owner} ({guild.owner_id})" if owner else str(guild.owner_id)
+    except Exception:
+        owner_str = str(getattr(guild, 'owner_id', '—'))
+    text_channels = len([c for c in guild.channels if isinstance(c, discord.TextChannel)])
+    voice_channels = len([c for c in guild.channels if isinstance(c, discord.VoiceChannel)])
+    role_names = [r.name for r in guild.roles if r.name != "@everyone"][:15]
+    lines = [
+        f"- Servidor: {guild.name} id={guild.id}",
+        f"  Membros: {guild.member_count or len(guild.members) if hasattr(guild, 'members') else '—'} | Canais: #{text_channels} texto / {voice_channels} voz",
+        f"  Dono: {owner_str}",
+        f"  Criado em: {_fmt_dt(getattr(guild, 'created_at', None))}",
+    ]
+    if role_names:
+        lines.append(f"  Cargos ({len(guild.roles)-1}): {', '.join(role_names)}")
+    return "\n".join(lines)
+
+
+def build_channel_context(channel: discord.abc.GuildChannel | discord.Thread | discord.DMChannel | None) -> str:
+    if not channel:
+        return "Canal: desconhecido"
+    ch_type = type(channel).__name__
+    name = getattr(channel, 'name', getattr(channel, 'recipient', 'DM'))
+    topic = getattr(channel, 'topic', None)
+    lines = [f"- Canal: #{name} id={channel.id} tipo={ch_type}"]
+    if topic:
+        lines.append(f"  Tópico: {topic[:200]}")
+    parent = getattr(channel, 'parent', None)
+    if parent:
+        lines.append(f"  Thread de: #{parent.name}")
+    return "\n".join(lines)
+
+
+def build_temporal_context(now: datetime.datetime | None = None, created_at: datetime.datetime | None = None) -> str:
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    br_now = now.astimezone(BR_TZ)
+    lines = [
+        f"- Agora: {br_now.strftime('%d/%m/%Y %H:%M:%S BRT')} ({now.strftime('%Y-%m-%d %H:%M UTC')})",
+    ]
+    if created_at:
+        lines.append(f"  Mensagem enviada em: {_fmt_dt(created_at)} UTC={created_at.strftime('%Y-%m-%d %H:%M UTC') if hasattr(created_at, 'strftime') else created_at}")
+    return "\n".join(lines)
+
+
+def build_full_context_block(
+    user: discord.abc.User | discord.Member | None,
+    guild: discord.Guild | None,
+    channel: discord.abc.GuildChannel | discord.Thread | discord.DMChannel | None,
+    created_at: datetime.datetime | None = None,
+) -> str:
+    now = datetime.datetime.now(datetime.timezone.utc)
+    parts = [
+        "<contexto>",
+        build_user_context(user),
+        build_guild_context(guild),
+        build_channel_context(channel),
+        build_temporal_context(now, created_at),
+        "</contexto>",
+    ]
+    return "\n".join(parts)
+
+
+async def fetch_channel_history(
+    bot: discord.Client,
+    channel: discord.abc.Messageable | None,
+    limit: int = 20,
+    channel_id: str | None = None,
+) -> str:
+    target = channel
+    if channel_id:
+        try:
+            cid = int(channel_id)
+            target = bot.get_channel(cid)
+            if target is None:
+                try:
+                    target = await bot.fetch_channel(cid)
+                except Exception:
+                    return f"Canal {channel_id} não encontrado ou sem acesso."
+        except ValueError:
+            return f"channel_id inválido: {channel_id}"
+    if target is None or not hasattr(target, "history"):
+        return "Histórico não disponível para este canal."
+    limit = max(1, min(50, int(limit)))
+    lines: list[str] = []
+    try:
+        async for msg in target.history(limit=limit):
+            ts = _fmt_dt(msg.created_at)
+            author = getattr(msg.author, 'display_name', str(msg.author))
+            content = msg.content or ""
+            if msg.attachments:
+                content += " " + " ".join(f"[anexo:{a.filename}]" for a in msg.attachments)
+            if msg.embeds and not content:
+                content = f"[embed: {msg.embeds[0].title or 'sem título'}]"
+            content = content.replace("\n", " ").strip()
+            if len(content) > 350:
+                content = content[:350] + "…"
+            if not content:
+                content = "[sem texto]"
+            lines.append(f"[{ts}] {author}: {content}")
+    except discord.Forbidden:
+        return "Sem permissão para ler histórico deste canal."
+    except Exception as e:
+        logger.exception("fetch_channel_history failed")
+        return f"Erro ao buscar histórico: {e}"
+    if not lines:
+        return "Nenhuma mensagem encontrada no histórico."
+    lines.reverse()
+    header = f"Histórico de #{getattr(target, 'name', target.id)} (últimas {len(lines)} mensagens, cronológica):\n"
+    return header + "\n".join(lines)
 
 
 async def run_tool_loop(

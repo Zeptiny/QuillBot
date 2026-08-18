@@ -1,4 +1,5 @@
 import logging
+import datetime
 import re
 import time
 
@@ -13,7 +14,19 @@ from cogs.tavily_tools import TOOLS as TAVILY_TOOLS
 from cogs.tavily_tools import exec_tool as tavily_exec_tool
 from cogs.tavily_tools import status_label as tavily_status_label
 from cogs.tavily_tools import MAX_TOOL_ROUNDS as TAVILY_MAX_ROUNDS
-from cogs.utils import PaginatedEmbedView, build_source_pages, run_tool_loop, split_response
+from cogs.utils import (
+    CHANNEL_HISTORY_TOOL,
+    GUILD_INFO_TOOL,
+    PaginatedEmbedView,
+    build_full_context_block,
+    build_guild_context,
+    build_temporal_context,
+    build_user_context,
+    fetch_channel_history,
+    build_source_pages,
+    run_tool_loop,
+    split_response,
+)
 from config import CHAT_MENTION_ENABLED, CHAT_MODEL, COOLDOWN_PER, COOLDOWN_RATE, DOCS_BASE_URL, OPENAI_API_KEY, OPENAI_BASE_URL, TAVILY_AVAILABLE
 
 logger = logging.getLogger(__name__)
@@ -439,7 +452,15 @@ class Commands(commands.Cog):
         )
 
         try:
-            answer, embeds = await self._run_chat(question, image_url=image_url, interaction=interaction)
+            answer, embeds = await self._run_chat(
+                question,
+                image_url=image_url,
+                interaction=interaction,
+                user=interaction.user,
+                guild=interaction.guild,
+                channel=interaction.channel,
+                created_at=interaction.created_at,
+            )
             # Clear any in-progress status message before sending the final embed.
             try:
                 await interaction.edit_original_response(content=None)
@@ -473,11 +494,23 @@ class Commands(commands.Cog):
         history: list[dict] | None = None,
         image_url: str | None = None,
         interaction: discord.Interaction | None = None,
+        user: discord.abc.User | discord.Member | None = None,
+        guild: discord.Guild | None = None,
+        channel: discord.abc.GuildChannel | discord.Thread | discord.DMChannel | None = None,
+        created_at: datetime.datetime | None = None,
     ) -> tuple[str, list[discord.Embed]]:
-        messages = [{'role': 'system', 'content': GENERAL_SYSTEM_PROMPT}]
+        context_block = None
+        if user or guild or channel:
+            try:
+                context_block = build_full_context_block(user or (interaction.user if interaction else None), guild or (interaction.guild if interaction else None), channel or (interaction.channel if interaction else None), created_at or (interaction.created_at if interaction else None))
+            except Exception:
+                logger.exception("Failed to build context block")
+        messages: list[dict] = [{'role': 'system', 'content': GENERAL_SYSTEM_PROMPT}]
+        if context_block:
+            messages.append({'role': 'system', 'content': context_block})
 
         if history:
-            for h in history[-3:]:
+            for h in history[-16:]:
                 messages.append({'role': 'user', 'content': h['question']})
                 messages.append({'role': 'assistant', 'content': h['answer']})
 
@@ -492,15 +525,50 @@ class Commands(commands.Cog):
         else:
             messages.append({'role': 'user', 'content': question})
 
-        active_tools = TAVILY_TOOLS if TAVILY_AVAILABLE else None
+        base_tools = list(TAVILY_TOOLS) if TAVILY_AVAILABLE else []
+        base_tools.extend([CHANNEL_HISTORY_TOOL, GUILD_INFO_TOOL])
+        active_tools = base_tools if base_tools else None
+        fallback_channel = channel or (interaction.channel if interaction else None)
+
+        async def _exec(name: str, args: dict) -> tuple[str, list[dict]]:
+            if name in ('web_search', 'web_extract'):
+                return await tavily_exec_tool(name, args)
+            if name == 'get_channel_history':
+                text = await fetch_channel_history(self.bot, fallback_channel, limit=args.get('limit', 20), channel_id=args.get('channel_id'))
+                return text, []
+            if name == 'get_guild_info':
+                g = guild or (interaction.guild if interaction else None)
+                if not g:
+                    return "Fora de um servidor (DM).", []
+                text = build_guild_context(g)
+                # add channel list
+                try:
+                    chs = [f"#{c.name} ({c.id})" for c in g.channels if isinstance(c, discord.TextChannel)][:30]
+                    if chs:
+                        text += "\nCanais de texto: " + ", ".join(chs)
+                except Exception:
+                    pass
+                return text, []
+            return f'Ferramenta desconhecida: {name}', []
+
+        def _status(name: str, args: dict) -> str:
+            if name in ('web_search', 'web_extract'):
+                return tavily_status_label(name, args)
+            if name == 'get_channel_history':
+                lim = args.get('limit', 20)
+                cid = args.get('channel_id')
+                return f'📜 Lendo histórico ({lim} msgs)' + (f' canal {cid}' if cid else '')
+            if name == 'get_guild_info':
+                return '🏰 Coletando informações do servidor'
+            return f'🔧 Executando: {name}'
 
         answer, all_sources = await run_tool_loop(
             client=self.client,
             model=CHAT_MODEL,
             messages=messages,
             tools=active_tools,
-            exec_tool=tavily_exec_tool,
-            status_label=tavily_status_label,
+            exec_tool=_exec,
+            status_label=_status,
             interaction=interaction,
             max_rounds=TAVILY_MAX_ROUNDS,
             dedup_key=lambda s: s.get('url', ''),
@@ -589,7 +657,13 @@ class Commands(commands.Cog):
                         history = conv.get('history', []).copy()
                         history.append({'question': conv['question'], 'answer': conv['answer']})
                         answer, embeds = await self._run_chat(
-                            follow_up_question, history=history, image_url=image_url
+                            follow_up_question,
+                            history=history,
+                            image_url=image_url,
+                            user=message.author,
+                            guild=message.guild,
+                            channel=message.channel,
+                            created_at=message.created_at,
                         )
                         if len(embeds) == 1:
                             reply = await message.reply(embed=embeds[0])
@@ -656,7 +730,14 @@ class Commands(commands.Cog):
         logger.info("Processing @mention chat user=%s guild=%s question=%r", message.author.id, message.guild_id, clean_question[:80])
         async with message.channel.typing():
             try:
-                answer, embeds = await self._run_chat(clean_question, image_url=image_url)
+                answer, embeds = await self._run_chat(
+                    clean_question,
+                    image_url=image_url,
+                    user=message.author,
+                    guild=message.guild,
+                    channel=message.channel,
+                    created_at=message.created_at,
+                )
                 if len(embeds) == 1:
                     reply = await message.reply(embed=embeds[0], mention_author=False)
                 else:
