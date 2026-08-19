@@ -313,6 +313,16 @@ cp .env.example .env   # if available, otherwise create .env manually
 | `VECTOR_STORE_PATH` | `data/vectors.json` | Docs vector store path |
 | `REINDEX_INTERVAL_HOURS` | `6` | Hours between automatic reindex checks |
 
+### Conversations (multi-turn memory)
+
+| Variable | Default | Description |
+|---|---|---|
+| `CONVERSATIONS_DB_PATH` | `data/conversations.db` | SQLite path for persisted conversations |
+| `CONVERSATIONS_TTL_SECONDS` | `1800` | Conversation expiry after **last activity** |
+| `CONVERSATIONS_MAX_STORED` | `200` | Max conversations kept per flow (chat/ask) |
+| `CONVERSATIONS_MAX_TURNS` | `24` | Max turns stored per conversation |
+| `CONVERSATIONS_HISTORY_TURNS` | `16` | Turns replayed to the LLM per request |
+
 ### Other
 
 | Variable | Default | Description |
