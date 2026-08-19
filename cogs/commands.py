@@ -550,9 +550,10 @@ class Commands(commands.Cog):
                 context_block = build_full_context_block(user or (interaction.user if interaction else None), guild or (interaction.guild if interaction else None), channel or (interaction.channel if interaction else None), created_at or (interaction.created_at if interaction else None))
             except Exception:
                 logger.exception("Failed to build context block")
-        messages: list[dict] = [{'role': 'system', 'content': GENERAL_SYSTEM_PROMPT}]
+        system_content = GENERAL_SYSTEM_PROMPT
         if context_block:
-            messages.append({'role': 'system', 'content': context_block})
+            system_content = f"{GENERAL_SYSTEM_PROMPT}\n\n{context_block}"
+        messages: list[dict] = [{'role': 'system', 'content': system_content}]
 
         if history:
             for h in history[-16:]:
