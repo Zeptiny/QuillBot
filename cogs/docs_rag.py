@@ -1353,7 +1353,7 @@ class DocsRAG(commands.Cog):
         if user or guild or channel or created_at:
             try:
                 ctx_block = _build_full_context_block(user, guild, channel, created_at)
-                messages.append({'role': 'system', 'content': ctx_block})
+                messages.append({'role': 'user', 'content': ctx_block})
             except Exception:
                 logger.exception("Failed to build context block for _run_agent")
 
