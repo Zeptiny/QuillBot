@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+import time
 
 import aiohttp
 import discord
@@ -14,6 +15,16 @@ from discord import app_commands
 from discord.ext import commands, tasks
 from openai import AsyncOpenAI, RateLimitError
 
+from cogs.conversation_store import (
+    ConversationStore as _ConversationStore,
+    add_participant as _add_participant,
+    author_info as _author_info,
+    build_conversation_block as _build_conversation_block,
+    build_current_message as _build_current_message,
+    build_history_messages as _build_history_messages,
+    cap_turns as _cap_turns,
+    make_turn as _make_turn,
+)
 from cogs.plugin_apis import HTTP_HEADERS as _HTTP_HEADERS
 from cogs.plugin_apis import search_all as _search_plugins_all
 from cogs.spark_parser import (
@@ -42,6 +53,11 @@ from config import (
     CHAT_MODEL,
     COOLDOWN_PER,
     COOLDOWN_RATE,
+    CONVERSATIONS_DB_PATH,
+    CONVERSATIONS_HISTORY_TURNS,
+    CONVERSATIONS_MAX_STORED,
+    CONVERSATIONS_MAX_TURNS,
+    CONVERSATIONS_TTL_SECONDS,
     DOC_SOURCES,
     DOCS_BASE_URL,
     DOCS_BRANCH,
@@ -89,7 +105,6 @@ SYSTEM_PROMPT = (
     "- Cite valores e trechos de configuração exatamente como retornados pelas ferramentas. "
     f"Se nenhuma ferramenta retornar dados relevantes, diga que não encontrou e sugira visitar {DOCS_BASE_URL}.\n"
     "- Omita seções de fontes na resposta — as fontes são exibidas automaticamente pela interface.\n"
-    "- Quando útil, termine com uma sugestão de acompanhamento na linha final, prefixada com '💡 '.\n"
     "- Execute as ferramentas diretamente sem pedir autorização. "
     "Se múltiplas buscas independentes forem necessárias, execute-as em paralelo na mesma rodada.\n"
     "</instructions>\n\n"
@@ -106,8 +121,7 @@ SYSTEM_PROMPT = (
     "```properties\nview-distance=6\n```\n\n"
     "**`paper-world-defaults.yml`** (Paper/Purpur)\n"
     "```yaml\nchunks:\n  delay-chunk-unloads-by: 10s\n```\n\n"
-    "Para servidores com 20–50 jogadores, valores entre 6 e 8 oferecem bom equilíbrio.\n\n"
-    "💡 Quer otimizar também o `simulation-distance`?\n"
+    "Para servidores com 20–50 jogadores, valores entre 6 e 8 oferecem bom equilíbrio.\n"
     "</assistant>\n"
     "</example>\n"
     "<example>\n"
@@ -411,8 +425,15 @@ class DocsRAG(commands.Cog):
         # Per-source SHA tracking for granular reindex
         self._source_shas: dict[str, str] = {}  # label -> latest commit SHA
         self._source_last_index: dict[str, float] = {}  # label -> timestamp
-        # TTL cache: max 200 conversations, each expires after 30 min
-        self._conversations: TTLCache = TTLCache(maxsize=200, ttl=1800)
+        # Persistent conversations with activity-based TTL (survive restarts)
+        self.store = _ConversationStore(
+            CONVERSATIONS_DB_PATH,
+            kind='ask',
+            ttl_seconds=CONVERSATIONS_TTL_SECONDS,
+            max_stored=CONVERSATIONS_MAX_STORED,
+        )
+        # Spark reports are too heavy to persist — kept in memory per conversation
+        self._spark_by_conv: dict[str, SparkReport] = {}
         # Per-user follow-up cooldown (same period as slash commands)
         self._followup_cd: TTLCache = TTLCache(maxsize=500, ttl=COOLDOWN_PER)
 
@@ -990,7 +1011,7 @@ class DocsRAG(commands.Cog):
         )
 
         try:
-            answer, embeds = await self._run_agent(
+            answer, embeds, sources = await self._run_agent(
                 question, image_url=image_url, interaction=interaction
             )
             # Clear any in-progress status message before sending the final embed.
@@ -1004,7 +1025,9 @@ class DocsRAG(commands.Cog):
                 msg = await interaction.followup.send(
                     embed=embeds[0], view=PaginatedEmbedView(embeds), wait=True
                 )
-            self._store_conversation(msg.id, question, answer)
+            await self._store_conversation(
+                msg, question, answer, sources=sources, interaction=interaction
+            )
 
         except RateLimitError:
             try:
@@ -1297,13 +1320,14 @@ class DocsRAG(commands.Cog):
         image_url: str | None = None,
         image_urls: list[str] | None = None,
         spark_report: SparkReport | None = None,
+        reply_to: str | None = None,
         title: str | None = None,
         interaction: discord.Interaction | None = None,
         user: discord.abc.User | discord.Member | None = None,
         guild: discord.Guild | None = None,
         channel: discord.abc.Messageable | None = None,
         created_at: datetime.datetime | None = None,
-    ) -> tuple[str, list[discord.Embed]]:
+    ) -> tuple[str, list[discord.Embed], list[dict]]:
         """Run the LLM with tool-calling in a loop until it produces a final answer.
 
         When ``spark_report`` is provided the agent uses ``SPARK_MODEL``,
@@ -1331,6 +1355,12 @@ class DocsRAG(commands.Cog):
                     'Não sugira otimizações gerais de desempenho como resposta primária.\n'
                     '</lag_spike_warning>'
                 )
+        history = history or []
+        if history:
+            system_content += '\n\n' + _build_conversation_block(
+                history[-CONVERSATIONS_HISTORY_TURNS:],
+                current_author=_author_info(user or (interaction.user if interaction else None)),
+            )
 
         messages: list[dict] = [
             {
@@ -1386,9 +1416,9 @@ class DocsRAG(commands.Cog):
 
         # Replay conversation history --------------------------------------------
         if history:
-            for h in history[-16:]:
-                messages.append({'role': 'user', 'content': h['question']})
-                messages.append({'role': 'assistant', 'content': h['answer']})
+            messages.extend(
+                _build_history_messages(history, max_turns=CONVERSATIONS_HISTORY_TURNS)
+            )
 
         # Current user message ---------------------------------------------------
         urls: list[str] = []
@@ -1396,13 +1426,14 @@ class DocsRAG(commands.Cog):
             urls.extend([u for u in image_urls if u])
         elif image_url:
             urls.append(image_url)
-        if urls:
-            content_parts: list[dict] = [{'type': 'text', 'text': question}]
-            for url in urls[:4]:
-                content_parts.append({'type': 'image_url', 'image_url': {'url': url}})
-            messages.append({'role': 'user', 'content': content_parts})
-        else:
-            messages.append({'role': 'user', 'content': question})
+        messages.append(_build_current_message(
+            question,
+            author=_author_info(user or (interaction.user if interaction else None)),
+            ts=created_at.timestamp() if created_at else None,
+            image_urls=urls,
+            reply_to=reply_to,
+            in_conversation=bool(history),
+        ))
 
         # Choose model and tool set based on session type ------------------------
         model = SPARK_MODEL if spark_report is not None else CHAT_MODEL
@@ -1426,6 +1457,7 @@ class DocsRAG(commands.Cog):
 
         # Build source links (attached to first page only) -----------------------
         source_lines: list[str] = []
+        sources: list[dict] = []
         if all_sources:
             seen_paths: set[str] = set()
             for r in all_sources:
@@ -1435,6 +1467,7 @@ class DocsRAG(commands.Cog):
                     doc_title = r['title'] or _title_from_path(r['path'])
                     source_label = r.get('source', "Miners' Refuge")
                     source_lines.append(f'• [{doc_title}]({doc_url}) — {source_label}')
+                    sources.append({'title': str(doc_title)[:100], 'url': doc_url})
 
         # Build paginated embeds -------------------------------------------------
         embed_title = title or f'❓ {question}'
@@ -1467,22 +1500,51 @@ class DocsRAG(commands.Cog):
                 )
             )
 
-        return answer, embeds
+        return answer, embeds, sources
 
-    def _store_conversation(
+    async def _store_conversation(
         self,
-        message_id: int,
+        message: discord.Message,
         question: str,
         answer: str,
+        sources: list[dict] | None = None,
         spark_report: SparkReport | None = None,
+        interaction: discord.Interaction | None = None,
     ) -> None:
-        """Store a conversation exchange for follow-up replies."""
-        self._conversations[message_id] = {
-            'question': question,
-            'answer': answer,
-            'history': [],
-            'spark_report': spark_report,
+        """Persist a conversation exchange for follow-up replies."""
+        user = interaction.user if interaction is not None else None
+        guild = interaction.guild if interaction is not None else None
+        channel = interaction.channel if interaction is not None else message.channel
+        author = _author_info(user)
+        ts_dt = interaction.created_at if interaction is not None else message.created_at
+        ts = ts_dt.timestamp() if ts_dt else time.time()
+        turn = _make_turn(
+            question, answer,
+            author=author, ts=ts,
+            channel_id=getattr(channel, 'id', None),
+            channel_name=getattr(channel, 'name', None),
+            images=[],
+            sources=sources,
+        )
+        origin = {
+            'channel_id': str(getattr(channel, 'id', '') or ''),
+            'channel_name': getattr(channel, 'name', '') or '',
+            'guild_id': str(getattr(guild, 'id', '') or ''),
+            'guild_name': getattr(guild, 'name', '') or '',
         }
+        await self.store.create(
+            str(message.id),
+            guild_id=origin['guild_id'] or None,
+            channel_id=origin['channel_id'] or None,
+            data={
+                'turns': [turn],
+                'participants': [author] if author.get('id') else [],
+                'origin': origin,
+                'started_ts': ts,
+            },
+        )
+        if spark_report is not None:
+            self._spark_by_conv[str(message.id)] = spark_report
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
@@ -1493,7 +1555,7 @@ class DocsRAG(commands.Cog):
             return
 
         ref_id = message.reference.message_id
-        conv = self._conversations.get(ref_id)
+        conv = await self.store.get_by_handle(ref_id)
         if not conv:
             return
 
@@ -1508,6 +1570,9 @@ class DocsRAG(commands.Cog):
         self._followup_cd[user_id] = True
 
         follow_up_question = message.content.strip()
+        if self.bot.user:
+            follow_up_question = re.sub(rf'<@!?{self.bot.user.id}>', '', follow_up_question)
+            follow_up_question = re.sub(r'\s+', ' ', follow_up_question).strip()
         if not follow_up_question and not message.attachments:
             return
 
@@ -1516,15 +1581,15 @@ class DocsRAG(commands.Cog):
         if not follow_up_question:
             follow_up_question = 'Analise esta imagem.'
 
-        # Carry the Spark report forward through the conversation chain.
-        spark_report: SparkReport | None = conv.get('spark_report')
+        # Carry the Spark report forward through the conversation chain
+        # (in-memory only — lost on restart, text history survives).
+        spark_report: SparkReport | None = self._spark_by_conv.get(conv['conv_id'])
 
         async with message.channel.typing():
             try:
-                history = conv.get('history', []).copy()
-                history.append({'question': conv['question'], 'answer': conv['answer']})
+                history = conv['data'].get('turns', []).copy()
 
-                answer, embeds = await self._run_agent(
+                answer, embeds, sources = await self._run_agent(
                     follow_up_question,
                     history=history,
                     image_urls=image_urls if image_urls else None,
@@ -1533,6 +1598,7 @@ class DocsRAG(commands.Cog):
                     guild=message.guild,
                     channel=message.channel,
                     created_at=message.created_at,
+                    reply_to=str(ref_id),
                 )
                 if len(embeds) == 1:
                     reply = await message.reply(embed=embeds[0])
@@ -1541,12 +1607,25 @@ class DocsRAG(commands.Cog):
                         embed=embeds[0], view=PaginatedEmbedView(embeds)
                     )
 
-                self._conversations[reply.id] = {
-                    'question': follow_up_question,
-                    'answer': answer,
-                    'history': history,
-                    'spark_report': spark_report,
-                }
+                turn = _make_turn(
+                    follow_up_question, answer,
+                    author=_author_info(message.author),
+                    ts=message.created_at.timestamp(),
+                    message_id=message.id,
+                    channel_id=message.channel.id,
+                    channel_name=getattr(message.channel, 'name', None),
+                    images=image_urls,
+                    sources=sources,
+                    reply_to=ref_id,
+                )
+                data = conv['data']
+                data['turns'] = _cap_turns(history + [turn], CONVERSATIONS_MAX_TURNS)
+                _add_participant(data.setdefault('participants', []), _author_info(message.author))
+                await self.store.update(
+                    conv['conv_id'], data, new_handle_msg_id=reply.id,
+                )
+                if spark_report is not None:
+                    self._spark_by_conv[conv['conv_id']] = spark_report
             except RateLimitError:
                 await message.reply(
                     '⏳ Limite de requisições atingido. Tente novamente em alguns minutos.'
@@ -1577,7 +1656,7 @@ class DocsRAG(commands.Cog):
             'desempenho, se houver. Siga o protocolo diagnóstico.'
         )
         try:
-            answer, embeds = await self._run_agent(
+            answer, embeds, sources = await self._run_agent(
                 question,
                 spark_report=report,
                 title=embed_title,
@@ -1594,7 +1673,10 @@ class DocsRAG(commands.Cog):
                 msg = await interaction.followup.send(
                     embed=embeds[0], view=PaginatedEmbedView(embeds), wait=True
                 )
-            self._store_conversation(msg.id, question, answer, spark_report=report)
+            await self._store_conversation(
+                msg, question, answer,
+                sources=sources, spark_report=report, interaction=interaction,
+            )
 
         except RateLimitError:
             await interaction.followup.send(

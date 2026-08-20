@@ -10,6 +10,16 @@ from discord import app_commands
 from discord.ext import commands
 from openai import AsyncOpenAI, RateLimitError
 
+from cogs.conversation_store import (
+    ConversationStore,
+    add_participant,
+    author_info,
+    build_conversation_block,
+    build_current_message,
+    build_history_messages,
+    cap_turns,
+    make_turn,
+)
 from cogs.tavily_tools import TOOLS as TAVILY_TOOLS
 from cogs.tavily_tools import exec_tool as tavily_exec_tool
 from cogs.tavily_tools import status_label as tavily_status_label
@@ -35,7 +45,21 @@ from cogs.utils import (
     run_tool_loop,
     split_response,
 )
-from config import CHAT_MENTION_ENABLED, CHAT_MODEL, COOLDOWN_PER, COOLDOWN_RATE, DOCS_BASE_URL, OPENAI_API_KEY, OPENAI_BASE_URL, TAVILY_AVAILABLE
+from config import (
+    CHAT_MENTION_ENABLED,
+    CHAT_MODEL,
+    CONVERSATIONS_DB_PATH,
+    CONVERSATIONS_HISTORY_TURNS,
+    CONVERSATIONS_MAX_STORED,
+    CONVERSATIONS_MAX_TURNS,
+    CONVERSATIONS_TTL_SECONDS,
+    COOLDOWN_PER,
+    COOLDOWN_RATE,
+    DOCS_BASE_URL,
+    OPENAI_API_KEY,
+    OPENAI_BASE_URL,
+    TAVILY_AVAILABLE,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +92,6 @@ GENERAL_SYSTEM_PROMPT = (
     "- Responda perguntas gerais com base no seu conhecimento.\n"
     + (_WEB_SEARCH_INSTRUCTIONS if TAVILY_AVAILABLE else '') +
     "- Seja honesto quando não souber a resposta — não invente informações.\n"
-    "- Quando útil, termine com uma sugestão de acompanhamento na linha final, prefixada com '💡 '.\n"
     "</instructions>\n\n"
     "<response_format>\n"
     + _DISCORD_FORMAT +
@@ -93,8 +116,13 @@ class Commands(commands.Cog):
         except Exception:
             logger.exception("Failed to initialize OpenAI client for Commands cog")
             self.client = None
-        # TTL cache: max 200 conversations, each expires after 30 min
-        self._conversations: TTLCache = TTLCache(maxsize=200, ttl=1800)
+        # Persistent conversations with activity-based TTL (survive restarts)
+        self.store = ConversationStore(
+            CONVERSATIONS_DB_PATH,
+            kind='chat',
+            ttl_seconds=CONVERSATIONS_TTL_SECONDS,
+            max_stored=CONVERSATIONS_MAX_STORED,
+        )
         # Per-user follow-up cooldown (same period as slash commands)
         self._followup_cd: TTLCache = TTLCache(maxsize=500, ttl=COOLDOWN_PER)
         self._start_time: float = time.monotonic()
@@ -380,8 +408,8 @@ class Commands(commands.Cog):
                 source_info = '\n'.join(lines)
 
         # Conversation cache stats
-        conv_count = len(self._conversations)
-        conv_max = self._conversations.maxsize
+        conv_count = await self.store.count_active()
+        conv_max = self.store.max_stored
 
         # Build embed
         embed = discord.Embed(
@@ -488,7 +516,7 @@ class Commands(commands.Cog):
         )
 
         try:
-            answer, embeds = await self._run_chat(
+            answer, embeds, sources = await self._run_chat(
                 question,
                 image_url=image_url,
                 interaction=interaction,
@@ -508,11 +536,14 @@ class Commands(commands.Cog):
                 msg = await interaction.followup.send(
                     embed=embeds[0], view=PaginatedEmbedView(embeds), wait=True
                 )
-            self._conversations[msg.id] = {
-                'question': question,
-                'answer': answer,
-                'history': [],
-            }
+            await self._store_new_conversation(
+                msg, question, answer, sources,
+                user=interaction.user,
+                guild=interaction.guild,
+                channel=interaction.channel,
+                created_at=interaction.created_at,
+                images=[image_url] if image_url else [],
+            )
 
         except RateLimitError:
             try:
@@ -532,6 +563,52 @@ class Commands(commands.Cog):
                 'Ocorreu um erro ao processar sua pergunta. Tente novamente mais tarde.'
             )
 
+    async def _store_new_conversation(
+        self,
+        reply_msg: discord.Message,
+        question: str,
+        answer: str,
+        sources: list[dict],
+        *,
+        user,
+        guild,
+        channel,
+        created_at: datetime.datetime | None,
+        images: list[str] | None = None,
+        message_id: str | int | None = None,
+        reply_to: str | int | None = None,
+    ) -> None:
+        """Persist a brand-new conversation anchored on the bot's reply message."""
+        author = author_info(user)
+        ts = created_at.timestamp() if created_at else time.time()
+        turn = make_turn(
+            question, answer,
+            author=author, ts=ts,
+            message_id=message_id,
+            channel_id=getattr(channel, 'id', None),
+            channel_name=getattr(channel, 'name', None),
+            images=images,
+            sources=sources,
+            reply_to=reply_to,
+        )
+        origin = {
+            'channel_id': str(getattr(channel, 'id', '') or ''),
+            'channel_name': getattr(channel, 'name', '') or '',
+            'guild_id': str(getattr(guild, 'id', '') or ''),
+            'guild_name': getattr(guild, 'name', '') or '',
+        }
+        await self.store.create(
+            str(reply_msg.id),
+            guild_id=origin['guild_id'] or None,
+            channel_id=origin['channel_id'] or None,
+            data={
+                'turns': [turn],
+                'participants': [author] if author.get('id') else [],
+                'origin': origin,
+                'started_ts': ts,
+            },
+        )
+
     async def _run_chat(
         self,
         question: str,
@@ -543,7 +620,8 @@ class Commands(commands.Cog):
         guild: discord.Guild | None = None,
         channel: discord.abc.GuildChannel | discord.Thread | discord.DMChannel | None = None,
         created_at: datetime.datetime | None = None,
-    ) -> tuple[str, list[discord.Embed]]:
+        reply_to: str | None = None,
+    ) -> tuple[str, list[discord.Embed], list[dict]]:
         context_block = None
         if user or guild or channel:
             try:
@@ -553,25 +631,32 @@ class Commands(commands.Cog):
         system_content = GENERAL_SYSTEM_PROMPT
         if context_block:
             system_content = f"{GENERAL_SYSTEM_PROMPT}\n\n{context_block}"
+        history = history or []
+        if history:
+            replay = history[-CONVERSATIONS_HISTORY_TURNS:]
+            system_content += '\n\n' + build_conversation_block(
+                replay, current_author=author_info(user or (interaction.user if interaction else None))
+            )
         messages: list[dict] = [{'role': 'system', 'content': system_content}]
 
         if history:
-            for h in history[-16:]:
-                messages.append({'role': 'user', 'content': h['question']})
-                messages.append({'role': 'assistant', 'content': h['answer']})
+            messages.extend(
+                build_history_messages(history, max_turns=CONVERSATIONS_HISTORY_TURNS)
+            )
 
         urls: list[str] = []
         if image_urls:
             urls.extend([u for u in image_urls if u])
         elif image_url:
             urls.append(image_url)
-        if urls:
-            content_parts: list[dict] = [{'type': 'text', 'text': question}]
-            for url in urls[:4]:
-                content_parts.append({'type': 'image_url', 'image_url': {'url': url}})
-            messages.append({'role': 'user', 'content': content_parts})
-        else:
-            messages.append({'role': 'user', 'content': question})
+        messages.append(build_current_message(
+            question,
+            author=author_info(user or (interaction.user if interaction else None)),
+            ts=created_at.timestamp() if created_at else None,
+            image_urls=urls,
+            reply_to=reply_to,
+            in_conversation=bool(history),
+        ))
 
         base_tools = list(TAVILY_TOOLS) if TAVILY_AVAILABLE else []
         base_tools.extend([CHANNEL_HISTORY_TOOL, GUILD_INFO_TOOL, SEARCH_HISTORY_TOOL, GET_MESSAGE_CONTEXT_TOOL, GET_USER_STATS_TOOL, AGGREGATE_USER_TOPICS_TOOL, GET_USER_TIMELINE_TOOL, COUNT_MENTIONS_TOOL, GET_TEMPORAL_HEATMAP_TOOL])
@@ -750,30 +835,29 @@ class Commands(commands.Cog):
         )
 
         source_lines: list[str] = []
+        sources: list[dict] = []
         if all_sources:
             seen_src: set[str] = set()
             for s in all_sources:
                 url = s.get('url', '')
-                if url in seen_src:
+                if not url or url in seen_src:
                     continue
                 seen_src.add(url)
-                title = s.get('title', url)
+                title = (s.get('title') or url)[:100]
                 source_lines.append(f'• [{title}]({url})')
+                sources.append({'title': title, 'url': url})
 
         pages = split_response(answer)
         total = len(pages)
-        footer_base = "💬 Assistente geral • Miners' Refuge"
         embeds: list[discord.Embed] = []
         for i, page_text in enumerate(pages):
             e = discord.Embed(
-                title=f'💬 {question}' if i == 0 else '',
                 description=page_text,
                 color=discord.Color.teal(),
             )
             page_num = i + 1
-            e.set_footer(
-                text=f"Página {page_num}/{total} • {footer_base}" if total > 1 else footer_base
-            )
+            if total > 1:
+                e.set_footer(text=f"Página {page_num}/{total}")
             embeds.append(e)
 
         if source_lines:
@@ -782,11 +866,10 @@ class Commands(commands.Cog):
                     source_lines,
                     title='🌐 Fontes da Web',
                     color=discord.Color.teal(),
-                    footer_base=footer_base,
                 )
             )
 
-        return answer, embeds
+        return answer, embeds, sources
 
     async def cog_app_command_error(
         self, interaction: discord.Interaction, error: app_commands.AppCommandError
@@ -807,7 +890,7 @@ class Commands(commands.Cog):
         # --- 1) Reply-based follow-up (existing conversation) ---
         if message.reference and message.reference.message_id:
             ref_id = message.reference.message_id
-            conv = self._conversations.get(ref_id)
+            conv = await self.store.get_by_handle(ref_id)
             if conv:
                 user_id = message.author.id
                 if user_id in self._followup_cd:
@@ -818,6 +901,9 @@ class Commands(commands.Cog):
                     return
                 self._followup_cd[user_id] = True
                 follow_up_question = message.content.strip()
+                if self.bot.user:
+                    follow_up_question = re.sub(rf'<@!?{self.bot.user.id}>', '', follow_up_question)
+                    follow_up_question = re.sub(r'\s+', ' ', follow_up_question).strip()
                 if not follow_up_question and not message.attachments:
                     return
                 image_urls = [att.url for att in message.attachments if att.content_type and att.content_type.startswith('image/')]
@@ -825,9 +911,8 @@ class Commands(commands.Cog):
                     follow_up_question = 'Analise esta imagem.'
                 async with message.channel.typing():
                     try:
-                        history = conv.get('history', []).copy()
-                        history.append({'question': conv['question'], 'answer': conv['answer']})
-                        answer, embeds = await self._run_chat(
+                        history = conv['data'].get('turns', []).copy()
+                        answer, embeds, sources = await self._run_chat(
                             follow_up_question,
                             history=history,
                             image_urls=image_urls if image_urls else None,
@@ -835,6 +920,7 @@ class Commands(commands.Cog):
                             guild=message.guild,
                             channel=message.channel,
                             created_at=message.created_at,
+                            reply_to=str(ref_id),
                         )
                         if len(embeds) == 1:
                             reply = await message.reply(embed=embeds[0])
@@ -842,11 +928,23 @@ class Commands(commands.Cog):
                             reply = await message.reply(
                                 embed=embeds[0], view=PaginatedEmbedView(embeds)
                             )
-                        self._conversations[reply.id] = {
-                            'question': follow_up_question,
-                            'answer': answer,
-                            'history': history,
-                        }
+                        turn = make_turn(
+                            follow_up_question, answer,
+                            author=author_info(message.author),
+                            ts=message.created_at.timestamp(),
+                            message_id=message.id,
+                            channel_id=message.channel.id,
+                            channel_name=getattr(message.channel, 'name', None),
+                            images=image_urls,
+                            sources=sources,
+                            reply_to=ref_id,
+                        )
+                        data = conv['data']
+                        data['turns'] = cap_turns(history + [turn], CONVERSATIONS_MAX_TURNS)
+                        add_participant(data.setdefault('participants', []), author_info(message.author))
+                        await self.store.update(
+                            conv['conv_id'], data, new_handle_msg_id=reply.id,
+                        )
                     except RateLimitError:
                         await message.reply(
                             '⏳ Limite de requisições atingido. Tente novamente em alguns minutos.'
@@ -944,7 +1042,7 @@ class Commands(commands.Cog):
         logger.info("Processing @mention chat user=%s guild=%s question=%r ref=%s images=%d", message.author.id, message.guild.id if message.guild else None, clean_question[:80], bool(ref_context), len(all_image_urls))
         async with message.channel.typing():
             try:
-                answer, embeds = await self._run_chat(
+                answer, embeds, sources = await self._run_chat(
                     clean_question,
                     image_urls=all_image_urls if all_image_urls else None,
                     user=message.author,
@@ -956,11 +1054,15 @@ class Commands(commands.Cog):
                     reply = await message.reply(embed=embeds[0], mention_author=False)
                 else:
                     reply = await message.reply(embed=embeds[0], view=PaginatedEmbedView(embeds), mention_author=False)
-                self._conversations[reply.id] = {
-                    'question': clean_question,
-                    'answer': answer,
-                    'history': [],
-                }
+                await self._store_new_conversation(
+                    reply, clean_question, answer, sources,
+                    user=message.author,
+                    guild=message.guild,
+                    channel=message.channel,
+                    created_at=message.created_at,
+                    images=all_image_urls,
+                    message_id=message.id,
+                )
             except RateLimitError:
                 await message.reply('⏳ Limite de requisições atingido. Tente novamente em alguns minutos.', mention_author=False)
             except Exception:

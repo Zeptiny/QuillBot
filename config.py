@@ -61,6 +61,13 @@ HISTORY_RRF_K: Final[int] = int(os.getenv('HISTORY_RRF_K', '60'))
 # --- Chat Mention ---
 CHAT_MENTION_ENABLED: Final[bool] = os.getenv('CHAT_MENTION_ENABLED', 'true').strip().lower() in ('1', 'true', 'yes')
 
+# --- Conversations (multi-turn chat memory) ---
+CONVERSATIONS_DB_PATH: Final[str] = os.getenv('CONVERSATIONS_DB_PATH', 'data/conversations.db')
+CONVERSATIONS_TTL_SECONDS: Final[float] = float(os.getenv('CONVERSATIONS_TTL_SECONDS', '1800'))
+CONVERSATIONS_MAX_STORED: Final[int] = int(os.getenv('CONVERSATIONS_MAX_STORED', '200'))
+CONVERSATIONS_MAX_TURNS: Final[int] = int(os.getenv('CONVERSATIONS_MAX_TURNS', '24'))
+CONVERSATIONS_HISTORY_TURNS: Final[int] = int(os.getenv('CONVERSATIONS_HISTORY_TURNS', '16'))
+
 # --- History RAG (entire server) ---
 HISTORY_ENABLED: Final[bool] = os.getenv('HISTORY_ENABLED', 'true').strip().lower() in ('1', 'true', 'yes')
 HISTORY_VECTOR_STORE_DIR: Final[str] = os.getenv('HISTORY_VECTOR_STORE_DIR', 'data/history')
