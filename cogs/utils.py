@@ -614,7 +614,7 @@ def build_source_pages(
     source_lines: list[str],
     title: str,
     color: discord.Color,
-    footer_base: str,
+    footer_base: str = '',
     page_size: int = 4000,
 ) -> list[discord.Embed]:
     """Paginate *source_lines* into embeds using the description field (4096 limit).
@@ -652,10 +652,12 @@ def build_source_pages(
         )
         pages.append(e)
 
-    total = len(pages) + 0  # pages of sources only
     for i, e in enumerate(pages):
         src_idx = i + 1
-        e.set_footer(text=f"Fontes {src_idx}/{len(pages)} • {footer_base}")
+        footer = f"Fontes {src_idx}/{len(pages)}"
+        if footer_base:
+            footer = f"{footer} • {footer_base}"
+        e.set_footer(text=footer)
 
     return pages
 

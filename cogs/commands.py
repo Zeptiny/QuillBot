@@ -92,7 +92,6 @@ GENERAL_SYSTEM_PROMPT = (
     "- Responda perguntas gerais com base no seu conhecimento.\n"
     + (_WEB_SEARCH_INSTRUCTIONS if TAVILY_AVAILABLE else '') +
     "- Seja honesto quando não souber a resposta — não invente informações.\n"
-    "- Quando útil, termine com uma sugestão de acompanhamento na linha final, prefixada com '💡 '.\n"
     "</instructions>\n\n"
     "<response_format>\n"
     + _DISCORD_FORMAT +
@@ -850,18 +849,15 @@ class Commands(commands.Cog):
 
         pages = split_response(answer)
         total = len(pages)
-        footer_base = "💬 Assistente geral • Miners' Refuge"
         embeds: list[discord.Embed] = []
         for i, page_text in enumerate(pages):
             e = discord.Embed(
-                title=f'💬 {question}' if i == 0 else '',
                 description=page_text,
                 color=discord.Color.teal(),
             )
             page_num = i + 1
-            e.set_footer(
-                text=f"Página {page_num}/{total} • {footer_base}" if total > 1 else footer_base
-            )
+            if total > 1:
+                e.set_footer(text=f"Página {page_num}/{total}")
             embeds.append(e)
 
         if source_lines:
@@ -870,7 +866,6 @@ class Commands(commands.Cog):
                     source_lines,
                     title='🌐 Fontes da Web',
                     color=discord.Color.teal(),
-                    footer_base=footer_base,
                 )
             )
 
