@@ -463,6 +463,19 @@ async def fetch_message_context(
     return header + "\n".join(lines)
 
 
+def _usage_summary(response: Any) -> str:
+    """Format token usage info from a chat completion for log lines."""
+    usage = getattr(response, 'usage', None)
+    if usage is None:
+        return 'n/a'
+    parts = [f'prompt={usage.prompt_tokens}', f'completion={usage.completion_tokens}']
+    details = getattr(usage, 'completion_tokens_details', None)
+    reasoning = getattr(details, 'reasoning_tokens', None) if details is not None else None
+    if reasoning is not None:
+        parts.append(f'reasoning={reasoning}')
+    return ', '.join(parts)
+
+
 async def run_tool_loop(
     client: AsyncOpenAI,
     model: str,
@@ -509,8 +522,11 @@ async def run_tool_loop(
     """
     all_sources: list[dict] = []
     seen_keys: set[str] = set()
+    rounds_used = 0
+    finish_reasons: list[str] = []
 
-    for _ in range(max_rounds):
+    for round_num in range(1, max_rounds + 1):
+        rounds_used = round_num
         response = await client.chat.completions.create(
             model=model,
             messages=messages,
@@ -519,6 +535,18 @@ async def run_tool_loop(
         )
 
         choice = response.choices[0]
+        finish_reason = getattr(choice, 'finish_reason', None) or 'unknown'
+        finish_reasons.append(finish_reason)
+        logger.debug(
+            "Tool loop round %d/%d: model=%s finish_reason=%s tool_calls=%d content_chars=%d usage=[%s]",
+            round_num,
+            max_rounds,
+            model,
+            finish_reason,
+            len(choice.message.tool_calls or []),
+            len(choice.message.content or ''),
+            _usage_summary(response),
+        )
 
         if not choice.message.tool_calls:
             break
@@ -529,6 +557,12 @@ async def run_tool_loop(
             try:
                 args = json.loads(tc.function.arguments)
             except (json.JSONDecodeError, TypeError):
+                logger.warning(
+                    "Malformed tool call arguments (model=%s finish_reason=%s): %r",
+                    model,
+                    finish_reason,
+                    (tc.function.arguments or '')[:200],
+                )
                 args = {}
 
             if interaction is not None and status_label is not None:
@@ -573,13 +607,31 @@ async def run_tool_loop(
                 'content': truncate_safe(result_text, limit=6000),
             })
     else:
+        logger.info(
+            "Tool loop exhausted max_rounds=%d without a final answer (finish_reasons=%s); "
+            "forcing one completion without tools",
+            max_rounds,
+            finish_reasons,
+        )
         response = await client.chat.completions.create(
             model=model,
             messages=messages,
             max_tokens=2048,
         )
 
-    answer = response.choices[0].message.content or 'Não foi possível gerar uma resposta.'
+    final_choice = response.choices[0]
+    answer = final_choice.message.content or ''
+    if not answer.strip():
+        logger.warning(
+            "LLM returned an empty answer (user got the fallback message): "
+            "model=%s rounds=%d final_finish_reason=%s finish_reasons=%s usage=[%s]",
+            model,
+            rounds_used,
+            getattr(final_choice, 'finish_reason', None),
+            finish_reasons,
+            _usage_summary(response),
+        )
+        answer = 'Não foi possível gerar uma resposta.'
     return answer, all_sources
 
 
