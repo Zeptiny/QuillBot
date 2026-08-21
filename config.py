@@ -82,6 +82,12 @@ HISTORY_INGEST_FLUSH_SECONDS: Final[float] = float(os.getenv('HISTORY_INGEST_FLU
 HISTORY_SNAPSHOT_INTERVAL: Final[float] = float(os.getenv('HISTORY_SNAPSHOT_INTERVAL', '300'))
 HISTORY_QUERY_CACHE_SIZE: Final[int] = int(os.getenv('HISTORY_QUERY_CACHE_SIZE', '200'))
 
+# --- Lore Encyclopedia (server history, inside jokes, glossary) ---
+LORE_ENABLED: Final[bool] = os.getenv('LORE_ENABLED', 'true').strip().lower() in ('1', 'true', 'yes')
+LORE_DB_PATH: Final[str] = os.getenv('LORE_DB_PATH', 'data/lore.db')
+LORE_LOG_CHANNEL_ID: Final[int | None] = int(v) if (v := os.getenv('LORE_LOG_CHANNEL_ID', '').strip()) else None
+LORE_BOT_WRITE_LIMIT: Final[int] = int(os.getenv('LORE_BOT_WRITE_LIMIT', '10'))
+
 # --- Rate Limiting (per-user) ---
 COOLDOWN_RATE: Final[int] = int(os.getenv('COOLDOWN_RATE', '1'))
 COOLDOWN_PER: Final[float] = float(os.getenv('COOLDOWN_PER', '30'))

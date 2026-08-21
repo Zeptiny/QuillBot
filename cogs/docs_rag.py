@@ -25,6 +25,7 @@ from cogs.conversation_store import (
     cap_turns as _cap_turns,
     make_turn as _make_turn,
 )
+from cogs.lore import SAVE_LORE_TOOL, SEARCH_LORE_TOOL
 from cogs.plugin_apis import HTTP_HEADERS as _HTTP_HEADERS
 from cogs.plugin_apis import search_all as _search_plugins_all
 from cogs.spark_parser import (
@@ -66,6 +67,7 @@ from config import (
     GITHUB_API,
     LOCAL_EMBEDDING_DEVICE,
     LOCAL_EMBEDDING_MODEL,
+    LORE_ENABLED,
     OPENAI_API_KEY,
     OPENAI_BASE_URL,
     OPENROUTER_API_KEY,
@@ -79,6 +81,15 @@ from config import (
 logger = logging.getLogger(__name__)
 
 MAX_TOOL_ROUNDS = 6  # Safety cap on tool-calling iterations
+
+_LORE_INSTRUCTIONS = (
+    "- Para perguntas sobre a história do servidor, pessoas, piadas internas, glossário da "
+    "comunidade ou marcos, use `search_lore` antes de `search_history` — o lore é a fonte "
+    "curada e canônica do passado do servidor.\n"
+    "- Ao descobrir, com base no histórico, um fato do servidor digno de memória (evento, "
+    "piada interna, termo do glossário, marco, pessoa marcante), salve com `save_lore` "
+    "incluindo `sources` com os links das mensagens que o comprovam.\n"
+) if LORE_ENABLED else ""
 
 _DISCORD_FORMAT_GUIDE = (
     "A resposta será exibida no Discord (embed description) — use APENAS sintaxe que o Discord renderiza:\n"
@@ -100,6 +111,7 @@ SYSTEM_PROMPT = (
     "<instructions>\n"
     "- Para qualquer pergunta técnica sobre configuração, administração ou otimização de "
     "servidores Minecraft, chame `search_docs` imediatamente.\n"
+    + _LORE_INSTRUCTIONS +
     "- Baseie cada resposta nos dados retornados pelas ferramentas, não em conhecimento de treinamento.\n"
     "- Se a pergunta for vaga ou ambígua, peça esclarecimentos — omita chamadas de ferramentas.\n"
     "- Cite valores e trechos de configuração exatamente como retornados pelas ferramentas. "
@@ -274,6 +286,10 @@ TOOLS = [
             },
         },
     },
+]
+if LORE_ENABLED:
+    TOOLS.extend([SEARCH_LORE_TOOL, SAVE_LORE_TOOL])
+TOOLS.extend([
     _CHANNEL_HISTORY_TOOL,
     _GUILD_INFO_TOOL,
     _SEARCH_HISTORY_TOOL,
@@ -283,7 +299,7 @@ TOOLS = [
     _GET_USER_TIMELINE_TOOL,
     _COUNT_MENTIONS_TOOL,
     _GET_TEMPORAL_HEATMAP_TOOL,
-]
+])
 
 # Additional tools injected only when a Spark report is active in the session.
 _SPARK_SECTIONS_STR = ', '.join(f'"{s}"' for s in _SPARK_SECTIONS)
@@ -1057,8 +1073,21 @@ class DocsRAG(commands.Cog):
         bot: discord.Client | None = None,
         channel: discord.abc.Messageable | None = None,
         guild: discord.Guild | None = None,
+        user: discord.abc.User | discord.Member | None = None,
     ) -> tuple[str, list[dict]]:
         """Execute a tool call and return (result_text, source_chunks)."""
+        if name == 'search_lore' or name == 'save_lore':
+            lore_cog = self.bot.get_cog('Lore')
+            if not lore_cog:
+                return 'Enciclopédia de lore não disponível.', []
+            if not guild:
+                return 'Lore requer estar em um servidor.', []
+            actor_name = f'bot (via {user.display_name})' if user is not None else 'bot'
+            return await lore_cog.exec_tool(
+                name, args, guild=guild, actor_name=actor_name,
+                requester=user, channel=channel,
+            )
+
         if name == 'search_docs':
             query = args.get('query', '')
             top_k = max(1, min(12, int(args.get('max_results', 5))))
@@ -1289,6 +1318,10 @@ class DocsRAG(commands.Cog):
             return f'📅 Heatmap: *{args.get("query","")[:30]}*'
         if tool_name == 'get_message_context':
             return f'🧩 Contexto da mensagem {args.get("message_id","")}…'
+        if tool_name == 'search_lore':
+            return f"📖 Consultando lore: *{args.get('query', '')[:40]}*"
+        if tool_name == 'save_lore':
+            return f"📖 Atualizando lore: *{args.get('term', '')[:40]}*"
         if tool_name == 'get_spark_detail':
             section = args.get('section', '')
             section_names = {
@@ -1440,7 +1473,7 @@ class DocsRAG(commands.Cog):
         active_tools = TOOLS + SPARK_TOOLS if spark_report is not None else TOOLS
 
         exec_tool = (
-            lambda name, args: self._exec_tool(name, args, spark_report=spark_report, bot=self.bot, channel=channel, guild=guild)
+            lambda name, args: self._exec_tool(name, args, spark_report=spark_report, bot=self.bot, channel=channel, guild=guild, user=user)
         )
 
         answer, all_sources = await run_tool_loop(
