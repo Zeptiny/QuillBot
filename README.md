@@ -32,6 +32,7 @@ Built with [discord.py](https://discordpy.readthedocs.io/) + RAG (Retrieval-Augm
 | **Spark Profiler** | Full report parsing, bottleneck diagnosis, platform-aware recommendations |
 | **Plugin Search** | Concurrent search across Modrinth, Hangar, SpigotMC |
 | **Server Tools** | JVM flags, server status checks, docs changelog |
+| **Lore Encyclopedia** | Bot-curated server memory: history, inside jokes, glossary, milestones — with full admin control (revert/lock/approve) and an append-only audit log |
 
 All AI responses are in **Brazilian Portuguese** and formatted for Discord embeds.
 
@@ -42,10 +43,10 @@ All AI responses are in **Brazilian Portuguese** and formatted for Discord embed
 ### AI-Powered Commands
 
 #### `/ask <question> [image]`
-Ask any Minecraft server administration question. Uses an agentic RAG loop — the LLM automatically calls `search_docs`, `search_plugins`, `search_history`, and context tools to ground its answer in real documentation.
+Ask any Minecraft server administration question. Uses an agentic RAG loop — the LLM automatically calls `search_docs`, `search_plugins`, `search_lore`, `search_history`, and context tools to ground its answer in real documentation.
 
 - **Model:** `CHAT_MODEL` (default: `qwen/qwen3.6-plus`)
-- **Tools available:** `search_docs`, `search_plugins`, `get_channel_history`, `get_guild_info`, `search_history`, `get_message_context`
+- **Tools available:** `search_docs`, `search_plugins`, `search_lore`, `save_lore`, `get_channel_history`, `get_guild_info`, `search_history`, `get_message_context`
 - **Features:** Image/screenshot analysis, 5-minute ephemeral prompt+report cache, paginated multi-embed output with source links, reply to continue conversation (30 min TTL, 200 conversations), cooldown per user
 - **Follow-up:** Reply to the bot's response to continue the conversation with full history
 
@@ -85,6 +86,32 @@ Re-index documentation vectors.
 - With `source`: reindex a single source by label (e.g. `PaperMC`)
 - Shows `⏳ Indexando...` guard — blocks `/ask`/`/docs` queries during indexing
 - Per-source commit SHA tracking for granular updates
+
+#### `/lore <subcommand>` — Server Lore Encyclopedia
+Structured community memory: server history, events, inside jokes, glossary terms, milestones, and notable people. The bot manages it autonomously via `search_lore` / `save_lore` tools in `/ask`, `/chat` and @mention flows; admins retain full control.
+
+| Subcommand | Who | Description |
+|---|---|---|
+| `/lore list [category]` | everyone | Paginated list of entries (pending entries admin-only) |
+| `/lore show <term>` | everyone | Entry details + sources; admins also see history IDs |
+| `/lore add` | Admin | Create an entry manually |
+| `/lore edit <term>` | Admin | Edit content / aliases / category |
+| `/lore delete <term>` | Admin | Archive (always reversible — no hard deletes) |
+| `/lore restore <id>` | Admin | Restore any version by history ID |
+| `/lore approve <term>` | Admin | Approve a pending `person` entry (works without the log channel) |
+| `/lore lock` / `/lore unlock <term>` | Admin | Toggle `curated` protection — bot can read but never write |
+| `/lore export` | Admin | Full JSON export |
+
+**How it works:**
+- **Single mutation path** — every write (bot or admin) funnels through `LoreStore`, which applies the change and records the before/after snapshot into `lore_history` in one SQLite transaction (partial failures roll back)
+- **Provenance required** — `save_lore` refuses create/update writes without `sources` shaped as guild-scoped `discord.com/channels/...` jump URLs; sources accumulate per entry
+- **Pending guard** — bot-created `person` entries stay `pending` (hidden from search) until an admin approves via log-channel button or `/lore approve`
+- **Transparency channel** — with `LORE_LOG_CHANNEL_ID` set, every mutation posts an embed with actor, reason, sources, and **↩️ Reverter / 🔒 Proteger / ✅ Aprovar** buttons (admin-only, same guild)
+- **Silent reads** — `search_lore` returns no source pages (responses stay clean); hits are console-logged (`[lore] hit: …`)
+- **Alias-first matching** — exact term > alias > substring (min length 3) > embedding fallback (reuses DocsRAG/HistoryRAG embedding clients; deferred until lexical hits miss)
+- **Rate guard** — bot writes capped at `LORE_BOT_WRITE_LIMIT`/hour per guild (rejected calls don't consume quota)
+- **Tool errors degrade gracefully** — lore failures return error strings to the LLM instead of aborting `/ask`//`/chat`
+- Set `LORE_ENABLED=false` to remove the tools and prompt guidance entirely
 
 ---
 
@@ -170,7 +197,8 @@ while tool_calls and rounds < MAX_TOOL_ROUNDS:
   → display status label on deferred interaction
   → execute each tool (deduplicate sources via dedup_key)
   → append tool results (truncated to 6000 chars)
-→ final answer (max_tokens=2048)
+→ final answer (max_tokens=`LLM_MAX_TOKENS`, default 8192)
+→ if the answer comes back empty (e.g. a reasoning model spent the whole token budget thinking): one retry without tools + conciseness nudge, then fallback message
 → paginated embeds + source pages
 ```
 
@@ -224,6 +252,7 @@ QuillBot/
 │   ├── docs_rag.py       # RAG pipeline — indexing, search, reranking, /ask, /reindex, agentic loop + Spark diagnosis
 │   ├── history_rag.py    # Server-wide history RAG — backfill, live ingestion, per-guild vector stores
 │   ├── log_analyzer.py   # Passive log detection, pattern matching, /analyze, file upload to mclo.gs
+│   ├── lore.py           # Lore encyclopedia — bot-managed entries, admin commands, audit history, log channel
 │   ├── plugins.py        # /plugin, /status, /changelog — plugin search & server status
 │   ├── spark.py          # /spark command + passive spark.lucko.me detection
 │   ├── spark_parser.py   # Spark JSON parsing, summary/detail builders, call-tree rendering
@@ -234,6 +263,7 @@ QuillBot/
 │   └── errors.py         # 25 compiled Minecraft error regex patterns + pt-BR responses
 └── data/
     ├── vectors.json/.npy # Docs RAG vector store
+    ├── lore.db           # Lore encyclopedia (entries + history)
     └── history/          # Per-guild history stores
 ```
 
@@ -278,6 +308,7 @@ cp .env.example .env   # if available, otherwise create .env manually
 |---|---|---|
 | `OPENAI_BASE_URL` | `https://openrouter.ai/api/v1` | OpenAI-compatible endpoint. Aliases: `LLM_BASE_URL`, `OPENROUTER_BASE_URL` |
 | `CHAT_MODEL` | `qwen/qwen3.6-plus` | Used for `/ask`, `/chat`, `/analyze` |
+| `LLM_MAX_TOKENS` | `8192` | Max completion tokens for the tool loop. Reasoning models count thinking tokens against this |
 | `SPARK_MODEL` | `google/gemini-2.5-pro` | Used only during active Spark sessions |
 | `EMBEDDING_MODEL` | `qwen/qwen3-embedding-8b` | Doc/history embedding model |
 | `RERANK_MODEL` | `cohere/rerank-4-fast` | Reranking model |
@@ -294,6 +325,7 @@ cp .env.example .env   # if available, otherwise create .env manually
 | `TAVILY_API_KEY` | — | Required when web search is enabled |
 | `CHAT_MENTION_ENABLED` | `true` | Enable @mention chat mode |
 | `HISTORY_ENABLED` | `true` | Enable server history RAG |
+| `LORE_ENABLED` | `true` | Enable the lore encyclopedia |
 | `LOG_LEVEL` | `INFO` | Python logging level |
 
 ### History RAG
@@ -305,6 +337,15 @@ cp .env.example .env   # if available, otherwise create .env manually
 | `HISTORY_BACKFILL_LIMIT` | _(none)_ | Max messages to backfill per channel (unset = all) |
 | `HISTORY_MAX_MSG_LENGTH` | `800` | Max chars per message in history chunks |
 | `HISTORY_EXCLUDE_BOTS` | `true` | Exclude bot messages from history |
+
+### Lore Encyclopedia
+
+| Variable | Default | Description |
+|---|---|---|
+| `LORE_ENABLED` | `true` | Enable the lore cog (cog is not loaded when false) |
+| `LORE_DB_PATH` | `data/lore.db` | SQLite path for entries + history |
+| `LORE_LOG_CHANNEL_ID` | _(none)_ | Channel ID for mutation log embeds (Revert/Lock/Approve buttons). Unset = console logging only |
+| `LORE_BOT_WRITE_LIMIT` | `10` | Max bot (`save_lore`) writes per hour per guild |
 
 ### Docs / RAG Indexing
 
@@ -343,7 +384,7 @@ python main.py
 On startup the bot:
 
 1. Validates `BOT_TOKEN` (exits if missing; warns if `TAVILY_API_KEY` missing while web search is enabled)
-2. Loads cogs in order: `log_analyzer` → `history_rag` → `commands` → `plugins` → `spark` → `docs_rag`
+2. Loads cogs in order: `log_analyzer` → `history_rag` → `commands` → `plugins` → `spark` → `docs_rag` → `lore`
 3. Loads cached vectors from disk or indexes all doc sources
 4. Starts periodic reindex loop + background history backfill
 5. Syncs slash commands with Discord

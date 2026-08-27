@@ -28,6 +28,9 @@ OPENAI_BASE_URL: Final[str] = (
 # Aliases for code that still imports the old names
 LLM_API_KEY: Final[str | None] = OPENAI_API_KEY
 LLM_BASE_URL: Final[str] = OPENAI_BASE_URL
+# Reasoning models (GLM, Qwen3, etc.) count hidden reasoning tokens against
+# max_tokens; keep this high enough that thinking + answer both fit.
+LLM_MAX_TOKENS: Final[int] = int(os.getenv('LLM_MAX_TOKENS', '8192'))
 
 # --- AI Models ---
 CHAT_MODEL: Final[str] = os.getenv('CHAT_MODEL', 'qwen/qwen3.6-plus')
@@ -81,6 +84,12 @@ HISTORY_INGEST_BATCH_SIZE: Final[int] = int(os.getenv('HISTORY_INGEST_BATCH_SIZE
 HISTORY_INGEST_FLUSH_SECONDS: Final[float] = float(os.getenv('HISTORY_INGEST_FLUSH_SECONDS', '2.0'))
 HISTORY_SNAPSHOT_INTERVAL: Final[float] = float(os.getenv('HISTORY_SNAPSHOT_INTERVAL', '300'))
 HISTORY_QUERY_CACHE_SIZE: Final[int] = int(os.getenv('HISTORY_QUERY_CACHE_SIZE', '200'))
+
+# --- Lore Encyclopedia (server history, inside jokes, glossary) ---
+LORE_ENABLED: Final[bool] = os.getenv('LORE_ENABLED', 'true').strip().lower() in ('1', 'true', 'yes')
+LORE_DB_PATH: Final[str] = os.getenv('LORE_DB_PATH', 'data/lore.db')
+LORE_LOG_CHANNEL_ID: Final[int | None] = int(v) if (v := os.getenv('LORE_LOG_CHANNEL_ID', '').strip()) else None
+LORE_BOT_WRITE_LIMIT: Final[int] = int(os.getenv('LORE_BOT_WRITE_LIMIT', '10'))
 
 # --- Rate Limiting (per-user) ---
 COOLDOWN_RATE: Final[int] = int(os.getenv('COOLDOWN_RATE', '1'))

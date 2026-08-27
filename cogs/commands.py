@@ -20,6 +20,7 @@ from cogs.conversation_store import (
     cap_turns,
     make_turn,
 )
+from cogs.lore import SAVE_LORE_TOOL, SEARCH_LORE_TOOL
 from cogs.tavily_tools import TOOLS as TAVILY_TOOLS
 from cogs.tavily_tools import exec_tool as tavily_exec_tool
 from cogs.tavily_tools import status_label as tavily_status_label
@@ -56,12 +57,20 @@ from config import (
     COOLDOWN_PER,
     COOLDOWN_RATE,
     DOCS_BASE_URL,
+    LORE_ENABLED,
     OPENAI_API_KEY,
     OPENAI_BASE_URL,
     TAVILY_AVAILABLE,
 )
 
 logger = logging.getLogger(__name__)
+
+_LORE_INSTRUCTIONS = (
+    "- Perguntas sobre a história, pessoas, piadas internas, glossário ou marcos do "
+    "servidor: use `search_lore` (enciclopédia curada) antes de `search_history`. "
+    "Fatos dignos de memória comprovados no histórico podem ser salvos com `save_lore` "
+    "(sempre inclua `sources` com os links das mensagens).\n"
+) if LORE_ENABLED else ""
 
 _WEB_SEARCH_INSTRUCTIONS = (
     "- Para informações em tempo real ou recentes, use as ferramentas de busca web.\n"
@@ -90,6 +99,7 @@ GENERAL_SYSTEM_PROMPT = (
     "</role>\n\n"
     "<instructions>\n"
     "- Responda perguntas gerais com base no seu conhecimento.\n"
+    + _LORE_INSTRUCTIONS
     + (_WEB_SEARCH_INSTRUCTIONS if TAVILY_AVAILABLE else '') +
     "- Seja honesto quando não souber a resposta — não invente informações.\n"
     "</instructions>\n\n"
@@ -660,6 +670,8 @@ class Commands(commands.Cog):
 
         base_tools = list(TAVILY_TOOLS) if TAVILY_AVAILABLE else []
         base_tools.extend([CHANNEL_HISTORY_TOOL, GUILD_INFO_TOOL, SEARCH_HISTORY_TOOL, GET_MESSAGE_CONTEXT_TOOL, GET_USER_STATS_TOOL, AGGREGATE_USER_TOPICS_TOOL, GET_USER_TIMELINE_TOOL, COUNT_MENTIONS_TOOL, GET_TEMPORAL_HEATMAP_TOOL])
+        if LORE_ENABLED:
+            base_tools.extend([SEARCH_LORE_TOOL, SAVE_LORE_TOOL])
         active_tools = base_tools if base_tools else None
         fallback_channel = channel or (interaction.channel if interaction else None)
         fallback_guild = guild or (interaction.guild if interaction else None)
@@ -667,6 +679,18 @@ class Commands(commands.Cog):
         async def _exec(name: str, args: dict) -> tuple[str, list[dict]]:
             if name in ('web_search', 'web_extract'):
                 return await tavily_exec_tool(name, args)
+            if name in ('search_lore', 'save_lore'):
+                lore_cog = self.bot.get_cog('Lore')
+                if not lore_cog:
+                    return 'Enciclopédia de lore não disponível.', []
+                g = fallback_guild
+                if not g:
+                    return 'Lore requer estar em um servidor.', []
+                actor_name = f'bot (via {user.display_name})' if user is not None else 'bot'
+                return await lore_cog.exec_tool(
+                    name, args, guild=g, actor_name=actor_name,
+                    requester=user, channel=channel,
+                )
             if name == 'get_channel_history':
                 text = await fetch_channel_history(self.bot, fallback_channel, limit=args.get('limit', 20), channel_id=args.get('channel_id'))
                 return text, []
@@ -799,6 +823,10 @@ class Commands(commands.Cog):
         def _status(name: str, args: dict) -> str:
             if name in ('web_search', 'web_extract'):
                 return tavily_status_label(name, args)
+            if name == 'search_lore':
+                return f"📖 Consultando lore: *{args.get('query', '')[:40]}*"
+            if name == 'save_lore':
+                return f"📖 Atualizando lore: *{args.get('term', '')[:40]}*"
             if name == 'get_channel_history':
                 lim = args.get('limit', 20)
                 cid = args.get('channel_id')
