@@ -197,7 +197,8 @@ while tool_calls and rounds < MAX_TOOL_ROUNDS:
   → display status label on deferred interaction
   → execute each tool (deduplicate sources via dedup_key)
   → append tool results (truncated to 6000 chars)
-→ final answer (max_tokens=2048)
+→ final answer (max_tokens=`LLM_MAX_TOKENS`, default 8192)
+→ if the answer comes back empty (e.g. a reasoning model spent the whole token budget thinking): one retry without tools + conciseness nudge, then fallback message
 → paginated embeds + source pages
 ```
 
@@ -307,6 +308,7 @@ cp .env.example .env   # if available, otherwise create .env manually
 |---|---|---|
 | `OPENAI_BASE_URL` | `https://openrouter.ai/api/v1` | OpenAI-compatible endpoint. Aliases: `LLM_BASE_URL`, `OPENROUTER_BASE_URL` |
 | `CHAT_MODEL` | `qwen/qwen3.6-plus` | Used for `/ask`, `/chat`, `/analyze` |
+| `LLM_MAX_TOKENS` | `8192` | Max completion tokens for the tool loop. Reasoning models count thinking tokens against this |
 | `SPARK_MODEL` | `google/gemini-2.5-pro` | Used only during active Spark sessions |
 | `EMBEDDING_MODEL` | `qwen/qwen3-embedding-8b` | Doc/history embedding model |
 | `RERANK_MODEL` | `cohere/rerank-4-fast` | Reranking model |

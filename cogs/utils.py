@@ -10,6 +10,8 @@ from zoneinfo import ZoneInfo
 import discord
 from openai import AsyncOpenAI
 
+from config import LLM_MAX_TOKENS
+
 logger = logging.getLogger(__name__)
 
 BR_TZ = ZoneInfo("America/Sao_Paulo")
@@ -530,7 +532,7 @@ async def run_tool_loop(
         response = await client.chat.completions.create(
             model=model,
             messages=messages,
-            max_tokens=2048,
+            max_tokens=LLM_MAX_TOKENS,
             tools=tools,
         )
 
@@ -616,11 +618,32 @@ async def run_tool_loop(
         response = await client.chat.completions.create(
             model=model,
             messages=messages,
-            max_tokens=2048,
+            max_tokens=LLM_MAX_TOKENS,
         )
 
     final_choice = response.choices[0]
     answer = final_choice.message.content or ''
+    if not answer.strip():
+        logger.warning(
+            "LLM returned an empty answer (finish_reason=%s usage=[%s]); "
+            "retrying once without tools and with a conciseness nudge",
+            getattr(final_choice, 'finish_reason', None),
+            _usage_summary(response),
+        )
+        retry_messages = [*messages, {
+            'role': 'user',
+            'content': (
+                'Responda agora, em português, de forma direta e concisa, sem '
+                'usar nenhuma ferramenta. Use apenas as informações já coletadas.'
+            ),
+        }]
+        response = await client.chat.completions.create(
+            model=model,
+            messages=retry_messages,
+            max_tokens=LLM_MAX_TOKENS,
+        )
+        final_choice = response.choices[0]
+        answer = final_choice.message.content or ''
     if not answer.strip():
         logger.warning(
             "LLM returned an empty answer (user got the fallback message): "

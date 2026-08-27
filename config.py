@@ -28,6 +28,9 @@ OPENAI_BASE_URL: Final[str] = (
 # Aliases for code that still imports the old names
 LLM_API_KEY: Final[str | None] = OPENAI_API_KEY
 LLM_BASE_URL: Final[str] = OPENAI_BASE_URL
+# Reasoning models (GLM, Qwen3, etc.) count hidden reasoning tokens against
+# max_tokens; keep this high enough that thinking + answer both fit.
+LLM_MAX_TOKENS: Final[int] = int(os.getenv('LLM_MAX_TOKENS', '8192'))
 
 # --- AI Models ---
 CHAT_MODEL: Final[str] = os.getenv('CHAT_MODEL', 'qwen/qwen3.6-plus')
