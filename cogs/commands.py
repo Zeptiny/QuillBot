@@ -658,21 +658,23 @@ class Commands(commands.Cog):
         context_message: discord.Message | None = None,
         prior_context: list[str] | None = None,
     ) -> tuple[str, list[discord.Embed], list[dict]]:
-        context_block = None
-        if user or guild or channel:
-            try:
-                context_block = build_full_context_block(user or (interaction.user if interaction else None), guild or (interaction.guild if interaction else None), channel or (interaction.channel if interaction else None), created_at or (interaction.created_at if interaction else None))
-            except Exception:
-                logger.exception("Failed to build context block")
+        # Message layout is ordered for provider prefix caching: the system
+        # prompt and replayed history stay byte-identical across follow-ups of
+        # a conversation, while per-request blocks (clock/context, memory
+        # selection, recent channel window) ride on the final user message.
         system_content = GENERAL_SYSTEM_PROMPT
-        if context_block:
-            system_content = f"{GENERAL_SYSTEM_PROMPT}\n\n{context_block}"
         history = history or []
         if history:
             replay = history[-CONVERSATIONS_HISTORY_TURNS:]
-            system_content += '\n\n' + build_conversation_block(
-                replay, current_author=author_info(user or (interaction.user if interaction else None))
-            )
+            system_content += '\n\n' + build_conversation_block(replay)
+        context_blocks: list[str] = []
+        if user or guild or channel:
+            try:
+                context_block = build_full_context_block(user or (interaction.user if interaction else None), guild or (interaction.guild if interaction else None), channel or (interaction.channel if interaction else None), created_at or (interaction.created_at if interaction else None))
+                if context_block:
+                    context_blocks.append(context_block)
+            except Exception:
+                logger.exception("Failed to build context block")
         if MEMORY_ENABLED:
             mem_cog = self.bot.get_cog('Memory')
             if mem_cog is not None and (guild or (interaction.guild if interaction else None)):
@@ -683,7 +685,7 @@ class Commands(commands.Cog):
                         participant_ids=participant_ids,
                     )
                     if mem_block:
-                        system_content += f'\n\n{mem_block}'
+                        context_blocks.append(mem_block)
                 except Exception:
                     logger.exception('Failed to build memory block')
         if CHANNEL_CONTEXT_MESSAGES > 0 and not prior_context and not any(t.get('prior_context') for t in (history or [])):
@@ -694,7 +696,7 @@ class Commands(commands.Cog):
                     before=context_message,
                 )
                 if chan_ctx:
-                    system_content += f'\n\n{chan_ctx}'
+                    context_blocks.append(chan_ctx)
             except Exception:
                 logger.exception('Failed to build recent channel context')
         messages: list[dict] = [{'role': 'system', 'content': system_content}]
@@ -718,6 +720,7 @@ class Commands(commands.Cog):
             in_conversation=bool(history),
             prior_context=prior_context,
             channel_id=getattr(channel, 'id', None),
+            context_blocks='\n\n'.join(context_blocks) or None,
         ))
 
         base_tools = list(TAVILY_TOOLS) if TAVILY_AVAILABLE else []

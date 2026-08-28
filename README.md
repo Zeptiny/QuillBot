@@ -215,6 +215,9 @@ Every AI call receives a `<contexto>` block with user (display name, account age
 
 When `CHANNEL_CONTEXT_MESSAGES` > 0 (default `10`), `/ask`, `/chat`, @mention and reply follow-ups also receive a `<mensagens_recentes_do_canal>` block — the latest N channel messages in chronological order, same format as the `get_channel_history` tool. The triggering message is excluded; set `0` to disable. Reply follow-ups use the captured gap block (`prior_context`, see `CONVERSATIONS_GAP_MESSAGES`) instead of this recent-channel window whenever a gap was captured.
 
+### Prefix-Cache-Friendly Message Layout
+The LLM message list is ordered so conversation follow-ups reuse a cached prefix: `[system (persona + static conversation summary)] → [replayed history turns] → [current message]`. All per-request blocks — `<contexto>` (clock), the semantically-selected memory block, and the recent channel window — ride on the **final user message** instead of the system prompt, so the system prompt + history stay byte-identical across turns and providers can prefix-cache them (typically 80–95% input-token savings on cached prefixes).
+
 ---
 
 ## Documentation Sources

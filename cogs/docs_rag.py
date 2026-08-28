@@ -1266,11 +1266,16 @@ class DocsRAG(commands.Cog):
         history = history or []
         if history:
             system_content += '\n\n' + _build_conversation_block(
-                history[-CONVERSATIONS_HISTORY_TURNS:],
-                current_author=_author_info(user or (interaction.user if interaction else None)),
+                history[-CONVERSATIONS_HISTORY_TURNS:]
             )
 
         # Inject persistent memory (pinned + semantically selected) ----------------
+        # Memory selection and the recent channel window are per-request, so
+        # they ride on the final user message (with the clock-bearing context
+        # block) instead of the system prompt. This keeps the system prompt and
+        # replayed history byte-identical across follow-ups, making provider
+        # prefix caching effective.
+        context_blocks: list[str] = []
         if MEMORY_ENABLED and guild is not None:
             mem_cog = self.bot.get_cog('Memory')
             if mem_cog is not None:
@@ -1281,7 +1286,7 @@ class DocsRAG(commands.Cog):
                         participant_ids=participant_ids,
                     )
                     if mem_block:
-                        system_content += f'\n\n{mem_block}'
+                        context_blocks.append(mem_block)
                 except Exception:
                     logger.exception('Failed to build memory block for _run_agent')
 
@@ -1293,7 +1298,7 @@ class DocsRAG(commands.Cog):
                     self.bot, channel, before=context_message,
                 )
                 if chan_ctx:
-                    system_content += f'\n\n{chan_ctx}'
+                    context_blocks.append(chan_ctx)
             except Exception:
                 logger.exception('Failed to build recent channel context for _run_agent')
 
@@ -1315,10 +1320,14 @@ class DocsRAG(commands.Cog):
         ]
 
         # Inject user/guild/channel/temporal awareness ---------------------------
+        # This block carries the current clock, so it rides on the final user
+        # message (context_blocks) instead of a message before the history —
+        # placing it before the history would defeat prefix caching.
         if user or guild or channel or created_at:
             try:
                 ctx_block = _build_full_context_block(user, guild, channel, created_at)
-                messages.append({'role': 'user', 'content': ctx_block})
+                if ctx_block:
+                    context_blocks.insert(0, ctx_block)
             except Exception:
                 logger.exception("Failed to build context block for _run_agent")
 
@@ -1370,6 +1379,7 @@ class DocsRAG(commands.Cog):
             in_conversation=bool(history),
             prior_context=prior_context,
             channel_id=getattr(channel, 'id', None),
+            context_blocks='\n\n'.join(context_blocks) or None,
         ))
 
         # Choose model and tool set based on session type ------------------------

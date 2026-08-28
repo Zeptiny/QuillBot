@@ -237,11 +237,20 @@ def build_current_message(
     in_conversation: bool = False,
     prior_context: list[str] | None = None,
     channel_id: str | int | None = None,
+    context_blocks: str | None = None,
 ) -> dict:
-    """Build the current user message, attributed when part of a conversation."""
+    """Build the current user message, attributed when part of a conversation.
+
+    ``context_blocks`` carries per-request context (current time/place, memory
+    selection, recent channel window). Keeping it in the *tail* message —
+    instead of the system prompt — leaves the history prefix byte-identical
+    across follow-ups, which makes provider prefix caching effective.
+    """
     images = [u for u in (image_urls or []) if u][:4]
     parts: list[dict] | None = None
-    head = _prior_context_head([l for l in (prior_context or []) if l], channel_id)
+    head = (f"{context_blocks}\n\n" if context_blocks else '') + _prior_context_head(
+        [l for l in (prior_context or []) if l], channel_id
+    )
     text = question
     if in_conversation:
         meta = [f'Agora — {_author_label(author)}']
@@ -251,6 +260,8 @@ def build_current_message(
         if reply_to:
             meta.append(f'↩ reply_to={reply_to}')
         text = f"{head}[{' • '.join(meta)}]\n{question}"
+    elif head:
+        text = f"{head}{question}"
     if images:
         inline, dropped = _split_images(images)
         if dropped:
@@ -262,13 +273,19 @@ def build_current_message(
     return {'role': 'user', 'content': text}
 
 
-def build_conversation_block(history: list[dict], *, current_author: dict | None) -> str:
-    """System-prompt block describing the ongoing conversation and participants."""
+def build_conversation_block(history: list[dict]) -> str:
+    """System-prompt block describing the ongoing conversation and participants.
+
+    Deliberately **static per conversation**: it depends only on stored history,
+    never on the current request's clock or current sender.  This lets the
+    rendered history that follows it stay byte-identical across follow-ups so
+    providers can prefix-cache it.  The current sender is instead signalled by
+    the ``[Agora — …]`` prefix of the current message.
+    """
     participants: list[dict] = []
     for turn in history:
         add_participant(participants, turn.get('author') or {})
     start_ts = history[0].get('ts') if history else None
-    current = _author_label(current_author)
     last_channel_id = history[-1].get('channel_id') if history else None
     lines = [
         '<conversa_em_andamento>',
@@ -286,7 +303,6 @@ def build_conversation_block(history: list[dict], *, current_author: dict | None
         'que aconteceu entre as perguntas direcionadas ao bot.',
         'Nos blocos de mensagens do canal, respostas do bot e perguntas já registradas como '
         'turnos são omitidas; use get_channel_history para vê-las.',
-        f'O turno atual foi enviado por {current}.',
         '</conversa_em_andamento>',
     ])
     return '\n'.join(lines)
