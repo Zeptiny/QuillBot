@@ -134,51 +134,6 @@ GET_USER_STATS_TOOL = {
     },
 }
 
-AGGREGATE_USER_TOPICS_TOOL = {
-    'type': 'function',
-    'function': {
-        'name': 'aggregate_user_topics',
-        'description': (
-            'Agrupa e conta os principais tópicos/assuntos de um usuário. Retorna lista de tópicos com contagem e exemplo. '
-            'Use para "sobre o que X fala mais?" ou "quais os assuntos favoritos de X?".'
-        ),
-        'parameters': {
-            'type': 'object',
-            'properties': {
-                'author_id': {'type': 'string', 'description': 'ID do usuário.'},
-                'author_name': {'type': 'string', 'description': 'Nome parcial se ID desconhecido.'},
-                'top_k': {'type': 'integer', 'description': 'Número de tópicos (padrão 5, máx 10).'},
-            },
-            'required': [],
-        },
-    },
-}
-
-GET_USER_TIMELINE_TOOL = {
-    'type': 'function',
-    'function': {
-        'name': 'get_user_timeline',
-        'description': (
-            'Retorna timeline cronológica de mensagens de um usuário, opcionalmente filtrada por tópico/query. '
-            'Use para "quando X mencionou Y?" ou "mostre histórico de X sobre Y".'
-        ),
-        'parameters': {
-            'type': 'object',
-            'properties': {
-                'author_id': {'type': 'string', 'description': 'ID do usuário.'},
-                'author_name': {'type': 'string', 'description': 'Nome parcial.'},
-                'query': {'type': 'string', 'description': 'Opcional: filtrar timeline por tópico/query semântica.'},
-                'limit': {'type': 'integer', 'description': 'Número de resultados (padrão 10, máx 20).'},
-                'after': {'type': 'string', 'description': 'Data inicial ISO.'},
-                'before': {'type': 'string', 'description': 'Data final ISO.'},
-                'channel_id': {'type': 'string', 'description': 'Opcional: restringir a canal.'},
-                'sort_by': {'type': 'string', 'enum': ['recent', 'oldest'], 'description': 'Ordenação (padrão recent).'},
-            },
-            'required': [],
-        },
-    },
-}
-
 COUNT_MENTIONS_TOOL = {
     'type': 'function',
     'function': {
@@ -193,27 +148,6 @@ COUNT_MENTIONS_TOOL = {
                 'query': {'type': 'string', 'description': 'Tópico/query a contar.'},
                 'group_by': {'type': 'string', 'enum': ['author', 'channel', 'day'], 'description': 'Agrupamento (padrão author).'},
                 'limit': {'type': 'integer', 'description': 'Número de grupos (padrão 10).'},
-                'after': {'type': 'string', 'description': 'Data inicial ISO.'},
-                'before': {'type': 'string', 'description': 'Data final ISO.'},
-            },
-            'required': ['query'],
-        },
-    },
-}
-
-GET_TEMPORAL_HEATMAP_TOOL = {
-    'type': 'function',
-    'function': {
-        'name': 'get_temporal_heatmap',
-        'description': (
-            'Gera heatmap temporal de um tópico: contagem de mensagens por dia/semana. '
-            'Use para "quando falamos sobre X?" ou evolução temporal de um assunto.'
-        ),
-        'parameters': {
-            'type': 'object',
-            'properties': {
-                'query': {'type': 'string', 'description': 'Tópico/query.'},
-                'bucket': {'type': 'string', 'enum': ['day', 'week'], 'description': 'Granularidade (padrão day).'},
                 'after': {'type': 'string', 'description': 'Data inicial ISO.'},
                 'before': {'type': 'string', 'description': 'Data final ISO.'},
             },

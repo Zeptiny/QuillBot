@@ -26,13 +26,10 @@ from cogs.tavily_tools import exec_tool as tavily_exec_tool
 from cogs.tavily_tools import status_label as tavily_status_label
 from cogs.tavily_tools import MAX_TOOL_ROUNDS as TAVILY_MAX_ROUNDS
 from cogs.utils import (
-    AGGREGATE_USER_TOPICS_TOOL,
     CHANNEL_HISTORY_TOOL,
     COUNT_MENTIONS_TOOL,
     GET_MESSAGE_CONTEXT_TOOL,
-    GET_TEMPORAL_HEATMAP_TOOL,
     GET_USER_STATS_TOOL,
-    GET_USER_TIMELINE_TOOL,
     GUILD_INFO_TOOL,
     PaginatedEmbedView,
     SEARCH_HISTORY_TOOL,
@@ -704,7 +701,7 @@ class Commands(commands.Cog):
         ))
 
         base_tools = list(TAVILY_TOOLS) if TAVILY_AVAILABLE else []
-        base_tools.extend([CHANNEL_HISTORY_TOOL, GUILD_INFO_TOOL, SEARCH_HISTORY_TOOL, GET_MESSAGE_CONTEXT_TOOL, GET_USER_STATS_TOOL, AGGREGATE_USER_TOPICS_TOOL, GET_USER_TIMELINE_TOOL, COUNT_MENTIONS_TOOL, GET_TEMPORAL_HEATMAP_TOOL])
+        base_tools.extend([CHANNEL_HISTORY_TOOL, GUILD_INFO_TOOL, SEARCH_HISTORY_TOOL, GET_MESSAGE_CONTEXT_TOOL, GET_USER_STATS_TOOL, COUNT_MENTIONS_TOOL])
         if MEMORY_ENABLED:
             base_tools.extend([MEMORY_SEARCH_TOOL, MEMORY_WRITE_TOOL, MEMORY_ABOUT_TOOL])
         active_tools = base_tools if base_tools else None
@@ -783,42 +780,6 @@ class Commands(commands.Cog):
                     return stats["error"], []
                 lines = [f"Usuário: {stats['author_full']} ({', '.join(stats['author_ids'])})", f"Total: {stats['total_messages']} msgs | Média: {stats['avg_length']} chars", f"Canais: {', '.join(f'{k}={v}' for k,v in stats['top_channels'])}", f"Horários: {', '.join(f'{h}h={v}' for h,v in stats['top_hours'])}", f"Período: {stats['first_seen']} → {stats['last_seen']}", f"Exemplo: {stats['example_content']} {stats['example_jump']}"]
                 return "\n".join(lines), []
-            if name == 'aggregate_user_topics':
-                hist = self.bot.get_cog('HistoryRAG')
-                if not hist:
-                    return "Histórico não disponível.", []
-                g = fallback_guild
-                if not g:
-                    return "Requer servidor.", []
-                try:
-                    topics = await hist.aggregate_user_topics(g.id, author_id=args.get('author_id'), author_name=args.get('author_name'), top_k=int(args.get('top_k',5)))  # type: ignore
-                except Exception:
-                    logger.exception("aggregate_user_topics failed")
-                    return "Erro ao agregar tópicos.", []
-                if not topics:
-                    return "Nenhum tópico encontrado.", []
-                parts = [f"**{t['topic']}** — {t['count']}× — {t['example'][:150]} [{t['channel']}] {t['jump_url']}" for t in topics]
-                return "\n".join(parts), []
-            if name == 'get_user_timeline':
-                hist = self.bot.get_cog('HistoryRAG')
-                if not hist:
-                    return "Histórico não disponível.", []
-                g = fallback_guild
-                if not g:
-                    return "Requer servidor.", []
-                try:
-                    tl = await hist.get_user_timeline(g.id, author_id=args.get('author_id'), author_name=args.get('author_name'), query=args.get('query'), limit=int(args.get('limit',10)), after=args.get('after'), before=args.get('before'), channel_id=args.get('channel_id'), sort_by=args.get('sort_by','recent'))  # type: ignore
-                except Exception:
-                    logger.exception("get_user_timeline failed")
-                    return "Erro ao buscar timeline.", []
-                if not tl:
-                    return "Nenhuma mensagem na timeline.", []
-                parts = []
-                for r in tl:
-                    jump = r.get('jump_url','')
-                    link = f"[ver]({jump})" if jump else ""
-                    parts.append(f"[{r.get('ts','')}] **{r.get('author_full','?')}** #{r.get('channel_name','?')} {link}\n{r.get('content','')[:400]}")
-                return "\n\n---\n\n".join(parts), []
             if name == 'count_mentions':
                 hist = self.bot.get_cog('HistoryRAG')
                 if not hist:
@@ -834,22 +795,6 @@ class Commands(commands.Cog):
                 if not groups:
                     return "Nenhuma menção encontrada.", []
                 lines = [f"{gr['key']}: {gr['count']}× — ex: {gr['example'].get('content','')[:120]}" for gr in groups]
-                return "\n".join(lines), []
-            if name == 'get_temporal_heatmap':
-                hist = self.bot.get_cog('HistoryRAG')
-                if not hist:
-                    return "Histórico não disponível.", []
-                g = fallback_guild
-                if not g:
-                    return "Requer servidor.", []
-                try:
-                    heat = await hist.get_temporal_heatmap(g.id, query=args.get('query',''), bucket=args.get('bucket','day'), after=args.get('after'), before=args.get('before'))  # type: ignore
-                except Exception:
-                    logger.exception("get_temporal_heatmap failed")
-                    return "Erro ao gerar heatmap.", []
-                if not heat:
-                    return "Nenhum dado temporal.", []
-                lines = [f"{h['bucket']}: {'█'*min(h['count'],20)} {h['count']}" for h in heat]
                 return "\n".join(lines), []
             if name == 'get_message_context':
                 text = await fetch_message_context(self.bot, channel_id=args.get('channel_id',''), message_id=args.get('message_id',''), window=args.get('window', 5))
@@ -878,14 +823,8 @@ class Commands(commands.Cog):
                 return f'🔎 Buscando no histórico: *{q}*'
             if name == 'get_user_stats':
                 return f'📊 Estatísticas de {args.get("author_id") or args.get("author_name","usuário")}…'
-            if name == 'aggregate_user_topics':
-                return f'🏷️ Tópicos de {args.get("author_id") or args.get("author_name","usuário")}…'
-            if name == 'get_user_timeline':
-                return f'🕰️ Timeline {args.get("query","")[:30]}…'
             if name == 'count_mentions':
                 return f'🔢 Contando menções: *{args.get("query","")[:30]}*'
-            if name == 'get_temporal_heatmap':
-                return f'📅 Heatmap: *{args.get("query","")[:30]}*'
             if name == 'get_message_context':
                 return f'🧩 Contexto da mensagem {args.get("message_id","")}…'
             return f'🔧 Executando: {name}'

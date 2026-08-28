@@ -58,12 +58,6 @@ try:
 except Exception:
     pass
 
-_STOPWORDS = set("""
-a o e de do da em um uma para com por os as que se no na foi ser ter mais mas foi seu sua
-the and or is are was were be been have has had this that it in on at to for with as by from
-de de um uma que com para por sobre muito também vai tem ser já meu sua seu nos
-""".split())
-
 def _fmt_dt(dt):
     if not dt:
         return "—"
@@ -1138,91 +1132,6 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
             "example_content": example.get("content","")[:300],
         }
 
-    async def aggregate_user_topics(self, guild_id: int, author_id: str | None = None, author_name: str | None = None, top_k: int = 5) -> list[dict]:
-        if guild_id not in self._chunks:
-            return []
-        chunks = self._chunks[guild_id]
-        author_ids = self._resolve_author(guild_id, author_id, author_name)
-        if author_id and str(author_id) not in author_ids:
-            author_ids.append(str(author_id))
-        if not author_ids:
-            return []
-        target = set(author_ids)
-        user_chunks = [c for c in chunks if c["author_id"] in target]
-        if not user_chunks:
-            return []
-        total_docs = len(self._chunks[guild_id])
-        doc_freq: dict[str, int] = {}
-        for c in self._chunks[guild_id]:
-            words = set(w for w in re.findall(r"\w+", c.get("content","").lower()) if len(w) >= 4 and w not in _STOPWORDS)
-            for w in words:
-                doc_freq[w] = doc_freq.get(w, 0) + 1
-        counter: dict[str, int] = {}
-        examples: dict[str, dict] = {}
-        tfidf: dict[str, float] = {}
-        for c in user_chunks:
-            words = re.findall(r"\w+", c.get("content","").lower())
-            for w in words:
-                if len(w) < 4 or w in _STOPWORDS:
-                    continue
-                counter[w] = counter.get(w, 0) + 1
-                if w not in examples:
-                    examples[w] = c
-        for w, tf in counter.items():
-            df = doc_freq.get(w, 1)
-            idf = math.log((1 + total_docs) / (1 + df)) + 1
-            tfidf[w] = tf * idf
-        top = sorted(tfidf.items(), key=lambda x: x[1], reverse=True)[: max(top_k*3, top_k*2)]
-        result = []
-        used = set()
-        for word, score in top:
-            if word in used:
-                continue
-            used.add(word)
-            ex = examples[word]
-            result.append({"topic": word, "count": counter[word], "tfidf": round(score, 3), "example": ex.get("content","")[:200], "jump_url": ex.get("jump_url",""), "channel": ex.get("channel_name",""), "ts": ex.get("ts","")})
-            if len(result) >= top_k:
-                break
-        return result
-
-    async def get_user_timeline(self, guild_id: int, author_id: str | None = None, author_name: str | None = None, query: str | None = None, limit: int = 10, after: str | None = None, before: str | None = None, channel_id: str | None = None, sort_by: str = "recent") -> list[dict]:
-        if guild_id not in self._chunks:
-            return []
-        if query:
-            results = await self.search(query, guild_id, limit=limit, channel_id=channel_id, author_id=author_id, author_name=author_name, after=after, before=before, search_mode="hybrid", sort_by=sort_by if sort_by in ("relevance","recent") else "recent")
-            if sort_by in ("recent","oldest"):
-                reverse = sort_by == "recent"
-                results.sort(key=lambda x: x["ts"], reverse=reverse)
-            return results
-        chunks = self._chunks[guild_id]
-        author_ids = self._resolve_author(guild_id, author_id, author_name)
-        if author_id and str(author_id) not in author_ids:
-            author_ids.append(str(author_id))
-        if not author_ids and (author_id or author_name):
-            return []
-        target = set(author_ids) if author_ids else None
-        dt_after = _parse_dt(after) if after else None
-        dt_before = _parse_dt(before) if before else None
-        filtered = []
-        for c in chunks:
-            if target and c["author_id"] not in target:
-                continue
-            if channel_id and c["channel_id"] != str(channel_id):
-                continue
-            try:
-                ts = datetime.datetime.fromisoformat(c["ts"].replace("Z","+00:00"))
-                if ts.tzinfo is None:
-                    ts = ts.replace(tzinfo=datetime.timezone.utc)
-            except Exception:
-                continue
-            if dt_after and ts < dt_after:
-                continue
-            if dt_before and ts > dt_before:
-                continue
-            filtered.append(c)
-        filtered.sort(key=lambda x: x["ts"], reverse=(sort_by != "oldest"))
-        return [dict(c, _score=1.0) for c in filtered[:limit]]
-
     async def count_mentions(self, guild_id: int, query: str, group_by: str = "author", limit: int = 10, after: str | None = None, before: str | None = None) -> list[dict]:
         results = await self.search(query, guild_id, limit=200, after=after, before=before, search_mode="hybrid", sort_by="relevance")
         if not results:
@@ -1248,27 +1157,6 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
             counter[key]["count"] += 1
         sorted_groups = sorted(counter.values(), key=lambda x: x["count"], reverse=True)[:limit]
         return sorted_groups
-
-    async def get_temporal_heatmap(self, guild_id: int, query: str, bucket: str = "day", after: str | None = None, before: str | None = None) -> list[dict]:
-        results = await self.search(query, guild_id, limit=200, after=after, before=before, search_mode="hybrid", sort_by="relevance")
-        if not results:
-            return []
-        buckets: dict[str, int] = {}
-        for r in results:
-            try:
-                ts = datetime.datetime.fromisoformat(r["ts"].replace("Z","+00:00"))
-                if ts.tzinfo is None:
-                    ts = ts.replace(tzinfo=datetime.timezone.utc)
-                if BR_TZ:
-                    ts = ts.astimezone(BR_TZ)
-                if bucket == "week":
-                    key = ts.strftime("%Y-W%V")
-                else:
-                    key = ts.strftime("%Y-%m-%d")
-                buckets[key] = buckets.get(key, 0) + 1
-            except Exception:
-                continue
-        return [{"bucket": k, "count": v} for k, v in sorted(buckets.items())]
 
     @app_commands.command(name="history", description="Buscar no histórico do servidor (RAG)")
     @app_commands.describe(query="O que buscar", user="Filtrar por usuário", channel="Filtrar por canal", after="Data inicial YYYY-MM-DD", before="Data final YYYY-MM-DD", limit="Resultados (1-12)", mode="Modo de busca")
@@ -1370,50 +1258,6 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
         embed.add_field(name="Período", value=f"{stats['first_seen'][:10]} → {stats['last_seen'][:10]}", inline=True)
         if stats.get("example_jump"):
             embed.add_field(name="Exemplo recente", value=f"[{stats['example_content'][:150]}]({stats['example_jump']})", inline=False)
-        try:
-            await interaction.edit_original_response(content=None)
-        except discord.HTTPException:
-            pass
-        await interaction.followup.send(embed=embed)
-
-    @app_commands.command(name="timeline", description="Timeline/heatmap de um tópico ou usuário")
-    @app_commands.describe(topic="Tópico/query", user="Filtrar por usuário", channel="Filtrar por canal", bucket="Agrupamento", limit="Resultados")
-    @app_commands.choices(bucket=[app_commands.Choice(name="day", value="day"), app_commands.Choice(name="week", value="week")])
-    async def timeline_cmd(self, interaction: discord.Interaction, topic: str, user: discord.Member | None = None, channel: discord.TextChannel | None = None, bucket: str = "day", limit: int = 10):
-        await interaction.response.defer(thinking=True)
-        try:
-            await interaction.edit_original_response(content=f'🕰️ Montando timeline: *{topic[:60]}*')
-        except discord.HTTPException:
-            pass
-        guild_id = interaction.guild_id
-        if not guild_id:
-            try:
-                await interaction.edit_original_response(content=None)
-            except discord.HTTPException:
-                pass
-            await interaction.followup.send("Só em servidores.", ephemeral=True)
-            return
-        limit = max(1, min(20, limit))
-        timeline = await self.get_user_timeline(guild_id, author_id=str(user.id) if user else None, query=topic, limit=limit, channel_id=str(channel.id) if channel else None, sort_by="recent")
-        try:
-            await interaction.edit_original_response(content=f'📅 Gerando heatmap: *{topic[:40]}*')
-        except discord.HTTPException:
-            pass
-        heat = await self.get_temporal_heatmap(guild_id, topic, bucket=bucket)
-        embed = discord.Embed(title=f"🕰️ Timeline: {topic}", color=discord.Color.teal())
-        if timeline:
-            lines = []
-            for r in timeline:
-                jump = r.get("jump_url","")
-                link = f"[ver]({jump})" if jump else ""
-                lines.append(f"`{r.get('ts','')[:16]}` **{r.get('author_full','?')}** #{r.get('channel_name','?')} {link}\n{r.get('content','')[:180]}")
-            embed.description = "\n\n".join(lines)[:3800]
-        else:
-            embed.description = "Nenhum resultado."
-        if heat:
-            heat_str = " • ".join(f"{h['bucket']}: {h['count']}" for h in heat[:15])
-            embed.add_field(name=f"Heatmap ({bucket})", value=heat_str[:1024], inline=False)
-        embed.set_footer(text=f"{len(timeline)} itens • bucket {bucket}")
         try:
             await interaction.edit_original_response(content=None)
         except discord.HTTPException:
