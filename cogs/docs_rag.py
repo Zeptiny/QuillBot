@@ -25,7 +25,7 @@ from cogs.conversation_store import (
     cap_turns as _cap_turns,
     make_turn as _make_turn,
 )
-from cogs.lore import SAVE_LORE_TOOL, SEARCH_LORE_TOOL
+from cogs.memory import MEMORY_ABOUT_TOOL, MEMORY_SEARCH_TOOL, MEMORY_WRITE_TOOL
 from cogs.plugin_apis import HTTP_HEADERS as _HTTP_HEADERS
 from cogs.plugin_apis import search_all as _search_plugins_all
 from cogs.spark_parser import (
@@ -67,7 +67,7 @@ from config import (
     GITHUB_API,
     LOCAL_EMBEDDING_DEVICE,
     LOCAL_EMBEDDING_MODEL,
-    LORE_ENABLED,
+    MEMORY_ENABLED,
     OPENAI_API_KEY,
     OPENAI_BASE_URL,
     OPENROUTER_API_KEY,
@@ -82,14 +82,31 @@ logger = logging.getLogger(__name__)
 
 MAX_TOOL_ROUNDS = 6  # Safety cap on tool-calling iterations
 
-_LORE_INSTRUCTIONS = (
-    "- Para perguntas sobre a história do servidor, pessoas, piadas internas, glossário da "
-    "comunidade ou marcos, use `search_lore` antes de `search_history` — o lore é a fonte "
-    "curada e canônica do passado do servidor.\n"
-    "- Ao descobrir, com base no histórico, um fato do servidor digno de memória (evento, "
-    "piada interna, termo do glossário, marco, pessoa marcante), salve com `save_lore` "
-    "incluindo `sources` com os links das mensagens que o comprovam.\n"
-) if LORE_ENABLED else ""
+
+def _conversation_participants(message: discord.Message) -> set[str]:
+    """User ids relevant to a message: author, mentions and reply target."""
+    ids = {str(message.author.id)}
+    for u in getattr(message, 'mentions', []):
+        if not u.bot:
+            ids.add(str(u.id))
+    ref = getattr(message, 'reference', None)
+    ref_msg = getattr(ref, 'resolved', None)
+    ref_author = getattr(ref_msg, 'author', None)
+    if ref_author is not None and not ref_author.bot:
+        ids.add(str(ref_author.id))
+    return ids
+
+_MEMORY_INSTRUCTIONS = (
+    "- Você tem uma memória persistente: um bloco <memory> com lembranças relevantes é "
+    "injetado automaticamente no início de cada resposta. Use-o naturalmente — nunca "
+    "mencione o bloco nem os IDs [mem #N]. Para lembrar de algo não injetado, use "
+    "`memory_search`; para contextualizar quem é alguém, use `memory_about`.\n"
+    "- Ao descobrir algo digno de memória (preferência estável, fato sobre pessoa, evento "
+    "marcante, habilidade ensinada), salve com `memory_write` — uma frase autocontida por "
+    "memória, em terceira pessoa. Atualize com action=update quando o fato mudar e use "
+    "action=forget quando deixar de valer. Use pinned=true só para fatos centrais e "
+    "permanentes.\n"
+) if MEMORY_ENABLED else ""
 
 _DISCORD_FORMAT_GUIDE = (
     "A resposta será exibida no Discord (embed description) — use APENAS sintaxe que o Discord renderiza:\n"
@@ -111,7 +128,7 @@ SYSTEM_PROMPT = (
     "<instructions>\n"
     "- Para qualquer pergunta técnica sobre configuração, administração ou otimização de "
     "servidores Minecraft, chame `search_docs` imediatamente.\n"
-    + _LORE_INSTRUCTIONS +
+    + _MEMORY_INSTRUCTIONS +
     "- Baseie cada resposta nos dados retornados pelas ferramentas, não em conhecimento de treinamento.\n"
     "- Se a pergunta for vaga ou ambígua, peça esclarecimentos — omita chamadas de ferramentas.\n"
     "- Cite valores e trechos de configuração exatamente como retornados pelas ferramentas. "
@@ -287,8 +304,8 @@ TOOLS = [
         },
     },
 ]
-if LORE_ENABLED:
-    TOOLS.extend([SEARCH_LORE_TOOL, SAVE_LORE_TOOL])
+if MEMORY_ENABLED:
+    TOOLS.extend([MEMORY_SEARCH_TOOL, MEMORY_WRITE_TOOL, MEMORY_ABOUT_TOOL])
 TOOLS.extend([
     _CHANNEL_HISTORY_TOOL,
     _GUILD_INFO_TOOL,
@@ -1074,18 +1091,22 @@ class DocsRAG(commands.Cog):
         channel: discord.abc.Messageable | None = None,
         guild: discord.Guild | None = None,
         user: discord.abc.User | discord.Member | None = None,
+        origin: str | None = None,
+        participant_ids: set[str] | None = None,
     ) -> tuple[str, list[dict]]:
         """Execute a tool call and return (result_text, source_chunks)."""
-        if name == 'search_lore' or name == 'save_lore':
-            lore_cog = self.bot.get_cog('Lore')
-            if not lore_cog:
-                return 'Enciclopédia de lore não disponível.', []
+        if name in ('memory_search', 'memory_write', 'memory_about'):
+            mem_cog = self.bot.get_cog('Memory')
+            if not mem_cog:
+                return 'Memória não disponível.', []
             if not guild:
-                return 'Lore requer estar em um servidor.', []
+                return 'Memória requer estar em um servidor.', []
             actor_name = f'bot (via {user.display_name})' if user is not None else 'bot'
-            return await lore_cog.exec_tool(
+            return await mem_cog.exec_tool(
                 name, args, guild=guild, actor_name=actor_name,
                 requester=user, channel=channel,
+                origin=origin,
+                participant_ids=participant_ids,
             )
 
         if name == 'search_docs':
@@ -1318,10 +1339,14 @@ class DocsRAG(commands.Cog):
             return f'📅 Heatmap: *{args.get("query","")[:30]}*'
         if tool_name == 'get_message_context':
             return f'🧩 Contexto da mensagem {args.get("message_id","")}…'
-        if tool_name == 'search_lore':
-            return f"📖 Consultando lore: *{args.get('query', '')[:40]}*"
-        if tool_name == 'save_lore':
-            return f"📖 Atualizando lore: *{args.get('term', '')[:40]}*"
+        if tool_name == 'memory_search':
+            return f"🧠 Recordando: *{args.get('query', '')[:40]}*"
+        if tool_name == 'memory_write':
+            act = args.get('action', 'write')
+            tgt = str(args.get('memory_id') or args.get('content') or args.get('content_match') or '')[:40]
+            return f'🧠 Memória — {act}: *{tgt}*'
+        if tool_name == 'memory_about':
+            return f"🧠 Relembrando {args.get('user', 'quem pergunta')}…"
         if tool_name == 'get_spark_detail':
             section = args.get('section', '')
             section_names = {
@@ -1360,6 +1385,8 @@ class DocsRAG(commands.Cog):
         guild: discord.Guild | None = None,
         channel: discord.abc.Messageable | None = None,
         created_at: datetime.datetime | None = None,
+        participant_ids: set[str] | None = None,
+        origin: str | None = None,
     ) -> tuple[str, list[discord.Embed], list[dict]]:
         """Run the LLM with tool-calling in a loop until it produces a final answer.
 
@@ -1394,6 +1421,21 @@ class DocsRAG(commands.Cog):
                 history[-CONVERSATIONS_HISTORY_TURNS:],
                 current_author=_author_info(user or (interaction.user if interaction else None)),
             )
+
+        # Inject persistent memory (pinned + semantically selected) ----------------
+        if MEMORY_ENABLED and guild is not None:
+            mem_cog = self.bot.get_cog('Memory')
+            if mem_cog is not None:
+                try:
+                    mem_block = await mem_cog.build_memory_block(
+                        guild.id, question,
+                        speaker_id=str(user.id) if user is not None else None,
+                        participant_ids=participant_ids,
+                    )
+                    if mem_block:
+                        system_content += f'\n\n{mem_block}'
+                except Exception:
+                    logger.exception('Failed to build memory block for _run_agent')
 
         messages: list[dict] = [
             {
@@ -1473,7 +1515,10 @@ class DocsRAG(commands.Cog):
         active_tools = TOOLS + SPARK_TOOLS if spark_report is not None else TOOLS
 
         exec_tool = (
-            lambda name, args: self._exec_tool(name, args, spark_report=spark_report, bot=self.bot, channel=channel, guild=guild, user=user)
+            lambda name, args: self._exec_tool(
+                name, args, spark_report=spark_report, bot=self.bot, channel=channel,
+                guild=guild, user=user, origin=origin, participant_ids=participant_ids,
+            )
         )
 
         answer, all_sources = await run_tool_loop(
@@ -1632,6 +1677,8 @@ class DocsRAG(commands.Cog):
                     channel=message.channel,
                     created_at=message.created_at,
                     reply_to=str(ref_id),
+                    participant_ids=_conversation_participants(message),
+                    origin=message.jump_url,
                 )
                 if len(embeds) == 1:
                     reply = await message.reply(embed=embeds[0])

@@ -85,11 +85,18 @@ HISTORY_INGEST_FLUSH_SECONDS: Final[float] = float(os.getenv('HISTORY_INGEST_FLU
 HISTORY_SNAPSHOT_INTERVAL: Final[float] = float(os.getenv('HISTORY_SNAPSHOT_INTERVAL', '300'))
 HISTORY_QUERY_CACHE_SIZE: Final[int] = int(os.getenv('HISTORY_QUERY_CACHE_SIZE', '200'))
 
-# --- Lore Encyclopedia (server history, inside jokes, glossary) ---
-LORE_ENABLED: Final[bool] = os.getenv('LORE_ENABLED', 'true').strip().lower() in ('1', 'true', 'yes')
+# --- Memory (persistent bot memory, replaces the lore encyclopedia) ---
+MEMORY_ENABLED: Final[bool] = os.getenv('MEMORY_ENABLED', 'true').strip().lower() in ('1', 'true', 'yes')
+MEMORY_DB_PATH: Final[str] = os.getenv('MEMORY_DB_PATH', 'data/memory.db')
+MEMORY_LOG_CHANNEL_ID: Final[int | None] = int(v) if (v := os.getenv('MEMORY_LOG_CHANNEL_ID', '').strip()) else None
+MEMORY_BOT_WRITE_LIMIT: Final[int] = int(os.getenv('MEMORY_BOT_WRITE_LIMIT', '20'))
+MEMORY_INJECT_LIMIT: Final[int] = int(os.getenv('MEMORY_INJECT_LIMIT', '5'))
+MEMORY_PIN_LIMIT: Final[int] = int(os.getenv('MEMORY_PIN_LIMIT', '12'))
+MEMORY_MAX_PER_SUBJECT: Final[int] = int(os.getenv('MEMORY_MAX_PER_SUBJECT', '200'))
+MEMORY_SEMANTIC_MIN_SCORE: Final[float] = float(os.getenv('MEMORY_SEMANTIC_MIN_SCORE', '0.35'))
+MEMORY_DEDUPE_THRESHOLD: Final[float] = float(os.getenv('MEMORY_DEDUPE_THRESHOLD', '0.85'))
+# Legacy lore encyclopedia — kept only as the one-time migration source for memory.db
 LORE_DB_PATH: Final[str] = os.getenv('LORE_DB_PATH', 'data/lore.db')
-LORE_LOG_CHANNEL_ID: Final[int | None] = int(v) if (v := os.getenv('LORE_LOG_CHANNEL_ID', '').strip()) else None
-LORE_BOT_WRITE_LIMIT: Final[int] = int(os.getenv('LORE_BOT_WRITE_LIMIT', '10'))
 
 # --- Rate Limiting (per-user) ---
 COOLDOWN_RATE: Final[int] = int(os.getenv('COOLDOWN_RATE', '1'))

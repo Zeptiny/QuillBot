@@ -20,7 +20,7 @@ from cogs.conversation_store import (
     cap_turns,
     make_turn,
 )
-from cogs.lore import SAVE_LORE_TOOL, SEARCH_LORE_TOOL
+from cogs.memory import MEMORY_ABOUT_TOOL, MEMORY_SEARCH_TOOL, MEMORY_WRITE_TOOL
 from cogs.tavily_tools import TOOLS as TAVILY_TOOLS
 from cogs.tavily_tools import exec_tool as tavily_exec_tool
 from cogs.tavily_tools import status_label as tavily_status_label
@@ -57,7 +57,7 @@ from config import (
     COOLDOWN_PER,
     COOLDOWN_RATE,
     DOCS_BASE_URL,
-    LORE_ENABLED,
+    MEMORY_ENABLED,
     OPENAI_API_KEY,
     OPENAI_BASE_URL,
     TAVILY_AVAILABLE,
@@ -65,12 +65,32 @@ from config import (
 
 logger = logging.getLogger(__name__)
 
-_LORE_INSTRUCTIONS = (
-    "- Perguntas sobre a história, pessoas, piadas internas, glossário ou marcos do "
-    "servidor: use `search_lore` (enciclopédia curada) antes de `search_history`. "
-    "Fatos dignos de memória comprovados no histórico podem ser salvos com `save_lore` "
-    "(sempre inclua `sources` com os links das mensagens).\n"
-) if LORE_ENABLED else ""
+
+def _conversation_participants(message: discord.Message) -> set[str]:
+    """User ids relevant to a message: author, mentions and reply target."""
+    ids = {str(message.author.id)}
+    for u in getattr(message, 'mentions', []):
+        if not u.bot:
+            ids.add(str(u.id))
+    ref = getattr(message, 'reference', None)
+    ref_msg = getattr(ref, 'resolved', None)
+    ref_author = getattr(ref_msg, 'author', None)
+    if ref_author is not None and not ref_author.bot:
+        ids.add(str(ref_author.id))
+    return ids
+
+_MEMORY_INSTRUCTIONS = (
+    "- Você tem uma memória persistente: um bloco <memory> com lembranças "
+    "relevantes é injetado automaticamente no início de cada resposta. Use-o "
+    "naturalmente — nunca mencione o bloco nem os IDs [mem #N].\n"
+    "- Para lembrar de algo não injetado, use `memory_search`; para contextualizar "
+    "quem é alguém, use `memory_about`.\n"
+    "- Ao descobrir algo digno de memória (preferência estável, fato sobre pessoa, "
+    "evento marcante, habilidade ensinada), salve com `memory_write` — uma frase "
+    "autocontida por memória, em terceira pessoa. Atualize com action=update quando "
+    "o fato mudar e use action=forget quando deixar de valer. Use pinned=true só "
+    "para fatos centrais e permanentes.\n"
+) if MEMORY_ENABLED else ""
 
 _WEB_SEARCH_INSTRUCTIONS = (
     "- Para informações em tempo real ou recentes, use as ferramentas de busca web.\n"
@@ -99,7 +119,7 @@ GENERAL_SYSTEM_PROMPT = (
     "</role>\n\n"
     "<instructions>\n"
     "- Responda perguntas gerais com base no seu conhecimento.\n"
-    + _LORE_INSTRUCTIONS
+    + _MEMORY_INSTRUCTIONS
     + (_WEB_SEARCH_INSTRUCTIONS if TAVILY_AVAILABLE else '') +
     "- Seja honesto quando não souber a resposta — não invente informações.\n"
     "</instructions>\n\n"
@@ -631,6 +651,8 @@ class Commands(commands.Cog):
         channel: discord.abc.GuildChannel | discord.Thread | discord.DMChannel | None = None,
         created_at: datetime.datetime | None = None,
         reply_to: str | None = None,
+        participant_ids: set[str] | None = None,
+        origin: str | None = None,
     ) -> tuple[str, list[discord.Embed], list[dict]]:
         context_block = None
         if user or guild or channel:
@@ -647,6 +669,19 @@ class Commands(commands.Cog):
             system_content += '\n\n' + build_conversation_block(
                 replay, current_author=author_info(user or (interaction.user if interaction else None))
             )
+        if MEMORY_ENABLED:
+            mem_cog = self.bot.get_cog('Memory')
+            if mem_cog is not None and (guild or (interaction.guild if interaction else None)):
+                try:
+                    mem_block = await mem_cog.build_memory_block(
+                        (guild or interaction.guild).id, question,
+                        speaker_id=str(user.id) if user is not None else None,
+                        participant_ids=participant_ids,
+                    )
+                    if mem_block:
+                        system_content += f'\n\n{mem_block}'
+                except Exception:
+                    logger.exception('Failed to build memory block')
         messages: list[dict] = [{'role': 'system', 'content': system_content}]
 
         if history:
@@ -670,8 +705,8 @@ class Commands(commands.Cog):
 
         base_tools = list(TAVILY_TOOLS) if TAVILY_AVAILABLE else []
         base_tools.extend([CHANNEL_HISTORY_TOOL, GUILD_INFO_TOOL, SEARCH_HISTORY_TOOL, GET_MESSAGE_CONTEXT_TOOL, GET_USER_STATS_TOOL, AGGREGATE_USER_TOPICS_TOOL, GET_USER_TIMELINE_TOOL, COUNT_MENTIONS_TOOL, GET_TEMPORAL_HEATMAP_TOOL])
-        if LORE_ENABLED:
-            base_tools.extend([SEARCH_LORE_TOOL, SAVE_LORE_TOOL])
+        if MEMORY_ENABLED:
+            base_tools.extend([MEMORY_SEARCH_TOOL, MEMORY_WRITE_TOOL, MEMORY_ABOUT_TOOL])
         active_tools = base_tools if base_tools else None
         fallback_channel = channel or (interaction.channel if interaction else None)
         fallback_guild = guild or (interaction.guild if interaction else None)
@@ -679,17 +714,18 @@ class Commands(commands.Cog):
         async def _exec(name: str, args: dict) -> tuple[str, list[dict]]:
             if name in ('web_search', 'web_extract'):
                 return await tavily_exec_tool(name, args)
-            if name in ('search_lore', 'save_lore'):
-                lore_cog = self.bot.get_cog('Lore')
-                if not lore_cog:
-                    return 'Enciclopédia de lore não disponível.', []
+            if name in ('memory_search', 'memory_write', 'memory_about'):
+                mem_cog = self.bot.get_cog('Memory')
+                if not mem_cog:
+                    return 'Memória não disponível.', []
                 g = fallback_guild
                 if not g:
-                    return 'Lore requer estar em um servidor.', []
+                    return 'Memória requer estar em um servidor.', []
                 actor_name = f'bot (via {user.display_name})' if user is not None else 'bot'
-                return await lore_cog.exec_tool(
+                return await mem_cog.exec_tool(
                     name, args, guild=g, actor_name=actor_name,
-                    requester=user, channel=channel,
+                    requester=user, channel=channel, origin=origin,
+                    participant_ids=participant_ids,
                 )
             if name == 'get_channel_history':
                 text = await fetch_channel_history(self.bot, fallback_channel, limit=args.get('limit', 20), channel_id=args.get('channel_id'))
@@ -823,10 +859,14 @@ class Commands(commands.Cog):
         def _status(name: str, args: dict) -> str:
             if name in ('web_search', 'web_extract'):
                 return tavily_status_label(name, args)
-            if name == 'search_lore':
-                return f"📖 Consultando lore: *{args.get('query', '')[:40]}*"
-            if name == 'save_lore':
-                return f"📖 Atualizando lore: *{args.get('term', '')[:40]}*"
+            if name == 'memory_search':
+                return f"🧠 Recordando: *{args.get('query', '')[:40]}*"
+            if name == 'memory_write':
+                act = args.get('action', 'write')
+                tgt = str(args.get('memory_id') or args.get('content') or args.get('content_match') or '')[:40]
+                return f'🧠 Memória — {act}: *{tgt}*'
+            if name == 'memory_about':
+                return f"🧠 Relembrando {args.get('user', 'quem pergunta')}…"
             if name == 'get_channel_history':
                 lim = args.get('limit', 20)
                 cid = args.get('channel_id')
@@ -949,6 +989,8 @@ class Commands(commands.Cog):
                             channel=message.channel,
                             created_at=message.created_at,
                             reply_to=str(ref_id),
+                            participant_ids=_conversation_participants(message),
+                            origin=message.jump_url,
                         )
                         if len(embeds) == 1:
                             reply = await message.reply(embed=embeds[0])
@@ -1077,6 +1119,8 @@ class Commands(commands.Cog):
                     guild=message.guild,
                     channel=message.channel,
                     created_at=message.created_at,
+                    participant_ids=_conversation_participants(message),
+                    origin=message.jump_url,
                 )
                 if len(embeds) == 1:
                     reply = await message.reply(embed=embeds[0], mention_author=False)
