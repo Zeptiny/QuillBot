@@ -27,8 +27,9 @@ import sqlite3
 import time
 from typing import Any
 
+from cogs import image_store
 from cogs.utils import BR_TZ
-from config import CONVERSATIONS_GAP_MESSAGES
+from config import CONVERSATIONS_GAP_MESSAGES, CONVERSATIONS_IMAGE_TURNS
 
 logger = logging.getLogger(__name__)
 
@@ -141,8 +142,27 @@ def _prior_context_block(turn: dict) -> str:
     return _prior_context_head(prior, turn.get('channel_id'))
 
 
+def _split_images(images: list[str]) -> tuple[list[dict], int]:
+    """(inline data-URI parts, count not inlined) for stored image refs/URLs."""
+    parts: list[dict] = []
+    dropped = 0
+    for img in images:
+        part = image_store.image_part(img) if image_store.is_image_ref(img) else None
+        if part is not None:
+            parts.append(part)
+        else:
+            dropped += 1
+    return parts, dropped
+
+
+def _append_image_marker(text: str, count: int) -> str:
+    marker = image_store.image_marker(count)
+    return f'{text}\n\n{marker}' if text else marker
+
+
 def build_history_messages(
     history: list[dict], *, max_turns: int = 16, max_images: int = 4,
+    image_turns: int = CONVERSATIONS_IMAGE_TURNS,
 ) -> list[dict]:
     """Render stored turns as attributed user/assistant message pairs.
 
@@ -152,11 +172,18 @@ def build_history_messages(
     injected above the question as a ``[Mensagens no canal antes desta
     pergunta]`` block, tagged with the channel when known. Sources used in a
     turn are appended to its assistant message.
+
+    Images are inlined as base64 data URIs only for the last ``image_turns``
+    turns (within ``max_images``); older turns — and turns whose images are
+    legacy URLs or missing files — get a text marker instead. Raw URLs are
+    never sent: some providers hang or reject URL-based ``image_url`` parts.
     """
+    turns = history[-max_turns:]
+    inline_from = max(0, len(turns) - image_turns)
     messages: list[dict] = []
     prev_author_id: str | None = None
     image_budget = max_images
-    for turn in history[-max_turns:]:
+    for idx, turn in enumerate(turns):
         author = turn.get('author') or {}
         meta = [f"Por {_author_label(author)}"]
         if author.get('id'):
@@ -174,12 +201,19 @@ def build_history_messages(
 
         question = turn.get('question') or ''
         head = _prior_context_block(turn)
-        images = [u for u in turn.get('images', []) if u][:image_budget]
+        images = [u for u in turn.get('images', []) if u]
+        parts: list[dict] | None = None
         if images:
-            image_budget -= len(images)
-            parts: list[dict] = [{'type': 'text', 'text': head + prefix + question}]
-            for url in images:
-                parts.append({'type': 'image_url', 'image_url': {'url': url}})
+            inline: list[dict] = []
+            if idx >= inline_from and image_budget > 0:
+                inline, _ = _split_images(images[:image_budget])
+                image_budget -= len(inline)
+            dropped = len(images) - len(inline)
+            if dropped:
+                question = _append_image_marker(question, dropped)
+            if inline:
+                parts = [{'type': 'text', 'text': head + prefix + question}, *inline]
+        if parts is not None:
             messages.append({'role': 'user', 'content': parts})
         else:
             messages.append({'role': 'user', 'content': head + prefix + question})
@@ -205,7 +239,7 @@ def build_current_message(
     channel_id: str | int | None = None,
 ) -> dict:
     """Build the current user message, attributed when part of a conversation."""
-    urls = [u for u in (image_urls or []) if u][:4]
+    images = [u for u in (image_urls or []) if u][:4]
     parts: list[dict] | None = None
     head = _prior_context_head([l for l in (prior_context or []) if l], channel_id)
     text = question
@@ -217,10 +251,12 @@ def build_current_message(
         if reply_to:
             meta.append(f'↩ reply_to={reply_to}')
         text = f"{head}[{' • '.join(meta)}]\n{question}"
-    if urls:
-        parts = [{'type': 'text', 'text': text}]
-        for url in urls:
-            parts.append({'type': 'image_url', 'image_url': {'url': url}})
+    if images:
+        inline, dropped = _split_images(images)
+        if dropped:
+            text = _append_image_marker(text, dropped)
+        if inline:
+            parts = [{'type': 'text', 'text': text}, *inline]
     if parts is not None:
         return {'role': 'user', 'content': parts}
     return {'role': 'user', 'content': text}

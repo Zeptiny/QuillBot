@@ -10,6 +10,7 @@ from discord import app_commands
 from discord.ext import commands
 from openai import AsyncOpenAI, RateLimitError
 
+from cogs import image_store
 from cogs.conversation_store import (
     ConversationStore,
     add_participant,
@@ -531,13 +532,15 @@ class Commands(commands.Cog):
                     'O arquivo enviado não é uma imagem válida.', ephemeral=True
                 )
                 return
-            image_url = image.url
 
         await interaction.response.defer(thinking=True)
         try:
             await interaction.edit_original_response(content='💭 Pensando…')
         except discord.HTTPException:
             pass
+
+        if image:
+            image_url = await image_store.persist_attachment(image)
 
         logger.info(
             "Processing /chat user=%s guild=%s question=%r",
@@ -846,7 +849,10 @@ class Commands(commands.Cog):
                     follow_up_question = re.sub(r'\s+', ' ', follow_up_question).strip()
                 if not follow_up_question and not message.attachments:
                     return
-                image_urls = [att.url for att in message.attachments if att.content_type and att.content_type.startswith('image/')]
+                image_urls = await image_store.persist_images(
+                    att for att in message.attachments
+                    if att.content_type and att.content_type.startswith('image/')
+                )
                 if not follow_up_question:
                     follow_up_question = 'Analise esta imagem.'
                 async with self.store.conversation_lock(conv['conv_id']), message.channel.typing():
@@ -937,9 +943,12 @@ class Commands(commands.Cog):
         clean_question = mention_pattern.sub('', message.content).strip()
         # Also strip any extra mention artifacts and whitespace
         clean_question = re.sub(r'\s+', ' ', clean_question).strip()
-        current_image_urls = [att.url for att in message.attachments if att.content_type and att.content_type.startswith('image/')]
+        current_image_urls = await image_store.persist_images(
+            att for att in message.attachments
+            if att.content_type and att.content_type.startswith('image/')
+        )
         ref_context = ""
-        ref_image_urls: list[str] = []
+        ref_image_urls: list[discord.Attachment] = []
         if message.reference and message.reference.message_id:
             ref_msg = message.reference.resolved
             if ref_msg is None:
@@ -958,7 +967,7 @@ class Commands(commands.Cog):
                         ref_content = ref_content[:1500] + "…"
                     for att in getattr(ref_msg, 'attachments', []):
                         if att.content_type and att.content_type.startswith('image/'):
-                            ref_image_urls.append(att.url)
+                            ref_image_urls.append(att)
                     attach_names = [att.filename for att in getattr(ref_msg, 'attachments', []) if not (att.content_type and att.content_type.startswith('image/'))]
                     parts = [f"[Mensagem respondida — {ref_author} (@{ref_msg.author.name})]"]
                     if ref_content:
@@ -979,7 +988,7 @@ class Commands(commands.Cog):
                         ref_context = "\n".join(parts)
                 except Exception:
                     logger.exception("Failed to build ref context")
-        all_image_urls = current_image_urls + ref_image_urls
+        all_image_urls = current_image_urls + await image_store.persist_images(ref_image_urls)
         if ref_context:
             if clean_question:
                 clean_question = f"{ref_context}\n---\n{clean_question}"

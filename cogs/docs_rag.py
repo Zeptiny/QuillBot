@@ -15,6 +15,7 @@ from discord import app_commands
 from discord.ext import commands, tasks
 from openai import AsyncOpenAI, RateLimitError
 
+from cogs import image_store as _image_store
 from cogs.conversation_store import (
     ConversationStore as _ConversationStore,
     add_participant as _add_participant,
@@ -1026,13 +1027,15 @@ class DocsRAG(commands.Cog):
                     'O arquivo enviado não é uma imagem válida.', ephemeral=True
                 )
                 return
-            image_url = image.url
 
         await interaction.response.defer(thinking=True)
         try:
             await interaction.edit_original_response(content='💭 Pensando…')
         except discord.HTTPException:
             pass
+
+        if image:
+            image_url = await _image_store.persist_attachment(image)
 
         logger.info(
             "Processing /ask user=%s guild=%s question=%r",
@@ -1513,7 +1516,10 @@ class DocsRAG(commands.Cog):
         if not follow_up_question and not message.attachments:
             return
 
-        image_urls: list[str] = [att.url for att in message.attachments if att.content_type and att.content_type.startswith('image/')]
+        image_urls: list[str] = await _image_store.persist_images(
+            att for att in message.attachments
+            if att.content_type and att.content_type.startswith('image/')
+        )
 
         if not follow_up_question:
             follow_up_question = 'Analise esta imagem.'

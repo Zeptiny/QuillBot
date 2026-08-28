@@ -61,6 +61,16 @@ HISTORY_HYBRID_WEIGHT_SEMANTIC: Final[float] = float(os.getenv('HISTORY_HYBRID_W
 HISTORY_HYBRID_WEIGHT_KEYWORD: Final[float] = float(os.getenv('HISTORY_HYBRID_WEIGHT_KEYWORD', '0.35'))
 HISTORY_RRF_K: Final[int] = int(os.getenv('HISTORY_RRF_K', '60'))
 
+# --- Vision images (download once, re-encode, inline as base64 data URIs) ---
+# Some providers cannot fetch image URLs (glm-5.3-flash hangs / 400s), so
+# images are persisted under IMAGES_DIR and re-sent inline per request.
+IMAGES_DIR: Final[str] = os.getenv('IMAGES_DIR', 'data/images')
+IMAGE_MAX_SIDE: Final[int] = int(os.getenv('IMAGE_MAX_SIDE', '640'))
+IMAGE_JPEG_QUALITY: Final[int] = int(os.getenv('IMAGE_JPEG_QUALITY', '80'))
+IMAGE_RETENTION_SECONDS: Final[float] = float(os.getenv('IMAGE_RETENTION_SECONDS', '86400'))
+# Inline stored images only for the most recent N history turns (older → text marker)
+CONVERSATIONS_IMAGE_TURNS: Final[int] = int(os.getenv('CONVERSATIONS_IMAGE_TURNS', '3'))
+
 # --- Chat Mention ---
 CHAT_MENTION_ENABLED: Final[bool] = os.getenv('CHAT_MENTION_ENABLED', 'true').strip().lower() in ('1', 'true', 'yes')
 
