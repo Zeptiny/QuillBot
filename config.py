@@ -64,6 +64,10 @@ HISTORY_RRF_K: Final[int] = int(os.getenv('HISTORY_RRF_K', '60'))
 # --- Chat Mention ---
 CHAT_MENTION_ENABLED: Final[bool] = os.getenv('CHAT_MENTION_ENABLED', 'true').strip().lower() in ('1', 'true', 'yes')
 
+# --- Channel context (recent messages auto-injected into /ask, /chat, @mention and follow-ups) ---
+# Number of latest channel messages sent to the LLM as conversation context; 0 disables.
+CHANNEL_CONTEXT_MESSAGES: Final[int] = int(os.getenv('CHANNEL_CONTEXT_MESSAGES', '10'))
+
 # --- Conversations (multi-turn chat memory) ---
 CONVERSATIONS_DB_PATH: Final[str] = os.getenv('CONVERSATIONS_DB_PATH', 'data/conversations.db')
 CONVERSATIONS_TTL_SECONDS: Final[float] = float(os.getenv('CONVERSATIONS_TTL_SECONDS', '1800'))

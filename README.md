@@ -213,6 +213,8 @@ while tool_calls and rounds < MAX_TOOL_ROUNDS:
 ### Context Injection
 Every AI call receives a `<contexto>` block with user (display name, account age, join date, roles), guild (name, member count, channels, roles), channel, and temporal (BRT + UTC) context.
 
+When `CHANNEL_CONTEXT_MESSAGES` > 0 (default `10`), `/ask`, `/chat`, @mention and reply follow-ups also receive a `<mensagens_recentes_do_canal>` block — the latest N channel messages in chronological order, same format as the `get_channel_history` tool. The triggering message is excluded; set `0` to disable.
+
 ---
 
 ## Documentation Sources
@@ -328,6 +330,7 @@ cp .env.example .env   # if available, otherwise create .env manually
 | `WEB_SEARCH_ENABLED` | `true` | Enable Tavily web search |
 | `TAVILY_API_KEY` | — | Required when web search is enabled |
 | `CHAT_MENTION_ENABLED` | `true` | Enable @mention chat mode |
+| `CHANNEL_CONTEXT_MESSAGES` | `10` | Latest channel messages auto-injected as context into `/ask`, `/chat`, @mention and reply follow-ups (`0` disables) |
 | `HISTORY_ENABLED` | `true` | Enable server history RAG |
 | `MEMORY_ENABLED` | `true` | Enable persistent memory (cog not loaded when false) |
 | `LOG_LEVEL` | `INFO` | Python logging level |

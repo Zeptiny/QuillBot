@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 import discord
 from openai import AsyncOpenAI
 
-from config import LLM_MAX_TOKENS
+from config import CHANNEL_CONTEXT_MESSAGES, LLM_MAX_TOKENS
 
 logger = logging.getLogger(__name__)
 
@@ -292,6 +292,7 @@ async def fetch_channel_history(
     channel: discord.abc.Messageable | None,
     limit: int = 20,
     channel_id: str | None = None,
+    before: discord.abc.Snowflake | None = None,
 ) -> str:
     target = channel
     if channel_id:
@@ -310,7 +311,7 @@ async def fetch_channel_history(
     limit = max(1, min(50, int(limit)))
     lines: list[str] = []
     try:
-        async for msg in target.history(limit=limit):
+        async for msg in target.history(limit=limit, before=before):
             ts = _fmt_dt(msg.created_at)
             author = getattr(msg.author, 'display_name', str(msg.author))
             content = msg.content or ""
@@ -334,6 +335,26 @@ async def fetch_channel_history(
     lines.reverse()
     header = f"Histórico de #{getattr(target, 'name', target.id)} (últimas {len(lines)} mensagens, cronológica):\n"
     return header + "\n".join(lines)
+
+
+async def fetch_recent_channel_context(
+    bot: discord.Client,
+    channel: discord.abc.Messageable | None,
+    *,
+    before: discord.abc.Snowflake | None = None,
+    limit: int | None = None,
+) -> str | None:
+    """Latest channel messages as auto-injected LLM context.
+
+    Controlled by ``CHANNEL_CONTEXT_MESSAGES`` (0 disables). Returns ``None``
+    when disabled or without a readable channel. ``before`` excludes the
+    triggering message from the window (mention/follow-up flows).
+    """
+    n = CHANNEL_CONTEXT_MESSAGES if limit is None else limit
+    if n <= 0 or channel is None:
+        return None
+    text = await fetch_channel_history(bot, channel, limit=n, before=before)
+    return f"<mensagens_recentes_do_canal>\n{text}\n</mensagens_recentes_do_canal>"
 
 
 async def fetch_message_context(

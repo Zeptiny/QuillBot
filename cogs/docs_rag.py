@@ -46,8 +46,10 @@ from cogs.utils import (
     build_guild_context as _build_guild_context,
     fetch_channel_history as _fetch_channel_history,
     fetch_message_context as _fetch_message_context,
+    fetch_recent_channel_context as _fetch_recent_channel_context,
 )
 from config import (
+    CHANNEL_CONTEXT_MESSAGES,
     CHAT_MODEL,
     COOLDOWN_PER,
     COOLDOWN_RATE,
@@ -1320,6 +1322,7 @@ class DocsRAG(commands.Cog):
         created_at: datetime.datetime | None = None,
         participant_ids: set[str] | None = None,
         origin: str | None = None,
+        context_message: discord.Message | None = None,
     ) -> tuple[str, list[discord.Embed], list[dict]]:
         """Run the LLM with tool-calling in a loop until it produces a final answer.
 
@@ -1369,6 +1372,17 @@ class DocsRAG(commands.Cog):
                         system_content += f'\n\n{mem_block}'
                 except Exception:
                     logger.exception('Failed to build memory block for _run_agent')
+
+        # Recent channel messages as conversation context ------------------------
+        if CHANNEL_CONTEXT_MESSAGES > 0:
+            try:
+                chan_ctx = await _fetch_recent_channel_context(
+                    self.bot, channel, before=context_message,
+                )
+                if chan_ctx:
+                    system_content += f'\n\n{chan_ctx}'
+            except Exception:
+                logger.exception('Failed to build recent channel context for _run_agent')
 
         messages: list[dict] = [
             {
@@ -1612,6 +1626,7 @@ class DocsRAG(commands.Cog):
                     reply_to=str(ref_id),
                     participant_ids=_conversation_participants(message),
                     origin=message.jump_url,
+                    context_message=message,
                 )
                 if len(embeds) == 1:
                     reply = await message.reply(embed=embeds[0])

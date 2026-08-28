@@ -39,11 +39,13 @@ from cogs.utils import (
     build_user_context,
     fetch_channel_history,
     fetch_message_context,
+    fetch_recent_channel_context,
     build_source_pages,
     run_tool_loop,
     split_response,
 )
 from config import (
+    CHANNEL_CONTEXT_MESSAGES,
     CHAT_MENTION_ENABLED,
     CHAT_MODEL,
     CONVERSATIONS_DB_PATH,
@@ -650,6 +652,7 @@ class Commands(commands.Cog):
         reply_to: str | None = None,
         participant_ids: set[str] | None = None,
         origin: str | None = None,
+        context_message: discord.Message | None = None,
     ) -> tuple[str, list[discord.Embed], list[dict]]:
         context_block = None
         if user or guild or channel:
@@ -679,6 +682,17 @@ class Commands(commands.Cog):
                         system_content += f'\n\n{mem_block}'
                 except Exception:
                     logger.exception('Failed to build memory block')
+        if CHANNEL_CONTEXT_MESSAGES > 0:
+            try:
+                chan_ctx = await fetch_recent_channel_context(
+                    self.bot,
+                    channel or (interaction.channel if interaction else None),
+                    before=context_message,
+                )
+                if chan_ctx:
+                    system_content += f'\n\n{chan_ctx}'
+            except Exception:
+                logger.exception('Failed to build recent channel context')
         messages: list[dict] = [{'role': 'system', 'content': system_content}]
 
         if history:
@@ -930,6 +944,7 @@ class Commands(commands.Cog):
                             reply_to=str(ref_id),
                             participant_ids=_conversation_participants(message),
                             origin=message.jump_url,
+                            context_message=message,
                         )
                         if len(embeds) == 1:
                             reply = await message.reply(embed=embeds[0])
@@ -1060,6 +1075,7 @@ class Commands(commands.Cog):
                     created_at=message.created_at,
                     participant_ids=_conversation_participants(message),
                     origin=message.jump_url,
+                    context_message=message,
                 )
                 if len(embeds) == 1:
                     reply = await message.reply(embed=embeds[0], mention_author=False)
