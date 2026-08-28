@@ -4,7 +4,7 @@ import datetime
 import json
 import logging
 from collections.abc import Awaitable, Callable
-from typing import Any
+from typing import Any, Final
 from zoneinfo import ZoneInfo
 
 import discord
@@ -12,8 +12,7 @@ from openai import AsyncOpenAI
 
 from config import (
     CHANNEL_CONTEXT_MESSAGES,
-    CONVERSATION_GAP_MESSAGES,
-    HISTORY_MAX_MSG_LENGTH,
+    CONVERSATIONS_GAP_MESSAGES,
     LLM_MAX_TOKENS,
 )
 
@@ -73,7 +72,8 @@ SEARCH_HISTORY_TOOL = {
             'Busca semanticamente no histórico completo do servidor (RAG). '
             'Use quando o usuário perguntar sobre conversas anteriores, decisões, '
             'problemas já discutidos, ou contexto que pode estar no chat. Retorna '
-            'mensagens relevantes com autor, canal, horário e link, incluindo 5 mensagens de contexto local.'
+            'mensagens relevantes com autor, canal, horário e link, incluindo 5 mensagens de contexto local. '
+            'Cada resultado traz channel_id e msg_id — use com get_message_context para expandir o contexto.'
         ),
         'parameters': {
             'type': 'object',
@@ -170,7 +170,8 @@ GET_MESSAGE_CONTEXT_TOOL = {
         'description': (
             'Retorna o contexto local ao redor de uma mensagem específica (5 antes e 5 depois). '
             'Use após search_history para expandir o contexto de um resultado relevante. '
-            'Aceita o msg_id ou reply_to visto em qualquer linha de mensagem.'
+            'Aceita o msg_id ou reply_to visto em qualquer linha de mensagem, desde que combinados '
+            'com o channel_id exibido nos cabeçalhos de resultado/blocos ou com o canal atual.'
         ),
         'parameters': {
             'type': 'object',
@@ -226,7 +227,18 @@ def _fmt_dt_line(dt: datetime.datetime | None) -> str:
 # - ``msg_id`` always comes LAST so content truncation never eats it.
 # ---------------------------------------------------------------------------
 
-def message_content_text(msg: discord.Message, *, max_length: int = HISTORY_MAX_MSG_LENGTH) -> str:
+MESSAGE_LINE_MAX_CONTENT: Final[int] = 800
+
+
+def _flatten(s: str) -> str:
+    return ' '.join(s.split())
+
+
+def _clip(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[:limit] + '…'
+
+
+def message_content_text(msg: discord.Message, *, max_length: int = MESSAGE_LINE_MAX_CONTENT) -> str:
     """Flattened message content with attachment/embed markers, never empty."""
     c = msg.content or ""
     if msg.attachments:
@@ -236,18 +248,16 @@ def message_content_text(msg: discord.Message, *, max_length: int = HISTORY_MAX_
             c = f"[embed: {msg.embeds[0].title or msg.embeds[0].description[:100]}]"
         except Exception:
             c = "[embed]"
-    c = c.replace("\n", " ").strip()
+    c = _flatten(c)
     if not c:
         c = "[sem texto]"
-    if len(c) > max_length:
-        c = c[:max_length] + "…"
-    return c
+    return _clip(c, max_length)
 
 
-def format_message_line(msg: discord.Message, *, is_target: bool = False) -> str:
+def format_message_line(msg: discord.Message) -> str:
     """Render a Discord message in the canonical line format."""
-    display = getattr(msg.author, 'display_name', str(msg.author))
-    handle = getattr(msg.author, 'name', None)
+    display = _flatten(getattr(msg.author, 'display_name', None) or str(msg.author))
+    handle = _flatten(getattr(msg.author, 'name', None) or '')
     author = f"{display} (@{handle})" if handle else display
     author_id = getattr(msg.author, 'id', '')
     line = f"[{_fmt_dt_line(msg.created_at)}] {author} <author_id={author_id}>: {message_content_text(msg)}"
@@ -257,13 +267,11 @@ def format_message_line(msg: discord.Message, *, is_target: bool = False) -> str
         target = ""
         resolved = getattr(ref, 'resolved', None)
         if resolved is not None and not isinstance(resolved, discord.DeletedReferencedMessage):
-            rdisplay = getattr(resolved.author, 'display_name', '')
+            rdisplay = _flatten(getattr(resolved.author, 'display_name', '') or '')
             if rdisplay:
                 target = f" ({rdisplay})"
         line += f" ↩ reply_to={ref_id}{target}"
     line += f" [msg_id={msg.id}]"
-    if is_target:
-        line += "  ← alvo"
     return line
 
 
@@ -277,8 +285,8 @@ def format_chunk_line(ch: dict) -> str:
         ts = dt.astimezone(BR_TZ).strftime("%d/%m/%Y %H:%M")
     except Exception:
         ts = ts_raw[:19]
-    author = ch.get('author_full') or ch.get('author_name') or '?'
-    content = str(ch.get('content', ''))[:HISTORY_MAX_MSG_LENGTH]
+    author = _flatten(str(ch.get('author_full') or ch.get('author_name') or '?'))
+    content = _clip(_flatten(str(ch.get('content', ''))), MESSAGE_LINE_MAX_CONTENT)
     if not content:
         content = '[sem texto]'
     line = f"[{ts}] {author} <author_id={ch.get('author_id', '?')}>: {content}"
@@ -287,7 +295,7 @@ def format_chunk_line(ch: dict) -> str:
     return f"{line} [msg_id={ch.get('msg_id', '')}]"
 
 
-def render_search_results(results: list[dict], *, window_chars: int = 1200) -> str:
+def render_search_results(results: list[dict], *, window_chars: int = 1200, include_msg_id: bool = True) -> str:
     """Render search_history results (shared by commands.py and docs_rag.py)."""
     parts: list[str] = []
     for r in results:
@@ -298,9 +306,23 @@ def render_search_results(results: list[dict], *, window_chars: int = 1200) -> s
             f"(channel_id={r.get('channel_id', '?')}) — {str(r.get('ts', ''))[:19]} "
             f"{link} (score {r.get('_score', 0):.2f})"
         )
-        window = str(r.get('chunk_text', r.get('content', '')))[:window_chars]
-        window = window.replace('```', 'ˋˋˋ')
-        parts.append(f"{header}\n```\n{window}\n```\n`msg_id={r.get('msg_id')}`")
+        raw_lines = str(r.get('chunk_text', r.get('content', ''))).replace('```', 'ˋˋˋ').split('\n')
+        kept: list[str] = []
+        used = 0
+        dropped = 0
+        for line in raw_lines:
+            cost = len(line) + (1 if kept else 0)
+            if used + cost > window_chars:
+                dropped = len(raw_lines) - len(kept)
+                break
+            kept.append(line)
+            used += cost
+        if dropped:
+            kept.append(f"… (+{dropped} linhas)")
+        body = f"{header}\n```\n" + '\n'.join(kept) + "\n```"
+        if include_msg_id:
+            body += f"\n`msg_id={r.get('msg_id')}`"
+        parts.append(body)
     return "\n\n---\n\n".join(parts)
 
 
@@ -469,11 +491,14 @@ async def fetch_channel_gap(
 
     Anchors on the previous bot-directed turn's message id and returns the
     chatter in between as canonical lines (bot messages excluded — bot answers
-    are already replayed as conversation turns). Controlled by
-    ``CONVERSATION_GAP_MESSAGES`` (0 disables). Returns [] on failure — the
-    recent-channel window is then the fallback.
+    are already replayed as conversation turns). The walk goes backwards from
+    ``before`` and stops at the anchor id, so nothing older than the previous
+    turn leaks in; only human messages consume the budget, so truncation keeps
+    the NEWEST chatter lines. Controlled by ``CONVERSATIONS_GAP_MESSAGES``
+    (0 disables). Returns [] on failure — the recent-channel window is then
+    the fallback.
     """
-    n = CONVERSATION_GAP_MESSAGES if limit is None else limit
+    n = CONVERSATIONS_GAP_MESSAGES if limit is None else limit
     if n <= 0 or channel is None or not hasattr(channel, "history"):
         return []
     try:
@@ -484,16 +509,37 @@ async def fetch_channel_gap(
     skip.add(str(after_id))
     lines: list[str] = []
     try:
-        async for msg in channel.history(limit=n, after=anchor, before=before):
+        async for msg in channel.history(limit=max(n * 3, 100), before=before):
+            if msg.id <= anchor.id:
+                break
             if msg.author.bot or str(msg.id) in skip:
                 continue
             if not msg.content and not msg.attachments and not msg.embeds:
                 continue
             lines.append(format_message_line(msg))
+            if len(lines) >= n:
+                break
     except Exception:
         logger.exception("fetch_channel_gap failed")
         return []
+    lines.reverse()
     return lines
+
+
+async def fetch_turn_gap(message: discord.Message, history: list[dict]) -> list[str]:
+    """Channel chatter since the previous bot-directed turn (same channel only)."""
+    last_turn = history[-1] if history else None
+    anchor_id = (last_turn or {}).get('message_id')
+    if not anchor_id:
+        return []
+    if last_turn.get('channel_id') and str(last_turn['channel_id']) != str(message.channel.id):
+        return []
+    return await fetch_channel_gap(
+        message.channel,
+        after_id=anchor_id,
+        before=message,
+        skip_ids={t.get('message_id') for t in history if t.get('message_id')},
+    )
 
 
 async def fetch_message_context(
@@ -539,7 +585,7 @@ async def fetch_message_context(
         pass
     def fmt(m: discord.Message, highlight: bool = False) -> str:
         prefix = "▶ " if highlight else "  "
-        return prefix + format_message_line(m, is_target=highlight)
+        return prefix + format_message_line(m)
     lines: list[str] = []
     for m in before:
         lines.append(fmt(m))
@@ -551,6 +597,105 @@ async def fetch_message_context(
         f"(channel_id={channel.id}, ±{window}):\n"
     )
     return header + "\n".join(lines)
+
+
+async def exec_history_tool(
+    name: str,
+    args: dict,
+    *,
+    bot: discord.Client,
+    guild: discord.Guild | None,
+    channel: discord.abc.Messageable | None,
+) -> tuple[str, list[dict]] | None:
+    """Run one of the six shared history/context tools.
+
+    Returns ``None`` for any other tool name so callers fall through to their
+    own handlers. Guild/channel resolution stays at the caller.
+    """
+    if name == 'get_channel_history':
+        text = await fetch_channel_history(bot, channel, limit=args.get('limit', 20), channel_id=args.get('channel_id'))
+        return text, []
+    if name == 'get_guild_info':
+        if not guild:
+            return "Fora de um servidor (DM).", []
+        text = build_guild_context(guild)
+        try:
+            chs = [f"#{c.name} ({c.id})" for c in guild.channels if isinstance(c, discord.TextChannel)][:30]
+            if chs:
+                text += "\nCanais de texto: " + ", ".join(chs)
+        except Exception:
+            pass
+        return text, []
+    if name == 'search_history':
+        hist = bot.get_cog('HistoryRAG')
+        if not hist:
+            return "Histórico não disponível.", []
+        if not guild:
+            return "Busca no histórico requer estar em um servidor.", []
+        query = args.get('query', '')
+        limit = max(1, min(12, int(args.get('limit', 5))))
+        try:
+            results = await hist.search(query, guild.id, limit=limit, channel_id=args.get('channel_id'), author_id=args.get('author_id'), author_name=args.get('author_name'), after=args.get('after'), before=args.get('before'), search_mode=args.get('search_mode','hybrid'), sort_by=args.get('sort_by','relevance'))  # type: ignore
+        except Exception:
+            logger.exception("search_history failed")
+            return "Erro ao buscar no histórico.", []
+        if not results:
+            return "Nenhuma mensagem relevante encontrada no histórico.", []
+        return render_search_results(results), []
+    if name == 'get_user_stats':
+        hist = bot.get_cog('HistoryRAG')
+        if not hist:
+            return "Histórico não disponível.", []
+        if not guild:
+            return "Requer servidor.", []
+        try:
+            stats = await hist.get_user_stats(guild.id, author_id=args.get('author_id'), author_name=args.get('author_name'))  # type: ignore
+        except Exception:
+            logger.exception("get_user_stats failed")
+            return "Erro ao buscar estatísticas.", []
+        if "error" in stats:
+            return stats["error"], []
+        lines = [f"Usuário: {stats['author_full']} ({', '.join(stats['author_ids'])})", f"Total: {stats['total_messages']} msgs | Média: {stats['avg_length']} chars", f"Canais: {', '.join(f'{k}={v}' for k,v in stats['top_channels'])}", f"Horários: {', '.join(f'{h}h={v}' for h,v in stats['top_hours'])}", f"Período: {stats['first_seen']} → {stats['last_seen']}", f"Exemplo: {stats['example_content']} {stats['example_jump']}"]
+        return "\n".join(lines), []
+    if name == 'count_mentions':
+        hist = bot.get_cog('HistoryRAG')
+        if not hist:
+            return "Histórico não disponível.", []
+        if not guild:
+            return "Requer servidor.", []
+        try:
+            groups = await hist.count_mentions(guild.id, query=args.get('query',''), group_by=args.get('group_by','author'), limit=int(args.get('limit',10)), after=args.get('after'), before=args.get('before'))  # type: ignore
+        except Exception:
+            logger.exception("count_mentions failed")
+            return "Erro ao contar menções.", []
+        if not groups:
+            return "Nenhuma menção encontrada.", []
+        lines = [f"{gr['key']}: {gr['count']}× — ex: {gr['example'].get('content','')[:120]}" for gr in groups]
+        return "\n".join(lines), []
+    if name == 'get_message_context':
+        text = await fetch_message_context(bot, channel_id=args.get('channel_id',''), message_id=args.get('message_id',''), window=args.get('window', 5))
+        return text, []
+    return None
+
+
+def history_tool_status(name: str, args: dict) -> str | None:
+    """Status label for the shared history/context tools, ``None`` otherwise."""
+    if name == 'get_channel_history':
+        lim = args.get('limit', 20)
+        cid = args.get('channel_id')
+        return f'📜 Lendo histórico ({lim} msgs)' + (f' canal {cid}' if cid else '')
+    if name == 'get_guild_info':
+        return '🏰 Coletando informações do servidor'
+    if name == 'search_history':
+        q = args.get('query','')[:40]
+        return f'🔎 Buscando no histórico: *{q}*'
+    if name == 'get_user_stats':
+        return f'📊 Estatísticas de {args.get("author_id") or args.get("author_name","usuário")}…'
+    if name == 'count_mentions':
+        return f'🔢 Contando menções: *{args.get("query","")[:30]}*'
+    if name == 'get_message_context':
+        return f'🧩 Contexto da mensagem {args.get("message_id","")}…'
+    return None
 
 
 def _usage_summary(response: Any) -> str:

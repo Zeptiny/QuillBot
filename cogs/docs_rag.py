@@ -43,12 +43,10 @@ from cogs.utils import (
     GUILD_INFO_TOOL as _GUILD_INFO_TOOL,
     SEARCH_HISTORY_TOOL as _SEARCH_HISTORY_TOOL,
     build_full_context_block as _build_full_context_block,
-    build_guild_context as _build_guild_context,
-    fetch_channel_gap as _fetch_channel_gap,
-    fetch_channel_history as _fetch_channel_history,
-    fetch_message_context as _fetch_message_context,
+    exec_history_tool as _exec_history_tool,
     fetch_recent_channel_context as _fetch_recent_channel_context,
-    render_search_results as _render_search_results,
+    fetch_turn_gap as _fetch_turn_gap,
+    history_tool_status as _history_tool_status,
 )
 from config import (
     CHANNEL_CONTEXT_MESSAGES,
@@ -1135,82 +1133,9 @@ class DocsRAG(commands.Cog):
                 )
             return '\n\n'.join(lines), []
 
-        if name == 'get_channel_history':
-            b = bot or self.bot
-            ch = channel
-            limit = args.get('limit', 20)
-            cid = args.get('channel_id')
-            text = await _fetch_channel_history(b, ch, limit=limit, channel_id=cid)
-            return text, []
-
-        if name == 'get_guild_info':
-            g = guild
-            if not g:
-                return "Fora de um servidor (DM).", []
-            text = _build_guild_context(g)
-            try:
-                chs = [f"#{c.name} ({c.id})" for c in g.channels if isinstance(c, discord.TextChannel)][:30]
-                if chs:
-                    text += "\nCanais de texto: " + ", ".join(chs)
-            except Exception:
-                pass
-            return text, []
-
-        if name == 'search_history':
-            hist = self.bot.get_cog('HistoryRAG')
-            if not hist:
-                return "Histórico não disponível.", []
-            g = guild
-            if not g:
-                return "Busca no histórico requer estar em um servidor.", []
-            query = args.get('query', '')
-            limit = max(1, min(12, int(args.get('limit', 5))))
-            try:
-                results = await hist.search(query, g.id, limit=limit, channel_id=args.get('channel_id'), author_id=args.get('author_id'), author_name=args.get('author_name'), after=args.get('after'), before=args.get('before'), search_mode=args.get('search_mode','hybrid'), sort_by=args.get('sort_by','relevance'))  # type: ignore
-            except Exception:
-                logger.exception("search_history failed in docs_rag")
-                return "Erro ao buscar no histórico.", []
-            if not results:
-                return "Nenhuma mensagem relevante encontrada no histórico.", []
-            return _render_search_results(results), []
-
-        if name == 'get_user_stats':
-            hist = self.bot.get_cog('HistoryRAG')
-            if not hist:
-                return "Histórico não disponível.", []
-            g = guild
-            if not g:
-                return "Requer servidor.", []
-            try:
-                stats = await hist.get_user_stats(g.id, author_id=args.get('author_id'), author_name=args.get('author_name'))  # type: ignore
-            except Exception:
-                logger.exception("get_user_stats failed")
-                return "Erro ao buscar estatísticas.", []
-            if "error" in stats:
-                return stats["error"], []
-            lines = [f"Usuário: {stats['author_full']} ({', '.join(stats['author_ids'])})", f"Total: {stats['total_messages']} msgs | Média: {stats['avg_length']} chars", f"Canais: {', '.join(f'{k}={v}' for k,v in stats['top_channels'])}", f"Horários: {', '.join(f'{h}h={v}' for h,v in stats['top_hours'])}", f"Período: {stats['first_seen']} → {stats['last_seen']}", f"Exemplo: {stats['example_content']} {stats['example_jump']}"]
-            return "\n".join(lines), []
-
-        if name == 'count_mentions':
-            hist = self.bot.get_cog('HistoryRAG')
-            if not hist:
-                return "Histórico não disponível.", []
-            g = guild
-            if not g:
-                return "Requer servidor.", []
-            try:
-                groups = await hist.count_mentions(g.id, query=args.get('query',''), group_by=args.get('group_by','author'), limit=int(args.get('limit',10)), after=args.get('after'), before=args.get('before'))  # type: ignore
-            except Exception:
-                logger.exception("count_mentions failed")
-                return "Erro ao contar menções.", []
-            if not groups:
-                return "Nenhuma menção encontrada.", []
-            lines = [f"{gr['key']}: {gr['count']}× — ex: {gr['example'].get('content','')[:120]}" for gr in groups]
-            return "\n".join(lines), []
-
-        if name == 'get_message_context':
-            text = await _fetch_message_context(self.bot, channel_id=args.get('channel_id',''), message_id=args.get('message_id',''), window=args.get('window', 5))
-            return text, []
+        result = await _exec_history_tool(name, args, bot=bot or self.bot, guild=guild, channel=channel)
+        if result is not None:
+            return result
 
         if name == 'get_spark_detail':
             if spark_report is None:
@@ -1254,21 +1179,9 @@ class DocsRAG(commands.Cog):
         if tool_name == 'search_plugins':
             query = args.get('query', '')
             return f'🔌 Pesquisando plugins: *{query[:60]}*'
-        if tool_name == 'get_channel_history':
-            lim = args.get('limit', 20)
-            cid = args.get('channel_id')
-            return f'📜 Lendo histórico ({lim} msgs)' + (f' canal {cid}' if cid else '')
-        if tool_name == 'get_guild_info':
-            return '🏰 Coletando informações do servidor'
-        if tool_name == 'search_history':
-            q = args.get('query','')[:40]
-            return f'🔎 Buscando no histórico: *{q}*'
-        if tool_name == 'get_user_stats':
-            return f'📊 Estatísticas de {args.get("author_id") or args.get("author_name","usuário")}…'
-        if tool_name == 'count_mentions':
-            return f'🔢 Contando menções: *{args.get("query","")[:30]}*'
-        if tool_name == 'get_message_context':
-            return f'🧩 Contexto da mensagem {args.get("message_id","")}…'
+        label = _history_tool_status(tool_name, args)
+        if label is not None:
+            return label
         if tool_name == 'memory_search':
             return f"🧠 Recordando: *{args.get('query', '')[:40]}*"
         if tool_name == 'memory_write':
@@ -1371,7 +1284,7 @@ class DocsRAG(commands.Cog):
 
         # Recent channel messages as conversation context ------------------------
         # (skipped when the turn's own channel gap was captured as prior_context)
-        if CHANNEL_CONTEXT_MESSAGES > 0 and not prior_context:
+        if CHANNEL_CONTEXT_MESSAGES > 0 and not prior_context and not any(t.get('prior_context') for t in (history or [])):
             try:
                 chan_ctx = await _fetch_recent_channel_context(
                     self.bot, channel, before=context_message,
@@ -1453,6 +1366,7 @@ class DocsRAG(commands.Cog):
             reply_to=reply_to,
             in_conversation=bool(history),
             prior_context=prior_context,
+            channel_id=getattr(channel, 'id', None),
         ))
 
         # Choose model and tool set based on session type ------------------------
@@ -1569,22 +1483,6 @@ class DocsRAG(commands.Cog):
         if spark_report is not None:
             self._spark_by_conv[str(message.id)] = spark_report
 
-    @staticmethod
-    async def _fetch_gap(message: discord.Message, history: list[dict]) -> list[str]:
-        """Channel chatter since the previous bot-directed turn (same channel only)."""
-        last_turn = history[-1] if history else None
-        anchor_id = (last_turn or {}).get('message_id')
-        if not anchor_id:
-            return []
-        if last_turn.get('channel_id') and str(last_turn['channel_id']) != str(message.channel.id):
-            return []
-        return await _fetch_channel_gap(
-            message.channel,
-            after_id=anchor_id,
-            before=message,
-            skip_ids={t.get('message_id') for t in history if t.get('message_id')},
-        )
-
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
         """Handle reply-based follow-up conversations."""
@@ -1624,10 +1522,13 @@ class DocsRAG(commands.Cog):
         # (in-memory only — lost on restart, text history survives).
         spark_report: SparkReport | None = self._spark_by_conv.get(conv['conv_id'])
 
-        async with message.channel.typing():
+        async with self.store.conversation_lock(conv['conv_id']), message.channel.typing():
             try:
+                fresh = await self.store.get_by_handle(ref_id)
+                if fresh:
+                    conv = fresh
                 history = conv['data'].get('turns', []).copy()
-                prior_context = await self._fetch_gap(message, history)
+                prior_context = await _fetch_turn_gap(message, history)
 
                 answer, embeds, sources = await self._run_agent(
                     follow_up_question,

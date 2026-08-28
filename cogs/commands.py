@@ -34,15 +34,13 @@ from cogs.utils import (
     PaginatedEmbedView,
     SEARCH_HISTORY_TOOL,
     build_full_context_block,
-    build_guild_context,
+    build_source_pages,
     build_temporal_context,
     build_user_context,
-    fetch_channel_gap,
-    fetch_channel_history,
-    fetch_message_context,
+    exec_history_tool,
     fetch_recent_channel_context,
-    build_source_pages,
-    render_search_results,
+    fetch_turn_gap,
+    history_tool_status,
     run_tool_loop,
     split_response,
 )
@@ -685,7 +683,7 @@ class Commands(commands.Cog):
                         system_content += f'\n\n{mem_block}'
                 except Exception:
                     logger.exception('Failed to build memory block')
-        if CHANNEL_CONTEXT_MESSAGES > 0 and not prior_context:
+        if CHANNEL_CONTEXT_MESSAGES > 0 and not prior_context and not any(t.get('prior_context') for t in (history or [])):
             try:
                 chan_ctx = await fetch_recent_channel_context(
                     self.bot,
@@ -716,6 +714,7 @@ class Commands(commands.Cog):
             reply_to=reply_to,
             in_conversation=bool(history),
             prior_context=prior_context,
+            channel_id=getattr(channel, 'id', None),
         ))
 
         base_tools = list(TAVILY_TOOLS) if TAVILY_AVAILABLE else []
@@ -742,74 +741,9 @@ class Commands(commands.Cog):
                     requester=user, channel=channel, origin=origin,
                     participant_ids=participant_ids,
                 )
-            if name == 'get_channel_history':
-                text = await fetch_channel_history(self.bot, fallback_channel, limit=args.get('limit', 20), channel_id=args.get('channel_id'))
-                return text, []
-            if name == 'get_guild_info':
-                g = guild or (interaction.guild if interaction else None)
-                if not g:
-                    return "Fora de um servidor (DM).", []
-                text = build_guild_context(g)
-                # add channel list
-                try:
-                    chs = [f"#{c.name} ({c.id})" for c in g.channels if isinstance(c, discord.TextChannel)][:30]
-                    if chs:
-                        text += "\nCanais de texto: " + ", ".join(chs)
-                except Exception:
-                    pass
-                return text, []
-            if name == 'search_history':
-                hist = self.bot.get_cog('HistoryRAG')
-                if not hist:
-                    return "Histórico não disponível.", []
-                g = fallback_guild
-                if not g:
-                    return "Busca no histórico requer estar em um servidor.", []
-                query = args.get('query', '')
-                limit = max(1, min(12, int(args.get('limit', 5))))
-                try:
-                    results = await hist.search(query, g.id, limit=limit, channel_id=args.get('channel_id'), author_id=args.get('author_id'), author_name=args.get('author_name'), after=args.get('after'), before=args.get('before'), search_mode=args.get('search_mode','hybrid'), sort_by=args.get('sort_by','relevance'))  # type: ignore
-                except Exception:
-                    logger.exception("search_history failed")
-                    return "Erro ao buscar no histórico.", []
-                if not results:
-                    return "Nenhuma mensagem relevante encontrada no histórico.", []
-                return render_search_results(results), []
-            if name == 'get_user_stats':
-                hist = self.bot.get_cog('HistoryRAG')
-                if not hist:
-                    return "Histórico não disponível.", []
-                g = fallback_guild
-                if not g:
-                    return "Requer servidor.", []
-                try:
-                    stats = await hist.get_user_stats(g.id, author_id=args.get('author_id'), author_name=args.get('author_name'))  # type: ignore
-                except Exception:
-                    logger.exception("get_user_stats failed")
-                    return "Erro ao buscar estatísticas.", []
-                if "error" in stats:
-                    return stats["error"], []
-                lines = [f"Usuário: {stats['author_full']} ({', '.join(stats['author_ids'])})", f"Total: {stats['total_messages']} msgs | Média: {stats['avg_length']} chars", f"Canais: {', '.join(f'{k}={v}' for k,v in stats['top_channels'])}", f"Horários: {', '.join(f'{h}h={v}' for h,v in stats['top_hours'])}", f"Período: {stats['first_seen']} → {stats['last_seen']}", f"Exemplo: {stats['example_content']} {stats['example_jump']}"]
-                return "\n".join(lines), []
-            if name == 'count_mentions':
-                hist = self.bot.get_cog('HistoryRAG')
-                if not hist:
-                    return "Histórico não disponível.", []
-                g = fallback_guild
-                if not g:
-                    return "Requer servidor.", []
-                try:
-                    groups = await hist.count_mentions(g.id, query=args.get('query',''), group_by=args.get('group_by','author'), limit=int(args.get('limit',10)), after=args.get('after'), before=args.get('before'))  # type: ignore
-                except Exception:
-                    logger.exception("count_mentions failed")
-                    return "Erro ao contar menções.", []
-                if not groups:
-                    return "Nenhuma menção encontrada.", []
-                lines = [f"{gr['key']}: {gr['count']}× — ex: {gr['example'].get('content','')[:120]}" for gr in groups]
-                return "\n".join(lines), []
-            if name == 'get_message_context':
-                text = await fetch_message_context(self.bot, channel_id=args.get('channel_id',''), message_id=args.get('message_id',''), window=args.get('window', 5))
-                return text, []
+            result = await exec_history_tool(name, args, bot=self.bot, guild=fallback_guild, channel=fallback_channel)
+            if result is not None:
+                return result
             return f'Ferramenta desconhecida: {name}', []
 
         def _status(name: str, args: dict) -> str:
@@ -823,21 +757,9 @@ class Commands(commands.Cog):
                 return f'🧠 Memória — {act}: *{tgt}*'
             if name == 'memory_about':
                 return f"🧠 Relembrando {args.get('user', 'quem pergunta')}…"
-            if name == 'get_channel_history':
-                lim = args.get('limit', 20)
-                cid = args.get('channel_id')
-                return f'📜 Lendo histórico ({lim} msgs)' + (f' canal {cid}' if cid else '')
-            if name == 'get_guild_info':
-                return '🏰 Coletando informações do servidor'
-            if name == 'search_history':
-                q = args.get('query','')[:40]
-                return f'🔎 Buscando no histórico: *{q}*'
-            if name == 'get_user_stats':
-                return f'📊 Estatísticas de {args.get("author_id") or args.get("author_name","usuário")}…'
-            if name == 'count_mentions':
-                return f'🔢 Contando menções: *{args.get("query","")[:30]}*'
-            if name == 'get_message_context':
-                return f'🧩 Contexto da mensagem {args.get("message_id","")}…'
+            label = history_tool_status(name, args)
+            if label is not None:
+                return label
             return f'🔧 Executando: {name}'
 
         answer, all_sources = await run_tool_loop(
@@ -900,22 +822,6 @@ class Commands(commands.Cog):
         else:
             raise error
 
-    @staticmethod
-    async def _fetch_gap(message: discord.Message, history: list[dict]) -> list[str]:
-        """Channel chatter since the previous bot-directed turn (same channel only)."""
-        last_turn = history[-1] if history else None
-        anchor_id = (last_turn or {}).get('message_id')
-        if not anchor_id:
-            return []
-        if last_turn.get('channel_id') and str(last_turn['channel_id']) != str(message.channel.id):
-            return []
-        return await fetch_channel_gap(
-            message.channel,
-            after_id=anchor_id,
-            before=message,
-            skip_ids={t.get('message_id') for t in history if t.get('message_id')},
-        )
-
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
         """Handle reply-based follow-up conversations and @mention chat mode."""
@@ -943,10 +849,13 @@ class Commands(commands.Cog):
                 image_urls = [att.url for att in message.attachments if att.content_type and att.content_type.startswith('image/')]
                 if not follow_up_question:
                     follow_up_question = 'Analise esta imagem.'
-                async with message.channel.typing():
+                async with self.store.conversation_lock(conv['conv_id']), message.channel.typing():
                     try:
+                        fresh = await self.store.get_by_handle(ref_id)
+                        if fresh:
+                            conv = fresh
                         history = conv['data'].get('turns', []).copy()
-                        prior_context = await self._fetch_gap(message, history)
+                        prior_context = await fetch_turn_gap(message, history)
                         answer, embeds, sources = await self._run_chat(
                             follow_up_question,
                             history=history,
@@ -1000,6 +909,15 @@ class Commands(commands.Cog):
             return
         if not self.bot.user or not self.bot.user.mentioned_in(message):
             return
+        if message.reference and message.reference.message_id:
+            docs_cog = self.bot.get_cog('DocsRAG')
+            if docs_cog is not None:
+                try:
+                    existing = await docs_cog.store.get_by_handle(message.reference.message_id)
+                except Exception:
+                    existing = None
+                if existing:
+                    return
         if not self.client:
             try:
                 await message.reply('⚠️ Chat indisponível: chave de API não configurada.', mention_author=False)

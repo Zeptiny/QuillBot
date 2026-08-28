@@ -28,8 +28,11 @@ import time
 from typing import Any
 
 from cogs.utils import BR_TZ
+from config import CONVERSATIONS_GAP_MESSAGES
 
 logger = logging.getLogger(__name__)
+
+PRIOR_CONTEXT_HEADER = 'Mensagens no canal antes desta pergunta'
 
 
 # ---------------------------------------------------------------------------
@@ -75,7 +78,7 @@ def make_turn(
             if s.get('url')
         ][:6],
         'reply_to': str(reply_to) if reply_to else None,
-        'prior_context': [l for l in (prior_context or []) if l][:30],
+        'prior_context': [l for l in (prior_context or []) if l][:max(30, CONVERSATIONS_GAP_MESSAGES)],
     }
 
 
@@ -122,12 +125,20 @@ def _author_label(author: dict | None) -> str:
 # LLM message builders (author-attributed history)
 # ---------------------------------------------------------------------------
 
+def _prior_context_head(lines: list[str], channel_id: str | int | None) -> str:
+    """Render the prior-context header (with channel when known) and its lines."""
+    if not lines:
+        return ''
+    header = f'[{PRIOR_CONTEXT_HEADER}]'
+    if channel_id:
+        header = f'[{PRIOR_CONTEXT_HEADER} (channel_id={channel_id})]'
+    return header + '\n' + '\n'.join(lines) + '\n\n'
+
+
 def _prior_context_block(turn: dict) -> str:
     """Render the channel chatter captured before a turn's question, if any."""
     prior = [l for l in (turn.get('prior_context') or []) if l]
-    if not prior:
-        return ''
-    return '[Mensagens no canal antes desta pergunta]\n' + '\n'.join(prior) + '\n\n'
+    return _prior_context_head(prior, turn.get('channel_id'))
 
 
 def build_history_messages(
@@ -135,11 +146,12 @@ def build_history_messages(
 ) -> list[dict]:
     """Render stored turns as attributed user/assistant message pairs.
 
-    Each user message is prefixed with ``[Por Autor (@handle) • data hora]``
-    plus extra metadata (speaker change, replied-to message, message id).
-    Channel chatter captured between turns (``prior_context``) is injected as
-    canonical lines above the question. Sources used in a turn are appended to
-    its assistant message.
+    Each user message is prefixed with ``[Por Autor (@handle) • author_id=… •
+    data hora]`` plus extra metadata: speaker change, ``↩ reply_to=`` and
+    ``msg_id=``. Channel chatter captured between turns (``prior_context``) is
+    injected above the question as a ``[Mensagens no canal antes desta
+    pergunta]`` block, tagged with the channel when known. Sources used in a
+    turn are appended to its assistant message.
     """
     messages: list[dict] = []
     prev_author_id: str | None = None
@@ -190,13 +202,12 @@ def build_current_message(
     reply_to: str | int | None = None,
     in_conversation: bool = False,
     prior_context: list[str] | None = None,
+    channel_id: str | int | None = None,
 ) -> dict:
     """Build the current user message, attributed when part of a conversation."""
     urls = [u for u in (image_urls or []) if u][:4]
     parts: list[dict] | None = None
-    head = ''
-    if prior_context:
-        head = '[Mensagens no canal antes desta pergunta]\n' + '\n'.join(prior_context) + '\n\n'
+    head = _prior_context_head([l for l in (prior_context or []) if l], channel_id)
     text = question
     if in_conversation:
         meta = [f'Agora — {_author_label(author)}']
@@ -222,19 +233,26 @@ def build_conversation_block(history: list[dict], *, current_author: dict | None
         add_participant(participants, turn.get('author') or {})
     start_ts = history[0].get('ts') if history else None
     current = _author_label(current_author)
+    last_channel_id = history[-1].get('channel_id') if history else None
     lines = [
         '<conversa_em_andamento>',
         f'Conversa iniciada em {_fmt_ts(start_ts)}.',
         f'Participantes: {", ".join(_author_label(p) for p in participants)}.',
+    ]
+    if last_channel_id:
+        lines.append(f'Canal atual da conversa: channel_id={last_channel_id} (use com get_message_context).')
+    lines.extend([
         'Cada pergunta do histórico aparece prefixada com [Por Autor (@usuário) • author_id=… • data hora] —',
         'use esses prefixos para saber quem perguntou o quê, e de qual resposta do bot.',
         'Mensagens do canal (ferramentas de histórico) usam o mesmo author_id/msg_id —',
         'correlacione-as para saber quem disse o quê na conversa do canal.',
-        'Blocos "[Mensagens no canal antes desta pergunta]" trazem a conversa do canal',
+        f'Blocos "[{PRIOR_CONTEXT_HEADER}]" trazem a conversa do canal',
         'que aconteceu entre as perguntas direcionadas ao bot.',
+        'Nos blocos de mensagens do canal, respostas do bot e perguntas já registradas como '
+        'turnos são omitidas; use get_channel_history para vê-las.',
         f'O turno atual foi enviado por {current}.',
         '</conversa_em_andamento>',
-    ]
+    ])
     return '\n'.join(lines)
 
 
@@ -261,6 +279,7 @@ class ConversationStore:
         self.kind = kind
         self.ttl_seconds = ttl_seconds
         self.max_stored = max_stored
+        self._locks: dict[str, asyncio.Lock] = {}
         self._ensure_db()
 
     # --- sync internals (invoked via asyncio.to_thread) ---
@@ -453,6 +472,20 @@ class ConversationStore:
             con.close()
 
     # --- async public API ---
+
+    def conversation_lock(self, conv_id: str | int) -> asyncio.Lock:
+        """Serialize follow-up processing per conversation so concurrent replies can't lose turns (last-write-wins)."""
+        key = str(conv_id)
+        lock = self._locks.get(key)
+        if lock is not None:
+            return lock
+        if len(self._locks) > 1024:
+            for stale_key, stale_lock in list(self._locks.items()):
+                if not stale_lock.locked():
+                    del self._locks[stale_key]
+        lock = asyncio.Lock()
+        self._locks[key] = lock
+        return lock
 
     async def get_by_handle(self, msg_id: str | int) -> dict | None:
         """Look up a conversation by bot-reply message id (touches TTL)."""

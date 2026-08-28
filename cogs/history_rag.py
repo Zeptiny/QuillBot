@@ -18,9 +18,7 @@ except ImportError:
 from discord import app_commands
 from discord.ext import commands, tasks
 
-from cogs.utils import format_chunk_line as _format_chunk_line_impl
-from cogs.utils import format_message_line as _format_message_line_impl
-from cogs.utils import message_content_text as _message_content_text
+from cogs.utils import format_chunk_line, format_message_line, message_content_text, render_search_results
 
 from config import (
     EMBEDDING_MODEL,
@@ -91,20 +89,11 @@ def _parse_dt(s: str | None) -> datetime.datetime | None:
             continue
     return None
 
-def _safe_content(msg: discord.Message) -> str:
-    return _message_content_text(msg)
-
-def _format_line(msg: discord.Message) -> str:
-    return _format_message_line_impl(msg)
-
 def _jump_url(msg: discord.Message) -> str:
     try:
         return f"https://discord.com/channels/{msg.guild.id}/{msg.channel.id}/{msg.id}"
     except Exception:
         return ""
-
-def _format_line_from_chunk(ch: dict) -> str:
-    return _format_chunk_line_impl(ch)
 
 def _keyword_score(query: str, chunk: dict) -> float:
     if not query:
@@ -253,8 +242,9 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
             )""")
             try:
                 con.execute("ALTER TABLE chunks ADD COLUMN reply_to TEXT")
-            except sqlite3.OperationalError:
-                pass
+            except sqlite3.OperationalError as e:
+                if "duplicate column name" not in str(e).lower():
+                    raise
             con.execute("CREATE INDEX IF NOT EXISTS idx_guild ON chunks(guild_id)")
             con.execute("CREATE INDEX IF NOT EXISTS idx_author ON chunks(author_id)")
             con.execute("CREATE INDEX IF NOT EXISTS idx_channel ON chunks(channel_id)")
@@ -302,7 +292,7 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
                     "chunk_text": r["chunk_text"] or "",
                     "window_line": r["window_line"] or "",
                     "window_lines": json.loads(r["window_lines"]) if r["window_lines"] else [],
-                    "reply_to": r["reply_to"] if "reply_to" in r.keys() else None,
+                    "reply_to": r["reply_to"],
                     "ts": r["ts"] or "",
                     "jump_url": r["jump_url"] or "",
                     "embedding": emb,
@@ -459,7 +449,7 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
         for cid, lst in per_channel.items():
             recent = collections.deque(maxlen=HISTORY_WINDOW_SIZE)
             for ch in lst[-HISTORY_WINDOW_SIZE:]:
-                recent.append(ch.get("window_line") or _format_line_from_chunk(ch))
+                recent.append(format_chunk_line(ch))
             self._recent[cid] = recent
 
     def _save_guild_json(self, guild_id: int):
@@ -668,7 +658,7 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
         try:
             async for msg in channel.history(limit=HISTORY_BACKFILL_LIMIT, oldest_first=True):
                 if msg.id in existing:
-                    line = _format_line(msg)
+                    line = format_message_line(msg)
                     recent.append(line)
                     continue
                 if HISTORY_EXCLUDE_BOTS and msg.author.bot:
@@ -716,7 +706,7 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
         texts: list[str] = []
         for msg in msgs:
             window_lines = list(recent)
-            cur_line = _format_line(msg)
+            cur_line = format_message_line(msg)
             if "```" in cur_line:
                 cur_line = cur_line.replace("```", "ˋˋˋ")
             if window_lines:
@@ -735,7 +725,7 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
                 "author_id": str(msg.author.id),
                 "author_name": getattr(msg.author, "display_name", str(msg.author)),
                 "author_full": f"{getattr(msg.author, 'display_name', str(msg.author))} (@{msg.author.name})",
-                "content": _safe_content(msg),
+                "content": message_content_text(msg, max_length=HISTORY_MAX_MSG_LENGTH),
                 "chunk_text": chunk_text,
                 "window_lines": window_lines.copy(),
                 "window_line": cur_line,
@@ -790,12 +780,12 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
         if idx is None:
             return
         try:
-            new_content = _safe_content(after)
+            new_content = message_content_text(after, max_length=HISTORY_MAX_MSG_LENGTH)
             chunk = self._chunks[gid][idx]
             if chunk.get("content") == new_content:
                 return
             chunk["content"] = new_content
-            chunk["window_line"] = _format_line(after)
+            chunk["window_line"] = format_message_line(after)
             chunk["chunk_text"] = "\n".join(chunk.get("window_lines", []) + [chunk["window_line"]])
             emb = (await self._embed_batch([chunk["chunk_text"]]))[0]
             chunk["embedding"] = np.array(emb, dtype=np.float32)
@@ -1176,15 +1166,7 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
             await interaction.followup.send(f"Nenhum resultado para `{query}` com os filtros aplicados.")
             return
         embed = discord.Embed(title=f"🔎 Histórico: {query}", color=discord.Color.blurple())
-        lines = []
-        for r in results:
-            jump = r.get("jump_url","")
-            link = f"[ver]({jump})" if jump else ""
-            header = f"**{r.get('author_full','?')}** em #{r.get('channel_name','?')} (channel_id={r.get('channel_id','?')}) — {r.get('ts','')[:19]} {link} (score {r.get('_score',0):.2f})"
-            window = r.get("chunk_text", r.get("content",""))[:900]
-            window = window.replace("```", "ˋˋˋ")
-            lines.append(f"{header}\n```\n{window}\n```")
-        desc = "\n\n---\n\n".join(lines)
+        desc = render_search_results(results, window_chars=900, include_msg_id=False)
         if len(desc) > 4000:
             desc = desc[:3990] + "\n…"
         embed.description = desc
