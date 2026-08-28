@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 import discord
 from openai import AsyncOpenAI
 
-from config import CHANNEL_CONTEXT_MESSAGES, LLM_MAX_TOKENS
+from config import CHANNEL_CONTEXT_MESSAGES, HISTORY_MAX_MSG_LENGTH, LLM_MAX_TOKENS
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +23,9 @@ CHANNEL_HISTORY_TOOL = {
         'description': (
             'Busca mensagens recentes do canal atual ou de outro canal do servidor. '
             'Use quando o usuário perguntar sobre conversas anteriores, contexto recente, '
-            'ou quando precisar entender o que foi discutido antes. Retorna autor, horário e conteúdo.'
+            'ou quando precisar entender o que foi discutido antes. Cada linha segue o formato '
+            '[data] Nome (@usuário) <author_id=…>: conteúdo ↩ reply_to=… [msg_id=…]. '
+            'Use author_id/msg_id/reply_to com search_history, get_user_stats ou get_message_context.'
         ),
         'parameters': {
             'type': 'object',
@@ -162,7 +164,8 @@ GET_MESSAGE_CONTEXT_TOOL = {
         'name': 'get_message_context',
         'description': (
             'Retorna o contexto local ao redor de uma mensagem específica (5 antes e 5 depois). '
-            'Use após search_history para expandir o contexto de um resultado relevante.'
+            'Use após search_history para expandir o contexto de um resultado relevante. '
+            'Aceita o msg_id ou reply_to visto em qualquer linha de mensagem.'
         ),
         'parameters': {
             'type': 'object',
@@ -193,6 +196,107 @@ def _fmt_dt(dt: datetime.datetime | None) -> str:
         return dt.astimezone(BR_TZ).strftime("%d/%m/%Y %H:%M BRT")
     except Exception:
         return dt.isoformat()
+
+
+def _fmt_dt_line(dt: datetime.datetime | None) -> str:
+    if not dt:
+        return "—"
+    try:
+        return dt.astimezone(BR_TZ).strftime("%d/%m/%Y %H:%M")
+    except Exception:
+        return dt.isoformat()
+
+
+# ---------------------------------------------------------------------------
+# Canonical message-line format
+#
+# Every renderer of Discord messages (channel history, message context,
+# search results, history chunks, conversation turns) emits lines in this
+# exact shape so the LLM can cross-reference messages between tools:
+#
+#   [dd/mm/aaaa HH:MM] Display (@handle) <author_id=123>: content ↩ reply_to=456 (Alvo) [msg_id=789]
+#
+# - ``author_id`` feeds search_history/get_user_stats filters;
+# - ``reply_to`` (only for replies) feeds get_message_context;
+# - ``msg_id`` always comes LAST so content truncation never eats it.
+# ---------------------------------------------------------------------------
+
+def message_content_text(msg: discord.Message, *, max_length: int = HISTORY_MAX_MSG_LENGTH) -> str:
+    """Flattened message content with attachment/embed markers, never empty."""
+    c = msg.content or ""
+    if msg.attachments:
+        c += " " + " ".join(f"[anexo:{a.filename}]" for a in msg.attachments)
+    if not c.strip() and msg.embeds:
+        try:
+            c = f"[embed: {msg.embeds[0].title or msg.embeds[0].description[:100]}]"
+        except Exception:
+            c = "[embed]"
+    c = c.replace("\n", " ").strip()
+    if not c:
+        c = "[sem texto]"
+    if len(c) > max_length:
+        c = c[:max_length] + "…"
+    return c
+
+
+def format_message_line(msg: discord.Message, *, is_target: bool = False) -> str:
+    """Render a Discord message in the canonical line format."""
+    display = getattr(msg.author, 'display_name', str(msg.author))
+    handle = getattr(msg.author, 'name', None)
+    author = f"{display} (@{handle})" if handle else display
+    author_id = getattr(msg.author, 'id', '')
+    line = f"[{_fmt_dt_line(msg.created_at)}] {author} <author_id={author_id}>: {message_content_text(msg)}"
+    ref = getattr(msg, 'reference', None)
+    ref_id = getattr(ref, 'message_id', None)
+    if ref_id:
+        target = ""
+        resolved = getattr(ref, 'resolved', None)
+        if resolved is not None and not isinstance(resolved, discord.DeletedReferencedMessage):
+            rdisplay = getattr(resolved.author, 'display_name', '')
+            if rdisplay:
+                target = f" ({rdisplay})"
+        line += f" ↩ reply_to={ref_id}{target}"
+    line += f" [msg_id={msg.id}]"
+    if is_target:
+        line += "  ← alvo"
+    return line
+
+
+def format_chunk_line(ch: dict) -> str:
+    """Render a stored history chunk (cogs/history_rag.py) in the canonical format."""
+    ts_raw = str(ch.get('ts', ''))
+    try:
+        dt = datetime.datetime.fromisoformat(ts_raw.replace('Z', '+00:00'))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        ts = dt.astimezone(BR_TZ).strftime("%d/%m/%Y %H:%M")
+    except Exception:
+        ts = ts_raw[:19]
+    author = ch.get('author_full') or ch.get('author_name') or '?'
+    content = str(ch.get('content', ''))[:HISTORY_MAX_MSG_LENGTH]
+    if not content:
+        content = '[sem texto]'
+    line = f"[{ts}] {author} <author_id={ch.get('author_id', '?')}>: {content}"
+    if ch.get('reply_to'):
+        line += f" ↩ reply_to={ch['reply_to']}"
+    return f"{line} [msg_id={ch.get('msg_id', '')}]"
+
+
+def render_search_results(results: list[dict], *, window_chars: int = 1200) -> str:
+    """Render search_history results (shared by commands.py and docs_rag.py)."""
+    parts: list[str] = []
+    for r in results:
+        jump = r.get('jump_url', '')
+        link = f"[ver]({jump})" if jump else ''
+        header = (
+            f"**{r.get('author_full', '?')}** em #{r.get('channel_name', '?')} "
+            f"(channel_id={r.get('channel_id', '?')}) — {str(r.get('ts', ''))[:19]} "
+            f"{link} (score {r.get('_score', 0):.2f})"
+        )
+        window = str(r.get('chunk_text', r.get('content', '')))[:window_chars]
+        window = window.replace('```', 'ˋˋˋ')
+        parts.append(f"{header}\n```\n{window}\n```\n`msg_id={r.get('msg_id')}`")
+    return "\n\n---\n\n".join(parts)
 
 
 def build_user_context(member: discord.abc.User | discord.Member | None) -> str:
@@ -312,19 +416,7 @@ async def fetch_channel_history(
     lines: list[str] = []
     try:
         async for msg in target.history(limit=limit, before=before):
-            ts = _fmt_dt(msg.created_at)
-            author = getattr(msg.author, 'display_name', str(msg.author))
-            content = msg.content or ""
-            if msg.attachments:
-                content += " " + " ".join(f"[anexo:{a.filename}]" for a in msg.attachments)
-            if msg.embeds and not content:
-                content = f"[embed: {msg.embeds[0].title or 'sem título'}]"
-            content = content.replace("\n", " ").strip()
-            if len(content) > 350:
-                content = content[:350] + "…"
-            if not content:
-                content = "[sem texto]"
-            lines.append(f"[{ts}] {author}: {content}")
+            lines.append(format_message_line(msg))
     except discord.Forbidden:
         return "Sem permissão para ler histórico deste canal."
     except Exception as e:
@@ -333,7 +425,10 @@ async def fetch_channel_history(
     if not lines:
         return "Nenhuma mensagem encontrada no histórico."
     lines.reverse()
-    header = f"Histórico de #{getattr(target, 'name', target.id)} (últimas {len(lines)} mensagens, cronológica):\n"
+    header = (
+        f"Histórico de #{getattr(target, 'name', target.id)} "
+        f"(channel_id={target.id}) — últimas {len(lines)} mensagens, cronológica:\n"
+    )
     return header + "\n".join(lines)
 
 
@@ -399,24 +494,18 @@ async def fetch_message_context(
     except Exception:
         pass
     def fmt(m: discord.Message, highlight: bool = False) -> str:
-        ts = _fmt_dt(m.created_at)
-        author = getattr(m.author, 'display_name', str(m.author))
-        content = (m.content or "").replace("\n", " ").strip()
-        if m.attachments:
-            content += " " + " ".join(f"[anexo:{a.filename}]" for a in m.attachments)
-        if not content:
-            content = "[sem texto]"
-        if len(content) > 350:
-            content = content[:350] + "…"
         prefix = "▶ " if highlight else "  "
-        return f"{prefix}[{ts}] {author}: {content} (id={m.id})"
+        return prefix + format_message_line(m, is_target=highlight)
     lines: list[str] = []
     for m in before:
         lines.append(fmt(m))
-    lines.append(fmt(target, True) + "  ← alvo")
+    lines.append(fmt(target, True))
     for m in after:
         lines.append(fmt(m))
-    header = f"Contexto ao redor de {message_id} em #{getattr(channel, 'name', channel_id)} (±{window}):\n"
+    header = (
+        f"Contexto ao redor de {message_id} em #{getattr(channel, 'name', channel_id)} "
+        f"(channel_id={channel.id}, ±{window}):\n"
+    )
     return header + "\n".join(lines)
 
 

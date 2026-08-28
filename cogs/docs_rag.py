@@ -47,6 +47,7 @@ from cogs.utils import (
     fetch_channel_history as _fetch_channel_history,
     fetch_message_context as _fetch_message_context,
     fetch_recent_channel_context as _fetch_recent_channel_context,
+    render_search_results as _render_search_results,
 )
 from config import (
     CHANNEL_CONTEXT_MESSAGES,
@@ -1170,14 +1171,7 @@ class DocsRAG(commands.Cog):
                 return "Erro ao buscar no histórico.", []
             if not results:
                 return "Nenhuma mensagem relevante encontrada no histórico.", []
-            parts = []
-            for r in results:
-                jump = r.get('jump_url', '')
-                link = f"[ver]({jump})" if jump else ""
-                window = r.get('chunk_text', r.get('content', ''))[:1200]
-                header = f"**{r.get('author_full','?')}** em #{r.get('channel_name','?')} — {r.get('ts','')} {link} (score {r.get('_score',0):.2f})"
-                parts.append(f"{header}\n```\n{window}\n```\n`msg_id={r.get('msg_id')} channel_id={r.get('channel_id')}`")
-            return "\n\n---\n\n".join(parts), []
+            return _render_search_results(results), []
 
         if name == 'get_user_stats':
             hist = self.bot.get_cog('HistoryRAG')

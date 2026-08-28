@@ -133,15 +133,19 @@ def build_history_messages(
     prev_author_id: str | None = None
     image_budget = max_images
     for turn in history[-max_turns:]:
-        meta = [f"Por {_author_label(turn.get('author'))}", _fmt_ts(turn.get('ts'))]
-        author_id = (turn.get('author') or {}).get('id')
+        author = turn.get('author') or {}
+        meta = [f"Por {_author_label(author)}"]
+        if author.get('id'):
+            meta.append(f"author_id={author['id']}")
+        meta.append(_fmt_ts(turn.get('ts')))
+        author_id = author.get('id')
         if prev_author_id is not None and author_id and author_id != prev_author_id:
             meta.append('nova pessoa na conversa')
         prev_author_id = author_id
         if turn.get('reply_to'):
-            meta.append(f"respondendo à msg {turn['reply_to']}")
+            meta.append(f"↩ reply_to={turn['reply_to']}")
         if turn.get('message_id'):
-            meta.append(f"msg {turn['message_id']}")
+            meta.append(f"msg_id={turn['message_id']}")
         prefix = f"[{' • '.join(meta)}]\n"
 
         question = turn.get('question') or ''
@@ -178,9 +182,12 @@ def build_current_message(
     parts: list[dict] | None = None
     text = question
     if in_conversation:
-        meta = [f'Agora — {_author_label(author)}', _fmt_ts(ts)]
+        meta = [f'Agora — {_author_label(author)}']
+        if (author or {}).get('id'):
+            meta.append(f"author_id={author['id']}")
+        meta.append(_fmt_ts(ts))
         if reply_to:
-            meta.append(f'respondendo à msg {reply_to}')
+            meta.append(f'↩ reply_to={reply_to}')
         text = f"[{' • '.join(meta)}]\n{question}"
     if urls:
         parts = [{'type': 'text', 'text': text}]
@@ -202,8 +209,10 @@ def build_conversation_block(history: list[dict], *, current_author: dict | None
         '<conversa_em_andamento>',
         f'Conversa iniciada em {_fmt_ts(start_ts)}.',
         f'Participantes: {", ".join(_author_label(p) for p in participants)}.',
-        'Cada pergunta do histórico aparece prefixada com [Por Autor (@usuário) • data hora] —',
+        'Cada pergunta do histórico aparece prefixada com [Por Autor (@usuário) • author_id=… • data hora] —',
         'use esses prefixos para saber quem perguntou o quê, e de qual resposta do bot.',
+        'Mensagens do canal (ferramentas de histórico) usam o mesmo author_id/msg_id —',
+        'correlacione-as para saber quem disse o quê na conversa do canal.',
         f'O turno atual foi enviado por {current}.',
         '</conversa_em_andamento>',
     ]

@@ -18,6 +18,10 @@ except ImportError:
 from discord import app_commands
 from discord.ext import commands, tasks
 
+from cogs.utils import format_chunk_line as _format_chunk_line_impl
+from cogs.utils import format_message_line as _format_message_line_impl
+from cogs.utils import message_content_text as _message_content_text
+
 from config import (
     EMBEDDING_MODEL,
     EMBEDDING_PROVIDER,
@@ -58,16 +62,6 @@ try:
 except Exception:
     pass
 
-def _fmt_dt(dt):
-    if not dt:
-        return "—"
-    try:
-        if BR_TZ:
-            return dt.astimezone(BR_TZ).strftime("%d/%m/%Y %H:%M BRT")
-        return dt.strftime("%Y-%m-%d %H:%M UTC")
-    except Exception:
-        return dt.isoformat()
-
 def _parse_dt(s: str | None) -> datetime.datetime | None:
     if not s:
         return None
@@ -98,26 +92,10 @@ def _parse_dt(s: str | None) -> datetime.datetime | None:
     return None
 
 def _safe_content(msg: discord.Message) -> str:
-    c = msg.content or ""
-    if msg.attachments:
-        c += " " + " ".join(f"[anexo:{a.filename}]" for a in msg.attachments)
-    if msg.embeds and not c:
-        try:
-            c = f"[embed: {msg.embeds[0].title or msg.embeds[0].description[:100]}]"
-        except Exception:
-            c = "[embed]"
-    c = c.replace("\n", " ").strip()
-    if len(c) > HISTORY_MAX_MSG_LENGTH:
-        c = c[:HISTORY_MAX_MSG_LENGTH] + "…"
-    return c
+    return _message_content_text(msg)
 
 def _format_line(msg: discord.Message) -> str:
-    ts = _fmt_dt(msg.created_at)
-    author = getattr(msg.author, 'display_name', str(msg.author))
-    content = _safe_content(msg)
-    if not content:
-        content = "[sem texto]"
-    return f"[{ts}] {author} (@{msg.author.name}): {content}"
+    return _format_message_line_impl(msg)
 
 def _jump_url(msg: discord.Message) -> str:
     try:
@@ -126,10 +104,7 @@ def _jump_url(msg: discord.Message) -> str:
         return ""
 
 def _format_line_from_chunk(ch: dict) -> str:
-    ts = ch.get("ts", "")[:19]
-    author = ch.get("author_full", ch.get("author_name", "?"))
-    content = ch.get("content", "")[:300]
-    return f"[{ts}] {author}: {content}"
+    return _format_chunk_line_impl(ch)
 
 def _keyword_score(query: str, chunk: dict) -> float:
     if not query:
@@ -271,10 +246,15 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
                 chunk_text TEXT,
                 window_line TEXT,
                 window_lines TEXT,
+                reply_to TEXT,
                 ts TEXT,
                 jump_url TEXT,
                 embedding BLOB NOT NULL
             )""")
+            try:
+                con.execute("ALTER TABLE chunks ADD COLUMN reply_to TEXT")
+            except sqlite3.OperationalError:
+                pass
             con.execute("CREATE INDEX IF NOT EXISTS idx_guild ON chunks(guild_id)")
             con.execute("CREATE INDEX IF NOT EXISTS idx_author ON chunks(author_id)")
             con.execute("CREATE INDEX IF NOT EXISTS idx_channel ON chunks(channel_id)")
@@ -322,6 +302,7 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
                     "chunk_text": r["chunk_text"] or "",
                     "window_line": r["window_line"] or "",
                     "window_lines": json.loads(r["window_lines"]) if r["window_lines"] else [],
+                    "reply_to": r["reply_to"] if "reply_to" in r.keys() else None,
                     "ts": r["ts"] or "",
                     "jump_url": r["jump_url"] or "",
                     "embedding": emb,
@@ -361,10 +342,10 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
                 else:
                     blob = np.array(emb, dtype=np.float32).tobytes()
                 con.execute("""
-                INSERT OR REPLACE INTO chunks (msg_id, guild_id, channel_id, channel_name, author_id, author_name, author_full, content, chunk_text, window_line, window_lines, ts, jump_url, embedding)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                INSERT OR REPLACE INTO chunks (msg_id, guild_id, channel_id, channel_name, author_id, author_name, author_full, content, chunk_text, window_line, window_lines, reply_to, ts, jump_url, embedding)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """, (
-                    str(c["msg_id"]), int(guild_id), str(c["channel_id"]), c.get("channel_name",""), str(c["author_id"]), c.get("author_name",""), c.get("author_full",""), c.get("content",""), c.get("chunk_text",""), c.get("window_line",""), json.dumps(c.get("window_lines",[]), ensure_ascii=False), c.get("ts",""), c.get("jump_url",""), blob
+                    str(c["msg_id"]), int(guild_id), str(c["channel_id"]), c.get("channel_name",""), str(c["author_id"]), c.get("author_name",""), c.get("author_full",""), c.get("content",""), c.get("chunk_text",""), c.get("window_line",""), json.dumps(c.get("window_lines",[]), ensure_ascii=False), c.get("reply_to"), c.get("ts",""), c.get("jump_url",""), blob
                 ))
                 try:
                     con.execute("INSERT INTO chunks_fts (msg_id, guild_id, chunk_text, content) VALUES (?,?,?,?)", (str(c["msg_id"]), int(guild_id), c.get("chunk_text",""), c.get("content","")))
@@ -394,11 +375,11 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
                 else:
                     blob = np.array(emb, dtype=np.float32).tobytes()
                 rows.append((
-                    str(c["msg_id"]), int(guild_id), str(c["channel_id"]), c.get("channel_name", ""), str(c["author_id"]), c.get("author_name", ""), c.get("author_full", ""), c.get("content", ""), c.get("chunk_text", ""), c.get("window_line", ""), json.dumps(c.get("window_lines", []), ensure_ascii=False), c.get("ts", ""), c.get("jump_url", ""), blob
+                    str(c["msg_id"]), int(guild_id), str(c["channel_id"]), c.get("channel_name", ""), str(c["author_id"]), c.get("author_name", ""), c.get("author_full", ""), c.get("content", ""), c.get("chunk_text", ""), c.get("window_line", ""), json.dumps(c.get("window_lines", []), ensure_ascii=False), c.get("reply_to"), c.get("ts", ""), c.get("jump_url", ""), blob
                 ))
             con.executemany("""
-            INSERT OR REPLACE INTO chunks (msg_id, guild_id, channel_id, channel_name, author_id, author_name, author_full, content, chunk_text, window_line, window_lines, ts, jump_url, embedding)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            INSERT OR REPLACE INTO chunks (msg_id, guild_id, channel_id, channel_name, author_id, author_name, author_full, content, chunk_text, window_line, window_lines, reply_to, ts, jump_url, embedding)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """, rows)
             try:
                 con.executemany(
@@ -744,6 +725,8 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
                 chunk_text = cur_line
             texts.append(chunk_text)
             jump = _jump_url(msg)
+            ref = getattr(msg, "reference", None)
+            ref_id = getattr(ref, "message_id", None)
             chunk = {
                 "msg_id": str(msg.id),
                 "channel_id": str(cid),
@@ -756,6 +739,7 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
                 "chunk_text": chunk_text,
                 "window_lines": window_lines.copy(),
                 "window_line": cur_line,
+                "reply_to": str(ref_id) if ref_id else None,
                 "ts": msg.created_at.isoformat(),
                 "jump_url": jump,
             }
@@ -811,9 +795,7 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
             if chunk.get("content") == new_content:
                 return
             chunk["content"] = new_content
-            ts = _fmt_dt(after.created_at)
-            author = getattr(after.author, 'display_name', str(after.author))
-            chunk["window_line"] = f"[{ts}] {author} (@{after.author.name}): {new_content}"
+            chunk["window_line"] = _format_line(after)
             chunk["chunk_text"] = "\n".join(chunk.get("window_lines", []) + [chunk["window_line"]])
             emb = (await self._embed_batch([chunk["chunk_text"]]))[0]
             chunk["embedding"] = np.array(emb, dtype=np.float32)
@@ -1198,8 +1180,9 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
         for r in results:
             jump = r.get("jump_url","")
             link = f"[ver]({jump})" if jump else ""
-            header = f"**{r.get('author_full','?')}** em #{r.get('channel_name','?')} — {r.get('ts','')[:19]} {link} (score {r.get('_score',0):.2f})"
+            header = f"**{r.get('author_full','?')}** em #{r.get('channel_name','?')} (channel_id={r.get('channel_id','?')}) — {r.get('ts','')[:19]} {link} (score {r.get('_score',0):.2f})"
             window = r.get("chunk_text", r.get("content",""))[:900]
+            window = window.replace("```", "ˋˋˋ")
             lines.append(f"{header}\n```\n{window}\n```")
         desc = "\n\n---\n\n".join(lines)
         if len(desc) > 4000:
