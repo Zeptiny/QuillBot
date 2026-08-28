@@ -10,7 +10,12 @@ from zoneinfo import ZoneInfo
 import discord
 from openai import AsyncOpenAI
 
-from config import CHANNEL_CONTEXT_MESSAGES, HISTORY_MAX_MSG_LENGTH, LLM_MAX_TOKENS
+from config import (
+    CHANNEL_CONTEXT_MESSAGES,
+    CONVERSATION_GAP_MESSAGES,
+    HISTORY_MAX_MSG_LENGTH,
+    LLM_MAX_TOKENS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -450,6 +455,45 @@ async def fetch_recent_channel_context(
         return None
     text = await fetch_channel_history(bot, channel, limit=n, before=before)
     return f"<mensagens_recentes_do_canal>\n{text}\n</mensagens_recentes_do_canal>"
+
+
+async def fetch_channel_gap(
+    channel: discord.abc.Messageable | None,
+    *,
+    after_id: str | int,
+    before: discord.abc.Snowflake,
+    skip_ids: set[str] | None = None,
+    limit: int | None = None,
+) -> list[str]:
+    """Human channel messages between a stored turn and a new follow-up.
+
+    Anchors on the previous bot-directed turn's message id and returns the
+    chatter in between as canonical lines (bot messages excluded — bot answers
+    are already replayed as conversation turns). Controlled by
+    ``CONVERSATION_GAP_MESSAGES`` (0 disables). Returns [] on failure — the
+    recent-channel window is then the fallback.
+    """
+    n = CONVERSATION_GAP_MESSAGES if limit is None else limit
+    if n <= 0 or channel is None or not hasattr(channel, "history"):
+        return []
+    try:
+        anchor = discord.Object(id=int(after_id))
+    except (TypeError, ValueError):
+        return []
+    skip = {str(s) for s in (skip_ids or set()) if s}
+    skip.add(str(after_id))
+    lines: list[str] = []
+    try:
+        async for msg in channel.history(limit=n, after=anchor, before=before):
+            if msg.author.bot or str(msg.id) in skip:
+                continue
+            if not msg.content and not msg.attachments and not msg.embeds:
+                continue
+            lines.append(format_message_line(msg))
+    except Exception:
+        logger.exception("fetch_channel_gap failed")
+        return []
+    return lines
 
 
 async def fetch_message_context(

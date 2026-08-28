@@ -74,6 +74,8 @@ CONVERSATIONS_TTL_SECONDS: Final[float] = float(os.getenv('CONVERSATIONS_TTL_SEC
 CONVERSATIONS_MAX_STORED: Final[int] = int(os.getenv('CONVERSATIONS_MAX_STORED', '200'))
 CONVERSATIONS_MAX_TURNS: Final[int] = int(os.getenv('CONVERSATIONS_MAX_TURNS', '24'))
 CONVERSATIONS_HISTORY_TURNS: Final[int] = int(os.getenv('CONVERSATIONS_HISTORY_TURNS', '16'))
+# Max channel messages captured between two bot-directed turns as prior_context; 0 disables.
+CONVERSATION_GAP_MESSAGES: Final[int] = int(os.getenv('CONVERSATION_GAP_MESSAGES', '20'))
 
 # --- History RAG (entire server) ---
 HISTORY_ENABLED: Final[bool] = os.getenv('HISTORY_ENABLED', 'true').strip().lower() in ('1', 'true', 'yes')

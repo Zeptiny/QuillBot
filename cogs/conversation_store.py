@@ -57,6 +57,7 @@ def make_turn(
     images: list[str] | None = None,
     sources: list[dict] | None = None,
     reply_to: str | int | None = None,
+    prior_context: list[str] | None = None,
 ) -> dict:
     """Build a single conversation turn record."""
     return {
@@ -74,6 +75,7 @@ def make_turn(
             if s.get('url')
         ][:6],
         'reply_to': str(reply_to) if reply_to else None,
+        'prior_context': [l for l in (prior_context or []) if l][:30],
     }
 
 
@@ -120,6 +122,14 @@ def _author_label(author: dict | None) -> str:
 # LLM message builders (author-attributed history)
 # ---------------------------------------------------------------------------
 
+def _prior_context_block(turn: dict) -> str:
+    """Render the channel chatter captured before a turn's question, if any."""
+    prior = [l for l in (turn.get('prior_context') or []) if l]
+    if not prior:
+        return ''
+    return '[Mensagens no canal antes desta pergunta]\n' + '\n'.join(prior) + '\n\n'
+
+
 def build_history_messages(
     history: list[dict], *, max_turns: int = 16, max_images: int = 4,
 ) -> list[dict]:
@@ -127,7 +137,9 @@ def build_history_messages(
 
     Each user message is prefixed with ``[Por Autor (@handle) • data hora]``
     plus extra metadata (speaker change, replied-to message, message id).
-    Sources used in a turn are appended to its assistant message.
+    Channel chatter captured between turns (``prior_context``) is injected as
+    canonical lines above the question. Sources used in a turn are appended to
+    its assistant message.
     """
     messages: list[dict] = []
     prev_author_id: str | None = None
@@ -149,15 +161,16 @@ def build_history_messages(
         prefix = f"[{' • '.join(meta)}]\n"
 
         question = turn.get('question') or ''
+        head = _prior_context_block(turn)
         images = [u for u in turn.get('images', []) if u][:image_budget]
         if images:
             image_budget -= len(images)
-            parts: list[dict] = [{'type': 'text', 'text': prefix + question}]
+            parts: list[dict] = [{'type': 'text', 'text': head + prefix + question}]
             for url in images:
                 parts.append({'type': 'image_url', 'image_url': {'url': url}})
             messages.append({'role': 'user', 'content': parts})
         else:
-            messages.append({'role': 'user', 'content': prefix + question})
+            messages.append({'role': 'user', 'content': head + prefix + question})
 
         answer = turn.get('answer') or ''
         sources = turn.get('sources') or []
@@ -176,10 +189,14 @@ def build_current_message(
     image_urls: list[str] | None = None,
     reply_to: str | int | None = None,
     in_conversation: bool = False,
+    prior_context: list[str] | None = None,
 ) -> dict:
     """Build the current user message, attributed when part of a conversation."""
     urls = [u for u in (image_urls or []) if u][:4]
     parts: list[dict] | None = None
+    head = ''
+    if prior_context:
+        head = '[Mensagens no canal antes desta pergunta]\n' + '\n'.join(prior_context) + '\n\n'
     text = question
     if in_conversation:
         meta = [f'Agora — {_author_label(author)}']
@@ -188,7 +205,7 @@ def build_current_message(
         meta.append(_fmt_ts(ts))
         if reply_to:
             meta.append(f'↩ reply_to={reply_to}')
-        text = f"[{' • '.join(meta)}]\n{question}"
+        text = f"{head}[{' • '.join(meta)}]\n{question}"
     if urls:
         parts = [{'type': 'text', 'text': text}]
         for url in urls:
@@ -213,6 +230,8 @@ def build_conversation_block(history: list[dict], *, current_author: dict | None
         'use esses prefixos para saber quem perguntou o quê, e de qual resposta do bot.',
         'Mensagens do canal (ferramentas de histórico) usam o mesmo author_id/msg_id —',
         'correlacione-as para saber quem disse o quê na conversa do canal.',
+        'Blocos "[Mensagens no canal antes desta pergunta]" trazem a conversa do canal',
+        'que aconteceu entre as perguntas direcionadas ao bot.',
         f'O turno atual foi enviado por {current}.',
         '</conversa_em_andamento>',
     ]

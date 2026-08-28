@@ -44,6 +44,7 @@ from cogs.utils import (
     SEARCH_HISTORY_TOOL as _SEARCH_HISTORY_TOOL,
     build_full_context_block as _build_full_context_block,
     build_guild_context as _build_guild_context,
+    fetch_channel_gap as _fetch_channel_gap,
     fetch_channel_history as _fetch_channel_history,
     fetch_message_context as _fetch_message_context,
     fetch_recent_channel_context as _fetch_recent_channel_context,
@@ -1317,6 +1318,7 @@ class DocsRAG(commands.Cog):
         participant_ids: set[str] | None = None,
         origin: str | None = None,
         context_message: discord.Message | None = None,
+        prior_context: list[str] | None = None,
     ) -> tuple[str, list[discord.Embed], list[dict]]:
         """Run the LLM with tool-calling in a loop until it produces a final answer.
 
@@ -1368,7 +1370,8 @@ class DocsRAG(commands.Cog):
                     logger.exception('Failed to build memory block for _run_agent')
 
         # Recent channel messages as conversation context ------------------------
-        if CHANNEL_CONTEXT_MESSAGES > 0:
+        # (skipped when the turn's own channel gap was captured as prior_context)
+        if CHANNEL_CONTEXT_MESSAGES > 0 and not prior_context:
             try:
                 chan_ctx = await _fetch_recent_channel_context(
                     self.bot, channel, before=context_message,
@@ -1449,6 +1452,7 @@ class DocsRAG(commands.Cog):
             image_urls=urls,
             reply_to=reply_to,
             in_conversation=bool(history),
+            prior_context=prior_context,
         ))
 
         # Choose model and tool set based on session type ------------------------
@@ -1565,6 +1569,22 @@ class DocsRAG(commands.Cog):
         if spark_report is not None:
             self._spark_by_conv[str(message.id)] = spark_report
 
+    @staticmethod
+    async def _fetch_gap(message: discord.Message, history: list[dict]) -> list[str]:
+        """Channel chatter since the previous bot-directed turn (same channel only)."""
+        last_turn = history[-1] if history else None
+        anchor_id = (last_turn or {}).get('message_id')
+        if not anchor_id:
+            return []
+        if last_turn.get('channel_id') and str(last_turn['channel_id']) != str(message.channel.id):
+            return []
+        return await _fetch_channel_gap(
+            message.channel,
+            after_id=anchor_id,
+            before=message,
+            skip_ids={t.get('message_id') for t in history if t.get('message_id')},
+        )
+
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
         """Handle reply-based follow-up conversations."""
@@ -1607,6 +1627,7 @@ class DocsRAG(commands.Cog):
         async with message.channel.typing():
             try:
                 history = conv['data'].get('turns', []).copy()
+                prior_context = await self._fetch_gap(message, history)
 
                 answer, embeds, sources = await self._run_agent(
                     follow_up_question,
@@ -1621,6 +1642,7 @@ class DocsRAG(commands.Cog):
                     participant_ids=_conversation_participants(message),
                     origin=message.jump_url,
                     context_message=message,
+                    prior_context=prior_context,
                 )
                 if len(embeds) == 1:
                     reply = await message.reply(embed=embeds[0])
@@ -1639,6 +1661,7 @@ class DocsRAG(commands.Cog):
                     images=image_urls,
                     sources=sources,
                     reply_to=ref_id,
+                    prior_context=prior_context,
                 )
                 data = conv['data']
                 data['turns'] = _cap_turns(history + [turn], CONVERSATIONS_MAX_TURNS)
