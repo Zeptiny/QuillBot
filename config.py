@@ -125,6 +125,38 @@ TAVILY_AVAILABLE: Final[bool] = bool(TAVILY_API_KEY) and WEB_SEARCH_ENABLED
 # --- Logging ---
 LOG_LEVEL: Final[str] = os.getenv('LOG_LEVEL', 'INFO').upper()
 
+# --- API request logging (api_logger.py) ---
+# Patches aiohttp + httpx at transport level: every outbound HTTP request
+# (discord.py REST, OpenAI SDK, tavily-python, direct aiohttp calls) and every
+# inbound Discord interaction is appended to a rotating JSONL file.
+API_REQUEST_LOG_ENABLED: Final[bool] = (
+    os.getenv('API_REQUEST_LOG_ENABLED', 'true').strip().lower() in ('1', 'true', 'yes')
+)
+API_REQUEST_LOG_PATH: Final[str] = os.getenv('API_REQUEST_LOG_PATH', 'data/api_requests.log')
+API_REQUEST_LOG_MAX_BYTES: Final[int] = int(os.getenv('API_REQUEST_LOG_MAX_BYTES', str(10 * 1024 * 1024)))
+API_REQUEST_LOG_BACKUPS: Final[int] = int(os.getenv('API_REQUEST_LOG_BACKUPS', '5'))
+# Outbound Discord REST traffic (message sends, history fetches) is by far the
+# noisiest; false omits it. Inbound interactions are logged regardless.
+API_REQUEST_LOG_DISCORD: Final[bool] = (
+    os.getenv('API_REQUEST_LOG_DISCORD', 'true').strip().lower() in ('1', 'true', 'yes')
+)
+API_REQUEST_LOG_CONSOLE: Final[bool] = (
+    os.getenv('API_REQUEST_LOG_CONSOLE', 'false').strip().lower() in ('1', 'true', 'yes')
+)
+# Services whose request/response JSON bodies are logged. 'openai' is whatever
+# host OPENAI_BASE_URL points at (OpenRouter by default). Accepts 'all'/'none'.
+# Bodies are captured for httpx-based services (openai, tavily); aiohttp-based
+# services (discord, github, plugin APIs) log metadata only.
+_raw_body_scope: Final[str] = os.getenv('API_REQUEST_LOG_BODY', 'openai,tavily').strip().lower()
+if _raw_body_scope == 'all':
+    _body_scope: set[str] = {'*'}
+elif _raw_body_scope in ('', 'none'):
+    _body_scope = set()
+else:
+    _body_scope = {s.strip() for s in _raw_body_scope.split(',') if s.strip()}
+API_REQUEST_LOG_BODY: Final[set[str]] = _body_scope
+API_REQUEST_LOG_BODY_MAX_CHARS: Final[int] = int(os.getenv('API_REQUEST_LOG_BODY_MAX_CHARS', '20000'))
+
 # --- Docs / RAG ---
 DOCS_REPO: Final[str] = 'MinersRefuge/docs'
 DOCS_BRANCH: Final[str] = 'main'

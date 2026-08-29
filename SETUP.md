@@ -66,6 +66,34 @@ cp .env.example .env
 
 These apply to `/ask` and `/analyze`. Users who exceed the limit receive an ephemeral "wait X seconds" message.
 
+### Optional — API Request Logging
+
+Every outbound HTTP request (discord.py REST, the OpenAI-compatible LLM API, Tavily, GitHub, plugin APIs) and every inbound Discord interaction is appended as one JSON line to a rotating file. Implemented in [`api_logger.py`](api_logger.py) by patching the `aiohttp` and `httpx` transports — no call-site changes needed.
+
+| Variable | Default | Description |
+|---|---|---|
+| `API_REQUEST_LOG_ENABLED` | `true` | Master switch. |
+| `API_REQUEST_LOG_PATH` | `data/api_requests.log` | Log file path (parent dirs are created). |
+| `API_REQUEST_LOG_MAX_BYTES` | `10485760` | Rotate the file after this many bytes. |
+| `API_REQUEST_LOG_BACKUPS` | `5` | Rotated files to keep. |
+| `API_REQUEST_LOG_DISCORD` | `true` | Set `false` to omit outbound Discord REST traffic (message sends, history fetches) — the noisiest service. Inbound interactions are logged regardless. |
+| `API_REQUEST_LOG_CONSOLE` | `false` | Also mirror API log lines to stdout (visible in `docker compose logs`). |
+| `API_REQUEST_LOG_BODY` | `openai,tavily` | Comma-separated services whose request/response JSON bodies are logged. `openai` = whatever host `OPENAI_BASE_URL` points at (OpenRouter by default). Accepts `all` or `none`. |
+| `API_REQUEST_LOG_BODY_MAX_CHARS` | `20000` | Per-body truncation limit. |
+
+Example lines:
+
+```json
+{"ts":"2026-08-28T17:18:47.123+00:00","dir":"outbound","service":"openai","method":"POST","url":"https://openrouter.ai/api/v1/chat/completions","status":200,"duration_ms":1834.2,"model":"qwen/qwen3.6-plus","request_body":{"model":"...","messages":[...]},"response_body":{"choices":[...],"usage":{"prompt_tokens":9123}}}
+{"ts":"2026-08-28T17:18:51.780+00:00","dir":"inbound","service":"discord","interaction_type":"application_command","command":"ask","user":"nyuu","user_id":123,"guild_id":456,"channel_id":789}
+```
+
+Notes:
+
+- **Privacy:** captured bodies include users' message content sent to the LLM and search queries — they persist to disk.
+- Bodies are captured for **httpx-based** services (`openai`, `tavily`); **aiohttp-based** services (Discord REST, GitHub, Modrinth/Hangar/SpigotMC, mclo.gs, spark) log metadata only.
+- Headers are never logged; API keys travel in headers. Sensitive query-string values (`token`, `key`, …) are redacted to `REDACTED`.
+
 ### Optional — RAG / Docs
 
 | Variable               | Default              | Description                                              |

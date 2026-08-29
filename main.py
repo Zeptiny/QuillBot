@@ -4,6 +4,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+from api_logger import install as install_api_logging, install_inbound_hooks
 from config import BOT_TOKEN, LOG_LEVEL, validate_config
 
 validate_config()
@@ -14,6 +15,10 @@ logging.basicConfig(
     format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
 )
 logger = logging.getLogger('quillbot')
+
+# Patches aiohttp + httpx before any client (discord.py REST, OpenAI SDK,
+# tavily) is constructed.
+install_api_logging()
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -52,6 +57,7 @@ async def on_ready():
 
 
 async def main():
+    install_inbound_hooks(bot)
     async with bot:
         for cog in COGS:
             await bot.load_extension(cog)
