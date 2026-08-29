@@ -92,6 +92,17 @@ def _parse_dt(s: str | None) -> datetime.datetime | None:
             continue
     return None
 
+# Explicit column list for full-row reads: positional access avoids
+# sqlite3.Row's per-access name scan, and the fixed order is immune to
+# reply_to being appended by ALTER TABLE on DBs created before that column.
+_CHUNK_COLS = (
+    "msg_id", "guild_id", "channel_id", "channel_name", "author_id", "author_name",
+    "author_full", "content", "chunk_text", "window_line", "window_lines",
+    "reply_to", "ts", "jump_url", "embedding",
+)
+_EMB_COL = 14
+
+
 def _jump_url(msg: discord.Message) -> str:
     try:
         return f"https://discord.com/channels/{msg.guild.id}/{msg.channel.id}/{msg.id}"
@@ -346,6 +357,9 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
                 if "duplicate column name" not in str(e).lower():
                     raise
             con.execute("CREATE INDEX IF NOT EXISTS idx_guild ON chunks(guild_id)")
+            # Satisfies the per-guild ORDER BY ts load without a temp-B-tree sort
+            # over full rows (embedding blobs included).
+            con.execute("CREATE INDEX IF NOT EXISTS idx_guild_ts ON chunks(guild_id, ts)")
             con.execute("CREATE INDEX IF NOT EXISTS idx_author ON chunks(author_id)")
             con.execute("CREATE INDEX IF NOT EXISTS idx_channel ON chunks(channel_id)")
             con.execute("CREATE INDEX IF NOT EXISTS idx_ts ON chunks(ts)")
@@ -385,41 +399,52 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
             return False
         try:
             con = sqlite3.connect(path)
-            con.row_factory = sqlite3.Row
-            cur = con.execute("SELECT * FROM chunks WHERE guild_id=? ORDER BY ts ASC", (guild_id,))
+            cur = con.execute(
+                f"SELECT {', '.join(_CHUNK_COLS)} FROM chunks WHERE guild_id=? ORDER BY ts ASC",
+                (guild_id,),
+            )
             rows = cur.fetchall()
             con.close()
             if not rows:
                 return False
-            chunks = []
-            embs = []
-            for r in rows:
-                emb = np.frombuffer(r["embedding"], dtype=np.float32)
-                if EMBEDDING_PROVIDER == "local" and self._local_dim and emb.shape[0] != self._local_dim:
-                    logger.warning("DB dim mismatch guild %s, skipping DB load", guild_id)
-                    return False
-                chunks.append({
-                    "msg_id": r["msg_id"],
-                    "channel_id": r["channel_id"],
-                    "guild_id": str(r["guild_id"]),
-                    "channel_name": r["channel_name"] or r["channel_id"],
-                    "author_id": r["author_id"],
-                    "author_name": r["author_name"] or "?",
-                    "author_full": r["author_full"] or r["author_name"] or "?",
-                    "content": r["content"] or "",
-                    "chunk_text": r["chunk_text"] or "",
-                    "window_line": r["window_line"] or "",
-                    "window_lines": json.loads(r["window_lines"]) if r["window_lines"] else [],
-                    "reply_to": r["reply_to"],
-                    "ts": r["ts"] or "",
-                    "jump_url": r["jump_url"] or "",
-                    "embedding": emb,
-                })
-                embs.append(emb)
-            if not chunks:
+            emb_len = len(rows[0][_EMB_COL])
+            if emb_len == 0 or emb_len % 4 or any(len(r[_EMB_COL]) != emb_len for r in rows):
+                logger.warning("DB embedding blob mismatch guild %s, skipping DB load", guild_id)
                 return False
+            dim = emb_len // 4
+            if EMBEDDING_PROVIDER == "local" and self._local_dim and dim != self._local_dim:
+                logger.warning("DB dim mismatch guild %s, skipping DB load", guild_id)
+                return False
+            chunks = []
+            for (msg_id, gid, channel_id, channel_name, author_id, author_name,
+                 author_full, content, chunk_text, window_line, window_lines,
+                 reply_to, ts, jump_url, _emb) in rows:
+                chunks.append({
+                    "msg_id": msg_id,
+                    "channel_id": channel_id,
+                    "guild_id": str(gid),
+                    "channel_name": channel_name or channel_id,
+                    "author_id": author_id,
+                    "author_name": author_name or "?",
+                    "author_full": author_full or author_name or "?",
+                    "content": content or "",
+                    "chunk_text": chunk_text or "",
+                    "window_line": window_line or "",
+                    "window_lines": json.loads(window_lines) if window_lines else [],
+                    "reply_to": reply_to,
+                    "ts": ts or "",
+                    "jump_url": jump_url or "",
+                })
+            # Bulk-decode all embeddings into one contiguous, writable matrix
+            # (on_message_edit overwrites rows in place) instead of per-row
+            # frombuffer + list-fed np.array. Chunks alias the matrix rows, so
+            # the joined bytes buffer is freed instead of staying resident.
+            raw = b"".join(r[_EMB_COL] for r in rows)
+            matrix = np.frombuffer(raw, dtype=np.float32).reshape(len(rows), dim).copy()
+            for i, chunk in enumerate(chunks):
+                chunk["embedding"] = matrix[i]
             self._chunks[guild_id] = chunks
-            self._matrices[guild_id] = np.array(embs, dtype=np.float32) if embs else None
+            self._matrices[guild_id] = matrix
             self._msg_index[guild_id] = {int(c["msg_id"]): i for i, c in enumerate(chunks)}
             self._rebuild_recent(guild_id)
             logger.info("Loaded history %d chunks for guild %s from DB", len(chunks), guild_id)
