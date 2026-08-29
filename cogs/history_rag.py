@@ -25,6 +25,7 @@ from config import (
     EMBEDDING_PROVIDER,
     HISTORY_BACKFILL_LIMIT,
     HISTORY_DB_PATH,
+    HISTORY_DEDUPE_WINDOW_MINUTES,
     HISTORY_ENABLED,
     HISTORY_EXCLUDE_BOTS,
     HISTORY_HYBRID_WEIGHT_KEYWORD,
@@ -95,25 +96,37 @@ def _jump_url(msg: discord.Message) -> str:
     except Exception:
         return ""
 
+def _extract_query_terms(query: str) -> list[str]:
+    """Extract search terms: quoted phrases kept verbatim, loose words > 2 chars."""
+    terms: list[str] = []
+    for m in re.finditer(r'"([^"]+)"', query or ''):
+        t = ' '.join(m.group(1).split())
+        if t and t not in terms:
+            terms.append(t)
+    remainder = re.sub(r'"[^"]*"', ' ', query or '')
+    for t in re.findall(r'\w+', remainder):
+        if len(t) > 2 and t not in terms:
+            terms.append(t)
+    return terms
+
+
 def _keyword_score(query: str, chunk: dict) -> float:
-    if not query:
-        return 0.0
-    q_tokens = [t.lower() for t in re.findall(r"\w+", query) if len(t) > 2]
-    if not q_tokens:
+    terms = _extract_query_terms(query)
+    if not terms:
         return 0.0
     text = (chunk.get("chunk_text", "") + " " + chunk.get("content", "")).lower()
-    matched = sum(1 for t in q_tokens if t in text)
-    return matched / len(q_tokens)
+    matched = sum(1 for t in terms if t.lower() in text)
+    return matched / len(terms)
 
 
 def _sanitize_fts_query(query: str) -> str | None:
-    tokens = [t.lower() for t in re.findall(r"\w+", query) if len(t) > 2]
-    if not tokens:
+    """Build an FTS5 OR-query; quoted phrases are preserved as exact phrase queries."""
+    terms = _extract_query_terms(query)
+    if not terms:
         return None
     escaped = []
-    for t in tokens[:10]:
-        t = t.replace('"', '""')
-        escaped.append(f'"{t}"')
+    for t in terms[:10]:
+        escaped.append('"' + t.replace('"', '""') + '"')
     return " OR ".join(escaped)
 
 
@@ -139,6 +152,46 @@ def _rrf_fuse(rank_dicts: list[dict[str, float]], k: int = 60) -> dict[str, floa
         for rank, mid in enumerate(sorted_ids, start=1):
             fused[mid] = fused.get(mid, 0) + 1 / (k + rank)
     return fused
+
+
+def _escape_like(s: str) -> str:
+    return s.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
+
+
+def _handle_from_label(full_label: str) -> str | None:
+    """Extract the @handle from a 'Display (@handle)' author label."""
+    if not full_label or ' (@' not in full_label:
+        return None
+    return full_label.rsplit(' (@', 1)[1].rstrip(')') or None
+
+
+def _aggregate_authors(rows) -> dict[tuple[int, str], dict]:
+    """Aggregate (guild_id, author_id, author_name, author_full, ts) rows into author stats."""
+    agg: dict[tuple[int, str], dict] = {}
+    for guild_id, aid, name, full, ts in rows:
+        if not aid:
+            continue
+        key = (int(guild_id), str(aid))
+        a = agg.setdefault(key, {
+            'display_name': name or '',
+            'full_label': full or name or str(aid),
+            'aliases': set(),
+            'first_seen': ts or '',
+            'last_seen': ts or '',
+            'count': 0,
+        })
+        if name:
+            a['aliases'].add(name)
+            a['display_name'] = name or a['display_name']
+        if full:
+            a['full_label'] = full
+        if ts:
+            if not a['first_seen'] or ts < a['first_seen']:
+                a['first_seen'] = ts
+            if not a['last_seen'] or ts > a['last_seen']:
+                a['last_seen'] = ts
+        a['count'] += 1
+    return agg
 
 class HistoryRAG(commands.Cog, name="HistoryRAG"):
     def __init__(self, bot: commands.Bot):
@@ -249,6 +302,10 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
             con.execute("CREATE INDEX IF NOT EXISTS idx_author ON chunks(author_id)")
             con.execute("CREATE INDEX IF NOT EXISTS idx_channel ON chunks(channel_id)")
             con.execute("CREATE INDEX IF NOT EXISTS idx_ts ON chunks(ts)")
+            # Covering indexes for the authors top-channels aggregation and the
+            # indexed message-context window queries (else both full-scan the guild).
+            con.execute("CREATE INDEX IF NOT EXISTS idx_guild_author_chan ON chunks(guild_id, author_id, channel_name)")
+            con.execute("CREATE INDEX IF NOT EXISTS idx_guild_chan_ts ON chunks(guild_id, channel_id, ts)")
             try:
                 con.execute("""
                 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
@@ -257,6 +314,20 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
                 con.execute("CREATE TRIGGER IF NOT EXISTS chunks_fts_delete AFTER DELETE ON chunks BEGIN DELETE FROM chunks_fts WHERE msg_id=old.msg_id; END;")
             except Exception:
                 logger.warning("FTS5 not available, keyword search will fallback to substring")
+            con.execute("""
+            CREATE TABLE IF NOT EXISTS authors (
+                guild_id INTEGER NOT NULL,
+                author_id TEXT NOT NULL,
+                display_name TEXT,
+                handle TEXT,
+                full_label TEXT,
+                aliases TEXT NOT NULL DEFAULT '[]',
+                first_seen TEXT,
+                last_seen TEXT,
+                msg_count INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (guild_id, author_id)
+            )""")
+            con.execute("CREATE INDEX IF NOT EXISTS idx_authors_guild ON authors(guild_id)")
             con.commit()
         finally:
             con.close()
@@ -343,6 +414,16 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
                     pass
             con.commit()
             logger.info("Saved history %d chunks for guild %s to DB", len(chunks), guild_id)
+            try:
+                agg = _aggregate_authors([
+                    (guild_id, c.get('author_id'), c.get('author_name'), c.get('author_full'), c.get('ts') or '')
+                    for c in chunks
+                ])
+                con.execute("DELETE FROM authors WHERE guild_id=?", (guild_id,))
+                self._insert_author_rows(con, agg)
+                con.commit()
+            except Exception:
+                logger.debug("Authors refresh after full save skipped", exc_info=True)
         except Exception:
             logger.exception("Failed to save history DB for guild %s", guild_id)
         finally:
@@ -372,8 +453,14 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """, rows)
             try:
+                # FTS5 has no PK on msg_id: REPLACE on chunks never cleans the old
+                # FTS row, so re-upserts (edits, re-backfill) would append duplicates.
                 con.executemany(
-                    "INSERT OR REPLACE INTO chunks_fts (msg_id, guild_id, chunk_text, content) VALUES (?,?,?,?)",
+                    "DELETE FROM chunks_fts WHERE guild_id=? AND msg_id=?",
+                    [(r[1], r[0]) for r in rows],
+                )
+                con.executemany(
+                    "INSERT INTO chunks_fts (msg_id, guild_id, chunk_text, content) VALUES (?,?,?,?)",
                     [(r[0], r[1], r[8], r[7]) for r in rows],
                 )
             except Exception:
@@ -397,6 +484,149 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
             logger.exception("Failed deleting history chunk guild %s msg %s", guild_id, msg_id)
         finally:
             con.close()
+
+    # --- Authors table maintenance (rename-proof identity + aliases) ---
+
+    @staticmethod
+    def _insert_author_rows(con: sqlite3.Connection, agg: dict[tuple[int, str], dict]) -> None:
+        rows = []
+        for (gid, aid), a in agg.items():
+            rows.append((
+                gid, aid, a['display_name'], _handle_from_label(a['full_label']),
+                a['full_label'], json.dumps(sorted(a['aliases']), ensure_ascii=False),
+                a['first_seen'], a['last_seen'], a['count'],
+            ))
+        con.executemany("""
+        INSERT OR REPLACE INTO authors (guild_id, author_id, display_name, handle, full_label, aliases, first_seen, last_seen, msg_count)
+        VALUES (?,?,?,?,?,?,?,?,?)
+        """, rows)
+
+    def _upsert_authors(self, guild_id: int, chunks: list[dict], count_msg_ids: set[str] | None = None):
+        """Merge newly indexed chunks into the authors table.
+
+        ``count_msg_ids`` limits the msg_count increment to messages that were
+        NOT already stored (re-indexing an edited or re-backfilled message must
+        not inflate counts); names/aliases are merged from every chunk. Pass an
+        empty set for alias-only refreshes.
+        """
+        if not chunks:
+            return
+        rows = [
+            (guild_id, str(c.get('author_id', '')), c.get('author_name'), c.get('author_full'), c.get('ts') or '')
+            for c in chunks
+        ]
+        agg = _aggregate_authors(rows)
+        if not agg:
+            return
+        if count_msg_ids is not None:
+            for a in agg.values():
+                a['count'] = 0
+            for c in chunks:
+                if str(c.get('msg_id', '')) in count_msg_ids:
+                    aid = str(c.get('author_id', ''))
+                    if (guild_id, aid) in agg:
+                        agg[(guild_id, aid)]['count'] += 1
+        con = sqlite3.connect(self._db_path(), timeout=30)
+        try:
+            con.execute("BEGIN IMMEDIATE")
+            for (gid, aid) in agg:
+                r = con.execute(
+                    "SELECT aliases, first_seen, last_seen, msg_count FROM authors WHERE guild_id=? AND author_id=?",
+                    (gid, aid),
+                ).fetchone()
+                if r is None:
+                    continue
+                a = agg[(gid, aid)]
+                try:
+                    a['aliases'] |= set(json.loads(r[0] or '[]'))
+                except Exception:
+                    pass
+                if r[1] and (not a['first_seen'] or r[1] < a['first_seen']):
+                    a['first_seen'] = r[1]
+                if r[2] and (not a['last_seen'] or r[2] > a['last_seen']):
+                    a['last_seen'] = r[2]
+                a['count'] += int(r[3] or 0)
+            self._insert_author_rows(con, agg)
+            con.commit()
+        except Exception:
+            con.rollback()
+            logger.exception("Failed upserting authors guild %s", guild_id)
+        finally:
+            con.close()
+
+    def _existing_msg_ids(self, guild_id: int, msg_ids: list[str]) -> set[str]:
+        """Return the subset of msg_ids already stored for a guild."""
+        msg_ids = [str(m) for m in msg_ids if m]
+        if not msg_ids:
+            return set()
+        con = sqlite3.connect(self._db_path(), timeout=30)
+        try:
+            placeholders = ','.join('?' * len(msg_ids))
+            cur = con.execute(
+                f"SELECT msg_id FROM chunks WHERE guild_id=? AND msg_id IN ({placeholders})",
+                (guild_id, *msg_ids),
+            )
+            return {str(r[0]) for r in cur.fetchall()}
+        except Exception:
+            logger.debug("existing msg_id probe failed", exc_info=True)
+            return set()
+        finally:
+            con.close()
+
+    def _rebuild_authors_from_chunks(self) -> int:
+        """Migration: populate authors for every guild that has chunks but no authors rows.
+
+        Per-guild (not global): one guild's existing rows must not block
+        another guild's backfill. Rows are read in ts order so the canonical
+        name is the most recent one seen.
+        """
+        con = sqlite3.connect(self._db_path(), timeout=30)
+        try:
+            try:
+                chunk_guilds = [int(r[0]) for r in con.execute("SELECT DISTINCT guild_id FROM chunks")]
+                author_guilds = {int(r[0]) for r in con.execute("SELECT DISTINCT guild_id FROM authors")}
+            except sqlite3.OperationalError:
+                return 0
+            missing = [g for g in chunk_guilds if g not in author_guilds]
+            if not missing:
+                return 0
+            total = 0
+            for g in missing:
+                rows = con.execute(
+                    "SELECT guild_id, author_id, author_name, author_full, ts FROM chunks WHERE guild_id=? ORDER BY ts ASC",
+                    (g,),
+                ).fetchall()
+                agg = _aggregate_authors(rows)
+                if not agg:
+                    continue
+                self._insert_author_rows(con, agg)
+                total += len(agg)
+            con.commit()
+            if total:
+                logger.info("Rebuilt authors table: %d authors across %d guilds", total, len(missing))
+            return total
+        except Exception:
+            con.rollback()
+            logger.exception("Failed rebuilding authors table")
+            return 0
+        finally:
+            con.close()
+
+    def _adjust_author_count(self, guild_id: int, author_id: str | None, delta: int):
+        if not author_id:
+            return
+        try:
+            con = sqlite3.connect(self._db_path(), timeout=30)
+            try:
+                con.execute(
+                    "UPDATE authors SET msg_count = MAX(0, msg_count + ?) WHERE guild_id=? AND author_id=?",
+                    (delta, guild_id, author_id),
+                )
+                con.commit()
+            finally:
+                con.close()
+        except Exception:
+            logger.debug("Failed adjusting author count", exc_info=True)
 
     def _load_guild(self, guild_id: int) -> bool:
         if self._load_guild_from_db(guild_id):
@@ -511,6 +741,10 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
             await asyncio.to_thread(self._load_all_guilds)
         except Exception:
             logger.exception("Failed to scan history store")
+        try:
+            await asyncio.to_thread(self._rebuild_authors_from_chunks)
+        except Exception:
+            logger.exception("Failed authors table migration")
         self._worker_task = asyncio.create_task(self._ingest_worker())
         self._snapshot_task = asyncio.create_task(self._snapshot_loop())
         self.bot.loop.create_task(self._background_backfill_all())
@@ -748,7 +982,13 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
                 self._append_chunks(gid, chunks, embeddings)
         logger.info("Indexed %d msgs guild %s channel %s (total %d)", len(chunks), gid, cid, len(self._chunks[gid]))
         try:
+            batch_ids = [str(c['msg_id']) for c in chunks]
+            already_stored = await asyncio.to_thread(self._existing_msg_ids, gid, batch_ids)
             await asyncio.to_thread(self._upsert_chunks_to_db, gid, chunks)
+            await asyncio.to_thread(
+                self._upsert_authors, gid, chunks,
+                count_msg_ids=set(batch_ids) - already_stored,
+            )
         except Exception:
             logger.exception("Failed persisting history batch guild %s", gid)
         self._dirty.add(gid)
@@ -791,6 +1031,7 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
             chunk["embedding"] = np.array(emb, dtype=np.float32)
             self._matrices[gid][idx] = chunk["embedding"]
             await asyncio.to_thread(self._upsert_chunks_to_db, gid, [chunk])
+            await asyncio.to_thread(self._upsert_authors, gid, [chunk], count_msg_ids=set())
             self._dirty.add(gid)
         except Exception:
             logger.exception("Failed to update edited message %s", after.id)
@@ -810,6 +1051,10 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
             if chunks:
                 self._matrices[gid] = np.array([c["embedding"] for c in chunks], dtype=np.float32)
                 await asyncio.to_thread(self._delete_chunk_from_db, gid, str(message.id))
+                await asyncio.to_thread(
+                    self._adjust_author_count, gid,
+                    str(getattr(message.author, 'id', '') or ''), -1,
+                )
                 self._dirty.add(gid)
             else:
                 self._matrices[gid] = None
@@ -828,6 +1073,10 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
                                 con.execute("DELETE FROM chunks_fts WHERE guild_id=?", (gid,))
                             except Exception:
                                 pass
+                            try:
+                                con.execute("DELETE FROM authors WHERE guild_id=?", (gid,))
+                            except Exception:
+                                pass
                             con.commit()
                         finally:
                             con.close()
@@ -836,32 +1085,104 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
                 except Exception:
                     pass
 
-    def _resolve_author(self, guild_id: int, author_id: str | None, author_name: str | None) -> list[str]:
+    async def _resolve_author(self, guild_id: int, author_id: str | None, author_name: str | None) -> list[str]:
         if author_id:
             return [str(author_id)]
-        if author_name:
+        if not author_name:
+            return []
+        ids = await asyncio.to_thread(self._resolve_author_db, guild_id, author_name)
+        if ids is None:
+            ids = []
+        if not ids:
+            # Empty-but-successful lookup (authors table missing rows for this
+            # guild — failed migration, legacy JSON store) is not authoritative:
+            # fall back to the in-memory chunk scan.
             name_low = author_name.lower()
-            chunks = self._chunks.get(guild_id, [])
             matched = set()
-            for c in chunks:
+            for c in self._chunks.get(guild_id, []):
                 if name_low in c.get("author_name","").lower() or name_low in c.get("author_full","").lower() or name_low in c.get("author_id",""):
                     matched.add(c["author_id"])
             return list(matched)
-        return []
+        return ids
 
-    def _fts_search(self, query: str, guild_id: int, limit: int = 100) -> dict[str, float]:
-        fts_q = _sanitize_fts_query(query)
-        if not fts_q:
-            return {}
+    def _resolve_author_db(self, guild_id: int, author_name: str) -> list[str] | None:
+        """Resolve a name to author IDs via the authors table (aliases included).
+
+        Returns None when the table is unusable so callers fall back to the
+        in-memory chunk scan.
+        """
         try:
             con = sqlite3.connect(self._db_path())
             con.row_factory = sqlite3.Row
-            cur = con.execute(
-                "SELECT msg_id, rank FROM chunks_fts WHERE guild_id=? AND chunks_fts MATCH ? ORDER BY rank LIMIT ?",
-                (guild_id, fts_q, limit),
-            )
-            rows = cur.fetchall()
-            con.close()
+            try:
+                like = f"%{_escape_like(author_name.lower())}%"
+                cur = con.execute(
+                    """SELECT author_id FROM authors
+                       WHERE guild_id=? AND (
+                           lower(display_name) LIKE ? ESCAPE '\\'
+                           OR lower(handle) LIKE ? ESCAPE '\\'
+                           OR lower(full_label) LIKE ? ESCAPE '\\'
+                           OR lower(aliases) LIKE ? ESCAPE '\\')
+                       ORDER BY msg_count DESC LIMIT 20""",
+                    (guild_id, like, like, like, like),
+                )
+                return [str(r["author_id"]) for r in cur.fetchall()]
+            finally:
+                con.close()
+        except Exception:
+            logger.debug("authors table resolve failed", exc_info=True)
+            return None
+
+    def _fts_where(
+        self,
+        guild_id: int,
+        channel_id: str | None = None,
+        author_ids: set[str] | None = None,
+        dt_after: datetime.datetime | None = None,
+        dt_before: datetime.datetime | None = None,
+    ) -> tuple[str, list]:
+        """Build the JOIN+WHERE fragment pushing channel/author/date filters into SQL."""
+        sql = "JOIN chunks c ON c.msg_id = f.msg_id WHERE f.guild_id=?"
+        params: list = [guild_id]
+        if channel_id:
+            sql += " AND c.channel_id=?"
+            params.append(str(channel_id))
+        if author_ids:
+            sql += f" AND c.author_id IN ({','.join('?' * len(author_ids))})"
+            params.extend(str(a) for a in author_ids)
+        if dt_after:
+            sql += " AND datetime(c.ts) >= datetime(?)"
+            params.append(dt_after.isoformat())
+        if dt_before:
+            sql += " AND datetime(c.ts) <= datetime(?)"
+            params.append(dt_before.isoformat())
+        return sql, params
+
+    def _fts_search(
+        self,
+        query: str,
+        guild_id: int,
+        limit: int = 100,
+        channel_id: str | None = None,
+        author_ids: set[str] | None = None,
+        dt_after: datetime.datetime | None = None,
+        dt_before: datetime.datetime | None = None,
+    ) -> dict[str, float]:
+        fts_q = _sanitize_fts_query(query)
+        if not fts_q:
+            return {}
+        where_sql, params = self._fts_where(guild_id, channel_id, author_ids, dt_after, dt_before)
+        try:
+            con = sqlite3.connect(self._db_path())
+            con.row_factory = sqlite3.Row
+            try:
+                cur = con.execute(
+                    f"SELECT f.msg_id AS msg_id, f.rank AS rank FROM chunks_fts f {where_sql} AND f.chunks_fts MATCH ? ORDER BY f.rank LIMIT ?",
+                    (*params, fts_q, limit),
+                )
+                rows = cur.fetchall()
+            finally:
+                con.close()
             scores: dict[str, float] = {}
             for idx, r in enumerate(rows):
                 try:
@@ -872,6 +1193,51 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
             return scores
         except Exception:
             return {}
+
+    def _fts_search_rows(
+        self,
+        query: str,
+        guild_id: int,
+        limit: int,
+        channel_id: str | None = None,
+        author_ids: set[str] | None = None,
+        dt_after: datetime.datetime | None = None,
+        dt_before: datetime.datetime | None = None,
+    ) -> list[tuple[dict, float]]:
+        """FTS search returning full chunk rows (rank order) with their scores."""
+        fts_q = _sanitize_fts_query(query)
+        if not fts_q:
+            return []
+        where_sql, params = self._fts_where(guild_id, channel_id, author_ids, dt_after, dt_before)
+        try:
+            con = sqlite3.connect(self._db_path())
+            con.row_factory = sqlite3.Row
+            try:
+                cur = con.execute(
+                    "SELECT c.msg_id, c.guild_id, c.channel_id, c.channel_name, c.author_id, c.author_name, c.author_full, c.content, c.chunk_text, c.window_line, c.window_lines, c.reply_to, c.ts, c.jump_url, f.rank AS fts_rank "
+                    f"FROM chunks_fts f {where_sql} AND f.chunks_fts MATCH ? ORDER BY f.rank LIMIT ?",
+                    (*params, fts_q, limit),
+                )
+                rows = cur.fetchall()
+            finally:
+                con.close()
+        except Exception:
+            return []
+        out: list[tuple[dict, float]] = []
+        for idx, r in enumerate(rows):
+            try:
+                rank_val = float(r["fts_rank"])
+                score = -rank_val if rank_val < 0 else 1 / (1 + rank_val)
+            except Exception:
+                score = 1 / (1 + idx)
+            d = dict(r)
+            d.pop("fts_rank", None)
+            try:
+                d["window_lines"] = json.loads(d.get("window_lines") or "[]")
+            except Exception:
+                d["window_lines"] = []
+            out.append((d, score))
+        return out
 
     async def _rerank_history(self, query: str, candidates: list[dict], top_n: int) -> list[dict]:
         if not candidates or not HISTORY_RERANK_ENABLED:
@@ -907,7 +1273,105 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
             logger.exception("Remote rerank failed")
         return candidates[:top_n]
 
-    async def search(self, query: str, guild_id: int, limit: int = 5, channel_id: str | None = None, author_id: str | None = None, author_name: str | None = None, after: str | None = None, before: str | None = None, search_mode: str = "hybrid", sort_by: str = "relevance") -> list[dict]:
+    def _dedupe_adjacent(self, results: list[dict], limit: int) -> list[dict]:
+        """Drop overlapping window results: same channel, adjacent in time.
+
+        Each chunk embeds its preceding window, so consecutive messages from one
+        conversation produce near-identical results. Keep the best-scoring
+        message per conversation window and let get_message_context expand.
+        """
+        if HISTORY_DEDUPE_WINDOW_MINUTES <= 0 or not results:
+            return results[:limit]
+        window_s = HISTORY_DEDUPE_WINDOW_MINUTES * 60
+        accepted: list[dict] = []
+        accepted_ts: list[tuple[str, float]] = []
+        for r in results:
+            if len(accepted) >= limit:
+                break
+            cid = str(r.get("channel_id", ""))
+            ts = _parse_dt(r.get("ts"))
+            if ts is not None:
+                dup = any(ac_cid == cid and abs(ts.timestamp() - ac_ts) <= window_s for ac_cid, ac_ts in accepted_ts)
+                if dup:
+                    continue
+                accepted_ts.append((cid, ts.timestamp()))
+            accepted.append(r)
+        return accepted
+
+    async def _keyword_search(self, query: str, guild_id: int, limit: int, channel_id: str | None, author_ids: set[str] | None, dt_after: datetime.datetime | None, dt_before: datetime.datetime | None, sort_by: str) -> list[dict]:
+        """Keyword search served straight from SQLite with filters pushed into SQL."""
+        rows = await asyncio.to_thread(
+            self._fts_search_rows, query, guild_id, max(limit * 8, 100),
+            channel_id, author_ids, dt_after, dt_before,
+        )
+        if not rows:
+            return []
+        out = []
+        for row, score in rows:
+            decay = _time_decay_factor(row.get("ts", ""), HISTORY_TIME_DECAY_LAMBDA) if sort_by == "recent" else 1.0
+            out.append(dict(row, _score=float(score * decay), _keyword_score=float(score)))
+        if sort_by == "recent":
+            out.sort(key=lambda r: r.get("ts", ""), reverse=True)
+        return out
+
+    def _keyword_fallback(self, query: str, guild_id: int, limit: int, channel_id: str | None, author_ids: set[str] | None, dt_after: datetime.datetime | None, dt_before: datetime.datetime | None, sort_by: str) -> list[dict]:
+        """Substring keyword scan over in-memory chunks (FTS unavailable or empty)."""
+        scored = []
+        for c in self._chunks.get(guild_id, []):
+            if channel_id and c["channel_id"] != str(channel_id):
+                continue
+            if author_ids and c["author_id"] not in author_ids:
+                continue
+            if dt_after or dt_before:
+                ts = _parse_dt(c.get("ts"))
+                if ts is None:
+                    continue
+                if dt_after and ts < dt_after:
+                    continue
+                if dt_before and ts > dt_before:
+                    continue
+            ks = _keyword_score(query, c)
+            if ks <= 0:
+                continue
+            decay = _time_decay_factor(c["ts"], HISTORY_TIME_DECAY_LAMBDA) if sort_by == "recent" and HISTORY_TIME_DECAY_LAMBDA > 0 else 1.0
+            scored.append((ks * decay, c))
+        if sort_by == "recent":
+            # Same rule as the DB keyword path: 'recent' means ts order.
+            scored.sort(key=lambda x: x[1]["ts"], reverse=True)
+        else:
+            scored.sort(reverse=True, key=lambda x: x[0])
+        return [dict(c, _score=float(s), _keyword_score=float(s)) for s, c in scored]
+
+    async def search(self, query: str, guild_id: int, limit: int = 5, channel_id: str | None = None, author_id: str | None = None, author_name: str | None = None, after: str | None = None, before: str | None = None, search_mode: str = "hybrid", sort_by: str = "relevance", dedupe: bool = True) -> list[dict]:
+        dt_after = _parse_dt(after) if after else None
+        dt_before = _parse_dt(before) if before else None
+        author_ids = None
+        if author_id or author_name:
+            author_ids = set(await self._resolve_author(guild_id, author_id, author_name))
+            if author_id and str(author_id) not in author_ids:
+                author_ids.add(str(author_id))
+            if not author_ids and (author_id or author_name):
+                return []
+        cache_key = f"{guild_id}:{query}:{limit}:{channel_id}:{author_id}:{author_name}:{after}:{before}:{search_mode}:{sort_by}:{dedupe}"
+        try:
+            cached = self._query_cache.get(cache_key)
+            if cached is not None:
+                return [dict(c) for c in cached]
+        except Exception:
+            pass
+        if search_mode == "keyword":
+            res = await self._keyword_search(query, guild_id, limit, channel_id, author_ids, dt_after, dt_before, sort_by)
+            if not res:
+                res = self._keyword_fallback(query, guild_id, limit, channel_id, author_ids, dt_after, dt_before, sort_by)
+            res = self._dedupe_adjacent(res, limit) if dedupe else res[:limit]
+            if res:
+                # Never negative-cache: guilds still loading/backfilling would
+                # serve a confident "nothing found" for the whole TTL otherwise.
+                try:
+                    self._query_cache[cache_key] = [dict(r) for r in res]
+                except Exception:
+                    pass
+            return res
         if guild_id not in self._chunks or not self._chunks[guild_id]:
             return []
         mat = self._matrices.get(guild_id)
@@ -919,26 +1383,15 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
             indices = [i for i in indices if chunks[i]["channel_id"] == str(channel_id)]
             if not indices:
                 return []
-        author_ids = None
-        if author_id or author_name:
-            author_ids = set(self._resolve_author(guild_id, author_id, author_name))
-            if author_id and str(author_id) not in author_ids:
-                author_ids.add(str(author_id))
-            if not author_ids and (author_id or author_name):
-                return []
+        if author_ids:
             indices = [i for i in indices if chunks[i]["author_id"] in author_ids]
             if not indices:
                 return []
-        dt_after = _parse_dt(after) if after else None
-        dt_before = _parse_dt(before) if before else None
         if dt_after or dt_before:
             filtered = []
             for i in indices:
-                try:
-                    ts = datetime.datetime.fromisoformat(chunks[i]["ts"].replace("Z","+00:00"))
-                    if ts.tzinfo is None:
-                        ts = ts.replace(tzinfo=datetime.timezone.utc)
-                except Exception:
+                ts = _parse_dt(chunks[i].get("ts"))
+                if ts is None:
                     continue
                 if dt_after and ts < dt_after:
                     continue
@@ -948,53 +1401,6 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
             indices = filtered
             if not indices:
                 return []
-        cache_key = f"{guild_id}:{query}:{limit}:{channel_id}:{author_id}:{author_name}:{after}:{before}:{search_mode}:{sort_by}"
-        try:
-            cached = self._query_cache.get(cache_key)
-            if cached is not None:
-                return [dict(c) for c in cached]
-        except Exception:
-            pass
-        if search_mode == "keyword":
-            fts_scores = await asyncio.to_thread(self._fts_search, query, guild_id, max(limit * 5, 100))
-            if fts_scores:
-                allowed = {chunks[i]["msg_id"] for i in indices}
-                filtered_fts = {k: v for k, v in fts_scores.items() if k in allowed}
-                if dt_after or dt_before:
-                    pass
-                sorted_ids = sorted(filtered_fts, key=lambda k: filtered_fts[k], reverse=True)
-                if sort_by == "recent":
-                    sorted_ids = sorted(sorted_ids, key=lambda mid: next((chunks[i]["ts"] for i in indices if chunks[i]["msg_id"] == mid), ""), reverse=True)
-                result = []
-                for mid in sorted_ids[:limit]:
-                    idx = next((i for i in indices if chunks[i]["msg_id"] == mid), None)
-                    if idx is not None:
-                        c = chunks[idx]
-                        decay = _time_decay_factor(c["ts"], HISTORY_TIME_DECAY_LAMBDA) if sort_by == "recent" else 1.0
-                        result.append(dict(c, _score=float(filtered_fts[mid] * decay), _keyword_score=float(filtered_fts[mid])))
-                if result:
-                    try:
-                        self._query_cache[cache_key] = [dict(r) for r in result]
-                    except Exception:
-                        pass
-                    return result
-            scored = []
-            for i in indices:
-                ks = _keyword_score(query, chunks[i])
-                if ks > 0:
-                    decay = _time_decay_factor(chunks[i]["ts"], HISTORY_TIME_DECAY_LAMBDA) if sort_by == "recent" and HISTORY_TIME_DECAY_LAMBDA > 0 else 1.0
-                    scored.append((ks * decay, i))
-            if sort_by == "recent" and HISTORY_TIME_DECAY_LAMBDA == 0:
-                scored.sort(key=lambda x: chunks[x[1]]["ts"], reverse=True)
-            else:
-                scored.sort(reverse=True, key=lambda x: x[0])
-            top = scored[:limit]
-            res = [dict(chunks[i], _score=float(s), _keyword_score=float(s)) for s, i in top]
-            try:
-                self._query_cache[cache_key] = [dict(r) for r in res]
-            except Exception:
-                pass
-            return res
         mat_f = mat[np.array(indices)]
         chunks_f = [chunks[i] for i in indices]
         try:
@@ -1008,7 +1414,7 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
         with np.errstate(invalid='ignore', divide='ignore'):
             vec_scores = np.where(norms > 0, dots / norms, 0.0)
         if search_mode == "hybrid":
-            fts_scores_map = await asyncio.to_thread(self._fts_search, query, guild_id, 200)
+            fts_scores_map = await asyncio.to_thread(self._fts_search, query, guild_id, 200, channel_id, author_ids, dt_after, dt_before)
             if fts_scores_map:
                 vec_rank = {chunks_f[i]["msg_id"]: float(vec_scores[i]) for i in range(len(chunks_f))}
                 allowed_ids = {chunks_f[i]["msg_id"] for i in range(len(chunks_f))}
@@ -1033,27 +1439,32 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
             scores = scores * (0.7 + 0.3 * decay_factors)
         if sort_by == "recent" and HISTORY_TIME_DECAY_LAMBDA == 0:
             order = np.argsort([c["ts"] for c in chunks_f])[::-1]
-            top_idx = order[: max(limit * 4, limit)]
+            top_idx = order[: max(limit * 6, 30)]
             candidates = [dict(chunks_f[i], _score=float(scores[i]), _keyword_score=float(_keyword_score(query, chunks_f[i]))) for i in top_idx]
-            reranked = await self._rerank_history(query, candidates, top_n=limit)
-            try:
-                self._query_cache[cache_key] = [dict(r) for r in reranked]
-            except Exception:
-                pass
+            reranked = await self._rerank_history(query, candidates, top_n=len(candidates))
+            reranked = self._dedupe_adjacent(reranked, limit) if dedupe else reranked[:limit]
+            if reranked:
+                try:
+                    self._query_cache[cache_key] = [dict(r) for r in reranked]
+                except Exception:
+                    pass
             return reranked
-        top_k_rerank = max(limit * 4, 20)
+        top_k_rerank = max(limit * 6, 30)
         top_idx = np.argsort(scores)[::-1][:top_k_rerank]
         candidates = [dict(chunks_f[i], _score=float(scores[i]), _keyword_score=float(_keyword_score(query, chunks_f[i]))) for i in top_idx]
         if sort_by == "recent" and HISTORY_TIME_DECAY_LAMBDA > 0:
             candidates.sort(key=lambda x: (x["_score"], x["ts"]), reverse=True)
-            candidates = candidates[:limit]
         else:
-            candidates = await self._rerank_history(query, candidates, top_n=limit)
-        try:
-            self._query_cache[cache_key] = [dict(r) for r in candidates]
-        except Exception:
-            pass
-        return candidates[:limit]
+            # Rerank the full pool so dedupe can pick representatives from beyond
+            # the old top-`limit` slice (both rerankers score the whole list anyway).
+            candidates = await self._rerank_history(query, candidates, top_n=len(candidates))
+        candidates = self._dedupe_adjacent(candidates, limit) if dedupe else candidates[:limit]
+        if candidates:
+            try:
+                self._query_cache[cache_key] = [dict(r) for r in candidates]
+            except Exception:
+                pass
+        return candidates
 
     async def get_user_stats(self, guild_id: int, author_id: str | None = None, author_name: str | None = None) -> dict:
         if guild_id not in self._chunks:
@@ -1061,7 +1472,7 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
         chunks = self._chunks[guild_id]
         if not chunks:
             return {"error": "Nenhum dado."}
-        author_ids = self._resolve_author(guild_id, author_id, author_name)
+        author_ids = await self._resolve_author(guild_id, author_id, author_name)
         if author_id and str(author_id) not in author_ids:
             author_ids.append(str(author_id))
         if not author_ids:
@@ -1105,7 +1516,8 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
         }
 
     async def count_mentions(self, guild_id: int, query: str, group_by: str = "author", limit: int = 10, after: str | None = None, before: str | None = None) -> list[dict]:
-        results = await self.search(query, guild_id, limit=200, after=after, before=before, search_mode="hybrid", sort_by="relevance")
+        # dedupe=False: mention counting needs every matching message, not one per conversation window
+        results = await self.search(query, guild_id, limit=200, after=after, before=before, search_mode="hybrid", sort_by="relevance", dedupe=False)
         if not results:
             return []
         threshold = 0.15
@@ -1129,6 +1541,113 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
             counter[key]["count"] += 1
         sorted_groups = sorted(counter.values(), key=lambda x: x["count"], reverse=True)[:limit]
         return sorted_groups
+
+    async def find_users(self, guild_id: int, query: str, limit: int = 5) -> list[dict]:
+        """Resolve users by name (current or old), handle, or ID; most active first."""
+        return await asyncio.to_thread(self._find_users_db, guild_id, query, limit)
+
+    def _find_users_db(self, guild_id: int, query: str, limit: int) -> list[dict]:
+        q = (query or '').strip()
+        limit = max(1, min(12, int(limit)))
+        con = sqlite3.connect(self._db_path(), timeout=30)
+        con.row_factory = sqlite3.Row
+        try:
+            if q:
+                like = f"%{_escape_like(q.lower())}%"
+                cur = con.execute(
+                    """SELECT * FROM authors
+                       WHERE guild_id=? AND (
+                           author_id = ?
+                           OR lower(display_name) LIKE ? ESCAPE '\\'
+                           OR lower(handle) LIKE ? ESCAPE '\\'
+                           OR lower(full_label) LIKE ? ESCAPE '\\'
+                           OR lower(aliases) LIKE ? ESCAPE '\\')
+                       ORDER BY msg_count DESC LIMIT ?""",
+                    (guild_id, q, like, like, like, like, limit),
+                )
+            else:
+                cur = con.execute(
+                    "SELECT * FROM authors WHERE guild_id=? ORDER BY msg_count DESC LIMIT ?",
+                    (guild_id, limit),
+                )
+            users = []
+            for r in cur.fetchall():
+                u = dict(r)
+                try:
+                    u['aliases'] = [a for a in json.loads(u.get('aliases') or '[]') if a]
+                except Exception:
+                    u['aliases'] = []
+                try:
+                    chs = con.execute(
+                        "SELECT channel_name, COUNT(*) AS n FROM chunks WHERE guild_id=? AND author_id=? GROUP BY channel_name ORDER BY n DESC LIMIT 3",
+                        (guild_id, u['author_id']),
+                    ).fetchall()
+                    u['top_channels'] = [(c['channel_name'], c['n']) for c in chs]
+                except Exception:
+                    u['top_channels'] = []
+                users.append(u)
+            return users
+        finally:
+            con.close()
+
+    async def get_message_context_from_index(self, guild_id: int, channel_id: str, message_id: str, window: int = 5) -> str | None:
+        """Build a ±window context block from the history index (DB-backed).
+
+        Returns None when the message is not indexed — callers fall back to the
+        Discord API path.
+        """
+        try:
+            window = max(1, min(10, int(window)))
+            rows = await asyncio.to_thread(self._message_context_rows, guild_id, channel_id, message_id, window)
+        except Exception:
+            logger.exception("Indexed message context failed guild %s msg %s", guild_id, message_id)
+            return None
+        if rows is None:
+            return None
+        lines = []
+        for r in rows:
+            prefix = '▶ ' if str(r.get('msg_id')) == str(message_id) else '  '
+            lines.append(prefix + format_chunk_line(r))
+        if not lines:
+            return None
+        chan = rows[0].get('channel_name') or channel_id
+        header = (
+            f"Contexto ao redor de {message_id} em #{chan} "
+            f"(channel_id={channel_id}, ±{window}):\n"
+        )
+        return header + "\n".join(lines)
+
+    def _message_context_rows(self, guild_id: int, channel_id: str, message_id: str, window: int) -> list[dict] | None:
+        con = sqlite3.connect(self._db_path(), timeout=30)
+        con.row_factory = sqlite3.Row
+        try:
+            anchor = con.execute(
+                "SELECT ts FROM chunks WHERE guild_id=? AND channel_id=? AND msg_id=?",
+                (guild_id, str(channel_id), str(message_id)),
+            ).fetchone()
+            if anchor is None or not anchor["ts"]:
+                return None
+            ts = anchor["ts"]
+            cols = "msg_id, guild_id, channel_id, channel_name, author_id, author_name, author_full, content, chunk_text, window_line, window_lines, reply_to, ts, jump_url"
+            before = con.execute(
+                f"SELECT {cols} FROM chunks WHERE guild_id=? AND channel_id=? AND ts<=? ORDER BY ts DESC LIMIT ?",
+                (guild_id, str(channel_id), ts, window + 1),
+            ).fetchall()
+            after = con.execute(
+                f"SELECT {cols} FROM chunks WHERE guild_id=? AND channel_id=? AND ts>? ORDER BY ts ASC LIMIT ?",
+                (guild_id, str(channel_id), ts, window),
+            ).fetchall()
+            out = []
+            for r in list(reversed(before)) + list(after):
+                d = dict(r)
+                try:
+                    d["window_lines"] = json.loads(d.get("window_lines") or "[]")
+                except Exception:
+                    d["window_lines"] = []
+                out.append(d)
+            return out
+        finally:
+            con.close()
 
     @app_commands.command(name="history", description="Buscar no histórico do servidor (RAG)")
     @app_commands.describe(query="O que buscar", user="Filtrar por usuário", channel="Filtrar por canal", after="Data inicial YYYY-MM-DD", before="Data final YYYY-MM-DD", limit="Resultados (1-12)", mode="Modo de busca")

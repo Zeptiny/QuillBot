@@ -73,7 +73,9 @@ SEARCH_HISTORY_TOOL = {
             'Use quando o usuário perguntar sobre conversas anteriores, decisões, '
             'problemas já discutidos, ou contexto que pode estar no chat. Retorna '
             'mensagens relevantes com autor, canal, horário e link, incluindo 5 mensagens de contexto local. '
-            'Cada resultado traz channel_id e msg_id — use com get_message_context para expandir o contexto.'
+            'Cada resultado traz channel_id e msg_id — use com get_message_context para expandir o contexto. '
+            'Mensagens do mesmo trecho de conversa são agrupadas em um único resultado. '
+            'Para filtrar por autor conhecendo apenas o nome, resolva o author_id com find_user primeiro.'
         ),
         'parameters': {
             'type': 'object',
@@ -171,7 +173,9 @@ GET_MESSAGE_CONTEXT_TOOL = {
             'Retorna o contexto local ao redor de uma mensagem específica (5 antes e 5 depois). '
             'Use após search_history para expandir o contexto de um resultado relevante. '
             'Aceita o msg_id ou reply_to visto em qualquer linha de mensagem, desde que combinados '
-            'com o channel_id exibido nos cabeçalhos de resultado/blocos ou com o canal atual.'
+            'com o channel_id exibido nos cabeçalhos de resultado/blocos ou com o canal atual. '
+            'Resultados próximos no tempo são agrupados pelo search_history — use esta ferramenta '
+            'para ver as mensagens vizinhas de um cluster.'
         ),
         'parameters': {
             'type': 'object',
@@ -190,6 +194,35 @@ GET_MESSAGE_CONTEXT_TOOL = {
                 },
             },
             'required': ['message_id', 'channel_id'],
+        },
+    },
+}
+
+FIND_USER_TOOL = {
+    'type': 'function',
+    'function': {
+        'name': 'find_user',
+        'description': (
+            'Resolve um usuário do servidor pelo nome (atual, antigo ou apelido), @handle ou ID. '
+            'Retorna a identidade canônica (author_id), apelidos conhecidos, total de mensagens, '
+            'período de atividade e canais mais ativos. '
+            'Use ANTES de search_history ou get_user_stats quando souber apenas o '
+            'nome da pessoa — passe o author_id retornado como filtro dessas ferramentas. '
+            'Sem query, lista os usuários mais ativos do servidor.'
+        ),
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'query': {
+                    'type': 'string',
+                    'description': 'Nome (parcial ok, sem diferenciação de maiúsculas), @handle ou ID do Discord. Omita para listar os mais ativos.',
+                },
+                'limit': {
+                    'type': 'integer',
+                    'description': 'Máximo de usuários (padrão 5, máximo 12).',
+                },
+            },
+            'required': [],
         },
     },
 }
@@ -547,29 +580,41 @@ async def fetch_message_context(
     channel_id: str,
     message_id: str,
     window: int = 5,
-) -> str:
-    window = max(1, min(10, int(window)))
+    guild_id: int | None = None,
+) -> str | None:
+    """Fetch ±window messages around one message via the Discord API.
+
+    Returns None on any failure (missing message, missing channel, no
+    permission, invalid ids, channel outside the requesting guild) so callers
+    can fall back to the history index.
+    """
+    try:
+        window = max(1, min(10, int(window)))
+    except (TypeError, ValueError):
+        window = 5
     try:
         cid = int(channel_id)
         mid = int(message_id)
-    except ValueError:
-        return "IDs inválidos."
+    except (TypeError, ValueError):
+        return None
     channel = bot.get_channel(cid)
     if channel is None:
         try:
             channel = await bot.fetch_channel(cid)
         except Exception:
-            return f"Canal {channel_id} não encontrado."
+            return None
+    if guild_id is not None and getattr(channel, "guild", None) is not None and channel.guild.id != guild_id:
+        return None
     if not hasattr(channel, "fetch_message") or not hasattr(channel, "history"):
-        return "Canal não suporta histórico."
+        return None
     try:
         target = await channel.fetch_message(mid)
     except discord.NotFound:
-        return f"Mensagem {message_id} não encontrada."
+        return None
     except discord.Forbidden:
-        return "Sem permissão para ler esta mensagem."
-    except Exception as e:
-        return f"Erro ao buscar mensagem: {e}"
+        return None
+    except Exception:
+        return None
     before: list[discord.Message] = []
     after: list[discord.Message] = []
     try:
@@ -672,8 +717,64 @@ async def exec_history_tool(
             return "Nenhuma menção encontrada.", []
         lines = [f"{gr['key']}: {gr['count']}× — ex: {gr['example'].get('content','')[:120]}" for gr in groups]
         return "\n".join(lines), []
+    if name == 'find_user':
+        hist = bot.get_cog('HistoryRAG')
+        if not hist:
+            return "Histórico não disponível.", []
+        if not guild:
+            return "Busca de usuários requer estar em um servidor.", []
+        query = args.get('query', '')
+        try:
+            limit = max(1, min(12, int(args.get('limit', 5))))
+        except (TypeError, ValueError):
+            limit = 5
+        try:
+            users = await hist.find_users(guild.id, query, limit=limit)  # type: ignore
+        except Exception:
+            logger.exception("find_user failed")
+            return "Erro ao buscar usuários.", []
+        if not users:
+            return (
+                f"Nenhum usuário encontrado para: {query or '(vazio)'}. "
+                "Tente search_history com author_name se a pessoa já falou no servidor."
+            ), []
+        lines = []
+        for u in users:
+            label = u.get('full_label') or u.get('display_name') or u.get('author_id', '?')
+            lines.append(
+                f"**{label}** <author_id={u.get('author_id','?')}> — "
+                f"{u.get('msg_count', 0)} msgs, {str(u.get('first_seen',''))[:10]} → {str(u.get('last_seen',''))[:10]}"
+            )
+            aliases = [a for a in u.get('aliases', []) if a and a != u.get('display_name')]
+            if aliases:
+                lines.append(f"  Também conhecido como: {', '.join(aliases[:5])}")
+            if u.get('top_channels'):
+                chans = ', '.join(f"#{c} ({n})" for c, n in u['top_channels'][:3])
+                lines.append(f"  Canais mais ativos: {chans}")
+        return "\n".join(lines), []
     if name == 'get_message_context':
-        text = await fetch_message_context(bot, channel_id=args.get('channel_id',''), message_id=args.get('message_id',''), window=args.get('window', 5))
+        try:
+            window = max(1, min(10, int(args.get('window', 5))))
+        except (TypeError, ValueError):
+            window = 5
+        text = await fetch_message_context(
+            bot,
+            channel_id=args.get('channel_id',''),
+            message_id=args.get('message_id',''),
+            window=window,
+            guild_id=guild.id if guild else None,
+        )
+        if text is None:
+            hist = bot.get_cog('HistoryRAG')
+            if hist and guild:
+                try:
+                    text = await hist.get_message_context_from_index(  # type: ignore
+                        guild.id, args.get('channel_id',''), args.get('message_id',''), window,
+                    )
+                except Exception:
+                    logger.exception("indexed get_message_context fallback failed")
+        if text is None:
+            text = f"Mensagem {args.get('message_id','')} não encontrada (nem via API, nem no índice)."
         return text, []
     return None
 
@@ -695,6 +796,8 @@ def history_tool_status(name: str, args: dict) -> str | None:
         return f'🔢 Contando menções: *{args.get("query","")[:30]}*'
     if name == 'get_message_context':
         return f'🧩 Contexto da mensagem {args.get("message_id","")}…'
+    if name == 'find_user':
+        return f'👤 Localizando usuário: *{str(args.get("query") or "")[:40] or "mais ativos"}*'
     return None
 
 

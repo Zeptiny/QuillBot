@@ -29,6 +29,7 @@ from cogs.tavily_tools import MAX_TOOL_ROUNDS as TAVILY_MAX_ROUNDS
 from cogs.utils import (
     CHANNEL_HISTORY_TOOL,
     COUNT_MENTIONS_TOOL,
+    FIND_USER_TOOL,
     GET_MESSAGE_CONTEXT_TOOL,
     GET_USER_STATS_TOOL,
     GUILD_INFO_TOOL,
@@ -724,7 +725,7 @@ class Commands(commands.Cog):
         ))
 
         base_tools = list(TAVILY_TOOLS) if TAVILY_AVAILABLE else []
-        base_tools.extend([CHANNEL_HISTORY_TOOL, GUILD_INFO_TOOL, SEARCH_HISTORY_TOOL, GET_MESSAGE_CONTEXT_TOOL, GET_USER_STATS_TOOL, COUNT_MENTIONS_TOOL])
+        base_tools.extend([CHANNEL_HISTORY_TOOL, GUILD_INFO_TOOL, SEARCH_HISTORY_TOOL, GET_MESSAGE_CONTEXT_TOOL, GET_USER_STATS_TOOL, COUNT_MENTIONS_TOOL, FIND_USER_TOOL])
         if MEMORY_ENABLED:
             base_tools.extend([MEMORY_SEARCH_TOOL, MEMORY_WRITE_TOOL, MEMORY_ABOUT_TOOL])
         active_tools = base_tools if base_tools else None

@@ -39,6 +39,7 @@ from cogs.utils import PaginatedEmbedView, build_source_pages, run_tool_loop, sp
 from cogs.utils import (
     CHANNEL_HISTORY_TOOL as _CHANNEL_HISTORY_TOOL,
     COUNT_MENTIONS_TOOL as _COUNT_MENTIONS_TOOL,
+    FIND_USER_TOOL as _FIND_USER_TOOL,
     GET_MESSAGE_CONTEXT_TOOL as _GET_MESSAGE_CONTEXT_TOOL,
     GET_USER_STATS_TOOL as _GET_USER_STATS_TOOL,
     GUILD_INFO_TOOL as _GUILD_INFO_TOOL,
@@ -313,6 +314,7 @@ TOOLS.extend([
     _GET_MESSAGE_CONTEXT_TOOL,
     _GET_USER_STATS_TOOL,
     _COUNT_MENTIONS_TOOL,
+    _FIND_USER_TOOL,
 ])
 
 # Additional tools injected only when a Spark report is active in the session.

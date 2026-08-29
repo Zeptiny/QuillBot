@@ -100,6 +100,9 @@ HISTORY_INGEST_BATCH_SIZE: Final[int] = int(os.getenv('HISTORY_INGEST_BATCH_SIZE
 HISTORY_INGEST_FLUSH_SECONDS: Final[float] = float(os.getenv('HISTORY_INGEST_FLUSH_SECONDS', '2.0'))
 HISTORY_SNAPSHOT_INTERVAL: Final[float] = float(os.getenv('HISTORY_SNAPSHOT_INTERVAL', '300'))
 HISTORY_QUERY_CACHE_SIZE: Final[int] = int(os.getenv('HISTORY_QUERY_CACHE_SIZE', '200'))
+# Adjacent results in the same channel within this window are treated as the same
+# conversation window and deduplicated from search results; 0 disables.
+HISTORY_DEDUPE_WINDOW_MINUTES: Final[int] = int(os.getenv('HISTORY_DEDUPE_WINDOW_MINUTES', '10'))
 
 # --- Memory (persistent bot memory, replaces the lore encyclopedia) ---
 MEMORY_ENABLED: Final[bool] = os.getenv('MEMORY_ENABLED', 'true').strip().lower() in ('1', 'true', 'yes')
