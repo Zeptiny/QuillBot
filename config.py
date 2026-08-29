@@ -103,6 +103,10 @@ HISTORY_QUERY_CACHE_SIZE: Final[int] = int(os.getenv('HISTORY_QUERY_CACHE_SIZE',
 # Adjacent results in the same channel within this window are treated as the same
 # conversation window and deduplicated from search results; 0 disables.
 HISTORY_DEDUPE_WINDOW_MINUTES: Final[int] = int(os.getenv('HISTORY_DEDUPE_WINDOW_MINUTES', '10'))
+# Read-only SQL tool over the history DB (LLM-written analytical SELECTs).
+HISTORY_SQL_TOOL_ENABLED: Final[bool] = os.getenv('HISTORY_SQL_TOOL_ENABLED', 'true').strip().lower() in ('1', 'true', 'yes')
+HISTORY_SQL_TIMEOUT_SECONDS: Final[float] = float(os.getenv('HISTORY_SQL_TIMEOUT_SECONDS', '5'))
+HISTORY_SQL_MAX_ROWS: Final[int] = int(os.getenv('HISTORY_SQL_MAX_ROWS', '200'))
 
 # --- Memory (persistent bot memory, replaces the lore encyclopedia) ---
 MEMORY_ENABLED: Final[bool] = os.getenv('MEMORY_ENABLED', 'true').strip().lower() in ('1', 'true', 'yes')

@@ -46,7 +46,7 @@ All AI responses are in **Brazilian Portuguese** and formatted for Discord embed
 Ask any Minecraft server administration question. Uses an agentic RAG loop — the LLM automatically calls `search_docs`, `search_plugins`, `memory_search`, `search_history`, and context tools to ground its answer in real documentation.
 
 - **Model:** `CHAT_MODEL` (default: `qwen/qwen3.6-plus`)
-- **Tools available:** `search_docs`, `search_plugins`, `memory_search`, `memory_write`, `memory_about`, `get_channel_history`, `get_guild_info`, `search_history`, `get_message_context`
+- **Tools available:** `search_docs`, `search_plugins`, `memory_search`, `memory_write`, `memory_about`, `get_channel_history`, `get_guild_info`, `search_history`, `get_message_context`, `find_user`, `sql_history`
 - **Features:** Image/screenshot analysis, 5-minute ephemeral prompt+report cache, paginated multi-embed output with source links, reply to continue conversation (30 min TTL, 200 conversations), cooldown per user
 - **Follow-up:** Reply to the bot's response to continue the conversation with full history
 
@@ -180,6 +180,7 @@ Background RAG over the entire Discord server's message history:
 - **Live ingestion:** Every new message is chunked with a 5-message sliding window for local context, embedded, and persisted per-guild (`data/history/<guild_id>.json + .npy`)
 - **Dedup + deletion:** Tracks `msg_id → index`, handles `on_message_delete`
 - **Search tool:** `search_history` / `search_docs` equivalent available to the LLM in all agentic loops
+- **SQL tool:** `sql_history` — LLM-written analytical SELECTs over the history DB (exact counts, GROUP BY, mentions, replies, FTS5, REGEXP), sandboxed four ways: single-SELECT validation + guild scoping, read-only URI + `PRAGMA query_only`, `set_authorizer` (writes/ATTACH/PRAGMA denied, `chunks.embedding` never emitted), and a progress-handler timeout (`HISTORY_SQL_TIMEOUT_SECONDS`). Disable with `HISTORY_SQL_TOOL_ENABLED=false`; rows/output caps via `HISTORY_SQL_MAX_ROWS`.
 
 ---
 

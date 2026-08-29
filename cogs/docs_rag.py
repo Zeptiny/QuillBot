@@ -44,6 +44,7 @@ from cogs.utils import (
     GET_USER_STATS_TOOL as _GET_USER_STATS_TOOL,
     GUILD_INFO_TOOL as _GUILD_INFO_TOOL,
     SEARCH_HISTORY_TOOL as _SEARCH_HISTORY_TOOL,
+    SQL_HISTORY_TOOL as _SQL_HISTORY_TOOL,
     build_full_context_block as _build_full_context_block,
     exec_history_tool as _exec_history_tool,
     fetch_recent_channel_context as _fetch_recent_channel_context,
@@ -66,6 +67,7 @@ from config import (
     EMBEDDING_MODEL,
     EMBEDDING_PROVIDER,
     GITHUB_API,
+    HISTORY_SQL_TOOL_ENABLED,
     LOCAL_EMBEDDING_DEVICE,
     LOCAL_EMBEDDING_MODEL,
     MEMORY_ENABLED,
@@ -316,6 +318,8 @@ TOOLS.extend([
     _COUNT_MENTIONS_TOOL,
     _FIND_USER_TOOL,
 ])
+if HISTORY_SQL_TOOL_ENABLED:
+    TOOLS.append(_SQL_HISTORY_TOOL)
 
 # Additional tools injected only when a Spark report is active in the session.
 _SPARK_SECTIONS_STR = ', '.join(f'"{s}"' for s in _SPARK_SECTIONS)

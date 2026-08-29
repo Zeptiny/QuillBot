@@ -35,6 +35,7 @@ from cogs.utils import (
     GUILD_INFO_TOOL,
     PaginatedEmbedView,
     SEARCH_HISTORY_TOOL,
+    SQL_HISTORY_TOOL,
     build_full_context_block,
     build_source_pages,
     build_temporal_context,
@@ -58,6 +59,7 @@ from config import (
     COOLDOWN_PER,
     COOLDOWN_RATE,
     DOCS_BASE_URL,
+    HISTORY_SQL_TOOL_ENABLED,
     MEMORY_ENABLED,
     OPENAI_API_KEY,
     OPENAI_BASE_URL,
@@ -726,6 +728,8 @@ class Commands(commands.Cog):
 
         base_tools = list(TAVILY_TOOLS) if TAVILY_AVAILABLE else []
         base_tools.extend([CHANNEL_HISTORY_TOOL, GUILD_INFO_TOOL, SEARCH_HISTORY_TOOL, GET_MESSAGE_CONTEXT_TOOL, GET_USER_STATS_TOOL, COUNT_MENTIONS_TOOL, FIND_USER_TOOL])
+        if HISTORY_SQL_TOOL_ENABLED:
+            base_tools.append(SQL_HISTORY_TOOL)
         if MEMORY_ENABLED:
             base_tools.extend([MEMORY_SEARCH_TOOL, MEMORY_WRITE_TOOL, MEMORY_ABOUT_TOOL])
         active_tools = base_tools if base_tools else None

@@ -13,6 +13,7 @@ from openai import AsyncOpenAI
 from config import (
     CHANNEL_CONTEXT_MESSAGES,
     CONVERSATIONS_GAP_MESSAGES,
+    HISTORY_SQL_TOOL_ENABLED,
     LLM_MAX_TOKENS,
 )
 
@@ -223,6 +224,45 @@ FIND_USER_TOOL = {
                 },
             },
             'required': [],
+        },
+    },
+}
+
+SQL_HISTORY_TOOL = {
+    'type': 'function',
+    'function': {
+        'name': 'sql_history',
+        'description': (
+            'Executa UM SELECT SQL somente-leitura no banco do histórico do servidor '
+            'para perguntas analíticas que o search_history não cobre: contagens exatas, '
+            'agrupamentos, cruzamentos, regex, menções e respostas. '
+            'OBRIGATÓRIO: a consulta deve citar o guild_id do servidor atual e ler apenas '
+            'as tabelas abaixo (leituras da coluna chunks.embedding e qualquer escrita são bloqueadas). '
+            'Sem busca semântica aqui — para "sobre o que falamos" use search_history. '
+            'Esquema: chunks(msg_id, guild_id, channel_id, channel_name, author_id, author_name, '
+            'author_full, content, chunk_text, window_line, window_lines, reply_to, ts ISO-8601 UTC, '
+            'jump_url, embedding BLOB proibido) — 1 linha por mensagem indexada (bots excluídos); '
+            'authors(guild_id, author_id, display_name, handle, full_label, aliases JSON, first_seen, '
+            'last_seen, msg_count); chunks_fts(msg_id, guild_id, chunk_text, content) — índice FTS5. '
+            'Exemplos: top falantes de um tópico: '
+            "\"SELECT c.author_full, COUNT(*) n FROM chunks c JOIN chunks_fts f ON f.msg_id=c.msg_id "
+            "WHERE f.guild_id=123 AND chunks_fts MATCH '\"lag\" AND server' GROUP BY c.author_full ORDER BY n DESC\"; "
+            'menções de usuário: c.content LIKE \'%<@ID>%\' OR c.content LIKE \'%<@!ID>%\'; '
+            'respostas a uma mensagem: c.reply_to=\'MSG_ID\'; respostas em geral: c.reply_to IS NOT NULL; '
+            'por mês: GROUP BY substr(c.ts,1,7); por hora: GROUP BY substr(c.ts,12,2); '
+            "FTS5: MATCH '\"frase exata\" AND (a OR b) NOT c', prefixo 'palavra*'; "
+            'REGEXP(padrão, texto) e REGEXP sempre com re.IGNORECASE; '
+            'data: compare c.ts como texto ISO ou use datetime(c.ts). Sempre termine com LIMIT.'
+        ),
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'sql': {
+                    'type': 'string',
+                    'description': 'Um único SELECT (ou WITH ... SELECT) SQLite, já com o filtro guild_id do servidor atual.',
+                },
+            },
+            'required': ['sql'],
         },
     },
 }
@@ -652,7 +692,7 @@ async def exec_history_tool(
     guild: discord.Guild | None,
     channel: discord.abc.Messageable | None,
 ) -> tuple[str, list[dict]] | None:
-    """Run one of the six shared history/context tools.
+    """Run one of the shared history/context tools.
 
     Returns ``None`` for any other tool name so callers fall through to their
     own handlers. Guild/channel resolution stays at the caller.
@@ -752,6 +792,23 @@ async def exec_history_tool(
                 chans = ', '.join(f"#{c} ({n})" for c, n in u['top_channels'][:3])
                 lines.append(f"  Canais mais ativos: {chans}")
         return "\n".join(lines), []
+    if name == 'sql_history':
+        if not HISTORY_SQL_TOOL_ENABLED:
+            return 'Ferramenta sql_history desativada por configuração (HISTORY_SQL_TOOL_ENABLED).', []
+        hist = bot.get_cog('HistoryRAG')
+        if not hist:
+            return 'Histórico não disponível.', []
+        if not guild:
+            return 'Consulta SQL requer estar em um servidor.', []
+        sql = args.get('sql', '')
+        try:
+            text = await hist.exec_sql(guild.id, sql)  # type: ignore
+        except ValueError as e:
+            return f'Consulta rejeitada: {e} Reescreva e tente de novo.', []
+        except Exception as e:
+            logger.exception('sql_history failed')
+            return f'Erro SQL: {e} Corrija a consulta (veja esquema na descrição da ferramenta).', []
+        return text, []
     if name == 'get_message_context':
         try:
             window = max(1, min(10, int(args.get('window', 5))))
@@ -798,6 +855,9 @@ def history_tool_status(name: str, args: dict) -> str | None:
         return f'🧩 Contexto da mensagem {args.get("message_id","")}…'
     if name == 'find_user':
         return f'👤 Localizando usuário: *{str(args.get("query") or "")[:40] or "mais ativos"}*'
+    if name == 'sql_history':
+        snippet = ' '.join(str(args.get('sql') or '').split())[:60]
+        return f'🗄️ Consultando histórico (SQL): `{snippet}`'
     return None
 
 

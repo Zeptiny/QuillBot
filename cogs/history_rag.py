@@ -39,6 +39,8 @@ from config import (
     HISTORY_RERANK_PROVIDER,
     HISTORY_RRF_K,
     HISTORY_SNAPSHOT_INTERVAL,
+    HISTORY_SQL_MAX_ROWS,
+    HISTORY_SQL_TIMEOUT_SECONDS,
     HISTORY_TIME_DECAY_LAMBDA,
     HISTORY_VECTOR_STORE_DIR,
     HISTORY_WINDOW_OVERLAP,
@@ -156,6 +158,51 @@ def _rrf_fuse(rank_dicts: list[dict[str, float]], k: int = 60) -> dict[str, floa
 
 def _escape_like(s: str) -> str:
     return s.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
+
+
+# --- Read-only SQL tool guards (LLM-written analytical queries) ---
+
+_SQL_LITERAL_RE = re.compile(r"'(?:[^']|'')*'|\"(?:[^\"]|\"\")*\"")
+_SQL_COMMENT_RE = re.compile(r'--[^\n]*|/\*.*?\*/', re.S)
+_SQL_SELECT_ONLY_RE = re.compile(r'^\s*(?:WITH\b.*?\bSELECT\b|SELECT\b)', re.I | re.S)
+_SQL_AUTHOR_ALLOWED = {
+    sqlite3.SQLITE_SELECT,
+    sqlite3.SQLITE_READ,
+    sqlite3.SQLITE_FUNCTION,
+    sqlite3.SQLITE_RECURSIVE,
+}
+_SQL_MAX_LENGTH = 4000
+_SQL_MAX_PATTERN = 512
+_SQL_CELL_CHARS = 160
+_SQL_OUTPUT_CHARS = 12000
+
+
+def _validate_history_sql(sql: str, guild_id: int | None) -> None:
+    """Reject anything but a single read-only SELECT scoped to one guild."""
+    if not sql or not sql.strip():
+        raise ValueError("Consulta SQL vazia.")
+    if len(sql) > _SQL_MAX_LENGTH:
+        raise ValueError(f"Consulta muito longa (máx. {_SQL_MAX_LENGTH} caracteres).")
+    if guild_id is None:
+        raise ValueError("Consulta requer estar em um servidor (guild_id).")
+    if str(guild_id) not in sql:
+        raise ValueError(f"A consulta deve filtrar pelo servidor atual: inclua guild_id={guild_id}.")
+    stripped = _SQL_COMMENT_RE.sub(' ', _SQL_LITERAL_RE.sub("''", sql)).strip()
+    if not _SQL_SELECT_ONLY_RE.match(stripped):
+        raise ValueError("Apenas um único SELECT (ou WITH ... SELECT) é permitido.")
+    if ';' in stripped.rstrip(';'):
+        raise ValueError("Apenas uma instrução por consulta.")
+
+
+def _sql_cell(v, limit: int = _SQL_CELL_CHARS) -> str:
+    if v is None:
+        return 'NULL'
+    if isinstance(v, bytes):
+        return f'<BLOB {len(v)}B>'
+    if isinstance(v, float):
+        return f'{v:.4f}'.rstrip('0').rstrip('.')
+    s = str(v).replace('\n', ' ').replace('\r', ' ').strip()
+    return s if len(s) <= limit else s[:limit] + '…'
 
 
 def _handle_from_label(full_label: str) -> str | None:
@@ -1589,6 +1636,82 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
             return users
         finally:
             con.close()
+
+    async def exec_sql(self, guild_id: int | None, sql: str, *, timeout_s: float | None = None, max_rows: int | None = None) -> str:
+        """Run one validated read-only SELECT over the history DB, rendered as text."""
+        timeout = HISTORY_SQL_TIMEOUT_SECONDS if timeout_s is None else max(0.1, timeout_s)
+        rows_cap = max(1, min(2000, HISTORY_SQL_MAX_ROWS if max_rows is None else max_rows))
+        return await asyncio.to_thread(self._exec_sql_sync, guild_id, sql, timeout, rows_cap)
+
+    def _exec_sql_sync(self, guild_id: int | None, sql: str, timeout_s: float, max_rows: int) -> str:
+        _validate_history_sql(sql, guild_id)
+        started = time.monotonic()
+        deadline = started + timeout_s
+        path = self._db_path()
+        try:
+            uri = "file:" + path.replace("?", "%3f").replace("#", "%23") + "?mode=ro"
+            con = sqlite3.connect(uri, uri=True, timeout=1)
+        except sqlite3.Error:
+            # e.g. read-only WAL open impossible in this filesystem: authorizer
+            # and query_only below still keep the connection non-mutating.
+            con = sqlite3.connect(path, timeout=1)
+        try:
+            try:
+                con.execute("PRAGMA query_only=1")
+            except sqlite3.Error:
+                pass
+
+            def _auth(action, arg1, arg2, *_):
+                if action == sqlite3.SQLITE_READ and (arg1, arg2) == ("chunks", "embedding"):
+                    return sqlite3.SQLITE_DENY
+                # FTS5 internals: consistency PRAGMA + shadow tables (<fts>_config/_data/...)
+                if action == sqlite3.SQLITE_PRAGMA and arg1 == "data_version":
+                    return sqlite3.SQLITE_OK
+                if action == sqlite3.SQLITE_READ and isinstance(arg1, str) and arg1.startswith("chunks_fts"):
+                    return sqlite3.SQLITE_OK
+                return sqlite3.SQLITE_OK if action in _SQL_AUTHOR_ALLOWED else sqlite3.SQLITE_DENY
+
+            con.set_authorizer(_auth)
+            con.set_progress_handler(lambda: time.monotonic() > deadline, 100_000)
+
+            def _regexp(pattern, value):
+                if pattern is None or value is None:
+                    return None
+                if len(str(pattern)) > _SQL_MAX_PATTERN:
+                    raise ValueError(f"Padrão REGEXP muito longo (máx. {_SQL_MAX_PATTERN}).")
+                try:
+                    return re.search(str(pattern), str(value), re.I) is not None
+                except re.error as e:
+                    raise ValueError(f"REGEXP inválido: {e}")
+
+            con.create_function("regexp", 2, _regexp)
+            try:
+                cur = con.execute(sql)
+                cols = [d[0] for d in cur.description] if cur.description else []
+                rows = cur.fetchmany(max_rows + 1)
+            except sqlite3.OperationalError as e:
+                if "user-defined function raised exception" in str(e):
+                    raise ValueError(
+                        "Padrão REGEXP inválido (erro dentro da função regexp) — corrija a sintaxe."
+                    ) from e
+                raise
+            truncated = len(rows) > max_rows
+            rows = rows[:max_rows]
+        finally:
+            con.close()
+        lines = [" | ".join(cols)] if cols else []
+        for r in rows:
+            lines.append(" | ".join(_sql_cell(v) for v in r))
+            if sum(len(l) for l in lines) > _SQL_OUTPUT_CHARS:
+                lines.pop()
+                truncated = True
+                lines.append(f"…saída truncada em {_SQL_OUTPUT_CHARS} caracteres")
+                break
+        if truncated and "…saída truncada" not in lines[-1]:
+            lines.append(f"…resultado truncado em {max_rows} linhas — adicione LIMIT/WHERE mais restritivo")
+        elapsed_ms = (time.monotonic() - started) * 1000
+        logger.info("sql_history guild=%s rows=%d %.0fms sql=%s", guild_id, len(rows), elapsed_ms, " ".join(sql.split())[:300])
+        return "\n".join(lines) if lines else "(sem linhas)"
 
     async def get_message_context_from_index(self, guild_id: int, channel_id: str, message_id: str, window: int = 5) -> str | None:
         """Build a ±window context block from the history index (DB-backed).
