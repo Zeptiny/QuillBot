@@ -331,6 +331,9 @@ cp .env.example .env   # if available, otherwise create .env manually
 | `LOCAL_EMBEDDING_MODEL` | `sentence-transformers/all-MiniLM-L6-v2` | Model when `EMBEDDING_PROVIDER=local` |
 | `LOCAL_EMBEDDING_DEVICE` | `cpu` | Device for local embeddings |
 | `RERANK_ENABLED` | `true` | Enable reranking (only when base URL is OpenRouter) |
+| `RERANK_PROVIDER` | `auto` | `auto` (remote on OpenRouter, local elsewhere), `local` (cross-encoder) or `remote` (OpenRouter `/rerank`) |
+| `LOCAL_RERANK_MODEL` | `cross-encoder/ms-marco-MiniLM-L-6-v2` | Cross-encoder used when the rerank provider is local |
+| `LOCAL_RERANK_DEVICE` | `cpu` | Device for the local reranker (defaults to `LOCAL_EMBEDDING_DEVICE`) |
 
 ### Feature Flags
 
@@ -349,10 +352,37 @@ cp .env.example .env   # if available, otherwise create .env manually
 | Variable | Default | Description |
 |---|---|---|
 | `HISTORY_VECTOR_STORE_DIR` | `data/history` | Per-guild history storage dir |
+| `HISTORY_DB_PATH` | `data/history/history.db` | SQLite history DB (defaults to `<HISTORY_VECTOR_STORE_DIR>/history.db`) |
 | `HISTORY_WINDOW_SIZE` | `5` | Sliding window of prior messages per chunk |
+| `HISTORY_WINDOW_OVERLAP` | `1` | Overlap between consecutive chunks |
 | `HISTORY_BACKFILL_LIMIT` | _(none)_ | Max messages to backfill per channel (unset = all) |
 | `HISTORY_MAX_MSG_LENGTH` | `800` | Max chars per message in history chunks |
 | `HISTORY_EXCLUDE_BOTS` | `true` | Exclude bot messages from history |
+| `HISTORY_INGEST_BATCH_SIZE` | `10` | Messages per embedding batch during live ingestion |
+| `HISTORY_INGEST_FLUSH_SECONDS` | `2.0` | Max delay before a partial batch is flushed |
+| `HISTORY_SNAPSHOT_INTERVAL` | `300` | Seconds between vector-store snapshots to disk |
+| `HISTORY_QUERY_CACHE_SIZE` | `200` | LRU query result cache size |
+| `HISTORY_DEDUPE_WINDOW_MINUTES` | `10` | Adjacent results in the same channel treated as one window and deduplicated (`0` disables) |
+| `HISTORY_RERANK_ENABLED` | `true` | Rerank history search results |
+| `HISTORY_RERANK_PROVIDER` | `auto` | Rerank provider for history search (defaults to `RERANK_PROVIDER`) |
+| `HISTORY_RERANK_MODEL` | `LOCAL_RERANK_MODEL` | Remote rerank model for history search |
+| `HISTORY_TIME_DECAY_LAMBDA` | `0.0` | Exponential decay on recency for `recent` sorting (`0` disables) |
+| `HISTORY_HYBRID_WEIGHT_SEMANTIC` | `0.65` | Semantic weight of the semantic/keyword hybrid blend |
+| `HISTORY_HYBRID_WEIGHT_KEYWORD` | `0.35` | Keyword (FTS5) weight of the hybrid blend |
+| `HISTORY_RRF_K` | `60` | Reciprocal-rank-fusion constant |
+| `HISTORY_SQL_TOOL_ENABLED` | `true` | Enable the read-only `sql_history` LLM tool |
+| `HISTORY_SQL_TIMEOUT_SECONDS` | `5` | Query timeout enforced by the SQLite progress handler |
+| `HISTORY_SQL_MAX_ROWS` | `200` | Max rows returned / shown to the LLM |
+
+### Vision Images
+
+| Variable | Default | Description |
+|---|---|---|
+| `IMAGES_DIR` | `data/images` | Where downloaded images are persisted |
+| `IMAGE_MAX_SIDE` | `640` | Max dimension (px) of re-encoded JPEGs |
+| `IMAGE_JPEG_QUALITY` | `80` | JPEG quality of re-encoded images |
+| `IMAGE_RETENTION_SECONDS` | `86400` | Stored images swept after this many seconds |
+| `CONVERSATIONS_IMAGE_TURNS` | `3` | Inline stored images only for the most recent N history turns (older become text markers) |
 
 ### Memory
 
@@ -399,6 +429,21 @@ cp .env.example .env   # if available, otherwise create .env manually
 | `COOLDOWN_PER` | `30` | Cooldown window in seconds (per user) |
 | `MAX_CONTENT_SIZE` | `5242880` | Max bytes fetched from paste services (5 MB) |
 | `MAX_LOG_CONTEXT` | `12000` | Max chars sent to LLM for log analysis |
+
+### API Request Logging
+
+Implemented in [`api_logger.py`](api_logger.py) — patches the `aiohttp`/`httpx` transports so every outbound HTTP request (Discord REST, LLM API, Tavily, GitHub, plugin APIs) and every inbound Discord interaction is appended as one JSON line to a rotating file. See [SETUP.md](SETUP.md) for sample lines and privacy notes.
+
+| Variable | Default | Description |
+|---|---|---|
+| `API_REQUEST_LOG_ENABLED` | `true` | Master switch |
+| `API_REQUEST_LOG_PATH` | `data/api_requests.log` | Log file path (parent dirs created) |
+| `API_REQUEST_LOG_MAX_BYTES` | `10485760` | Rotate after this many bytes |
+| `API_REQUEST_LOG_BACKUPS` | `5` | Rotated files to keep |
+| `API_REQUEST_LOG_DISCORD` | `true` | `false` omits outbound Discord REST traffic (inbound interactions are logged regardless) |
+| `API_REQUEST_LOG_CONSOLE` | `false` | Also mirror log lines to stdout / docker logs |
+| `API_REQUEST_LOG_BODY` | `openai,tavily` | Services whose request/response bodies are logged (`all`/`none` accepted) |
+| `API_REQUEST_LOG_BODY_MAX_CHARS` | `20000` | Per-body truncation limit |
 
 ---
 
