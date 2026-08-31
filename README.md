@@ -208,6 +208,11 @@ while tool_calls and rounds < MAX_TOOL_ROUNDS:
 
 - Parallel tool calls per round when the LLM requests multiple
 
+### Trajectory Replay (`CONVERSATIONS_TRAJECTORY_*`)
+Each turn captures the **exact rendered user message** plus the serialized internal loop (assistant tool calls, tool results, final answer). On follow-ups, the most recent `CONVERSATIONS_TRAJECTORY_TURNS` turns are replayed **verbatim** — the model literally sees its own prior tool calls and their results instead of a distilled Q/A pair. Older turns (and turns captured before this feature, or whose trajectory was dropped as invalid/oversized) fall back to the compact attributed rendering.
+
+Replay windows advance in `CONVERSATIONS_TRAJECTORY_STEP`-turn steps (hysteresis), so the replayed prefix only changes at deliberate collapse boundaries — not sliding every turn — which is what keeps the provider prefix cache effective. Explicit `cache_control` breakpoints mark the system prompt and the last replayed history message for Anthropic/Gemini via OpenRouter; OpenAI-compatible endpoints ignore them and cache automatically. Captured trajectories are sanitized on persist (no `reasoning`/thinking payloads, tool-call/result pairing enforced).
+
 ### Rate Limiting
 `COOLDOWN_RATE` / `COOLDOWN_PER` (default `1` per `30s`) per user on `/ask`, `/chat`, `/analyze`. Follow-up replies share a `TTLCache` cooldown. Exceeding returns an ephemeral `⏳ Aguarde Xs` message.
 
@@ -381,6 +386,10 @@ cp .env.example .env   # if available, otherwise create .env manually
 | `CONVERSATIONS_MAX_TURNS` | `24` | Max turns stored per conversation |
 | `CONVERSATIONS_HISTORY_TURNS` | `16` | Turns replayed to the LLM per request |
 | `CONVERSATIONS_GAP_MESSAGES` | `20` | Max channel messages captured between two bot-directed turns as `prior_context` (`0` disables) |
+| `CONVERSATIONS_TRAJECTORY_ENABLED` | `true` | Capture and replay the internal LLM trajectory (tool calls/results + exact user message) per turn |
+| `CONVERSATIONS_TRAJECTORY_TURNS` | `6` | Most recent N turns replayed **verbatim** with their trajectory (older turns use the compact Q/A rendering) |
+| `CONVERSATIONS_TRAJECTORY_STEP` | `3` | Window advances in steps of N turns — prefix-cache hysteresis so the replayed prefix only changes at deliberate boundaries |
+| `CONVERSATIONS_TRAJECTORY_MAX_CHARS` | `120000` | Hard budget on the replayed trajectory payload; turns are collapsed to compact rendering when exceeded |
 
 ### Other
 
