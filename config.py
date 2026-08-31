@@ -86,6 +86,16 @@ CONVERSATIONS_MAX_TURNS: Final[int] = int(os.getenv('CONVERSATIONS_MAX_TURNS', '
 CONVERSATIONS_HISTORY_TURNS: Final[int] = int(os.getenv('CONVERSATIONS_HISTORY_TURNS', '16'))
 # Max channel messages captured between two bot-directed turns as prior_context; 0 disables.
 CONVERSATIONS_GAP_MESSAGES: Final[int] = int(os.getenv('CONVERSATIONS_GAP_MESSAGES', '20'))
+# Replay the exact internal trajectory (tool calls + results) of the most recent
+# N turns instead of a distilled question/answer pair. Turns outside this window
+# fall back to the compact rendering. The window advances in steps of
+# CONVERSATIONS_TRAJECTORY_STEP (hysteresis) so the replayed prefix stays
+# byte-identical between collapses — sliding it every turn would defeat provider
+# prefix caching.
+CONVERSATIONS_TRAJECTORY_ENABLED: Final[bool] = os.getenv('CONVERSATIONS_TRAJECTORY_ENABLED', 'true').strip().lower() in ('1', 'true', 'yes')
+CONVERSATIONS_TRAJECTORY_TURNS: Final[int] = int(os.getenv('CONVERSATIONS_TRAJECTORY_TURNS', '6'))
+CONVERSATIONS_TRAJECTORY_STEP: Final[int] = int(os.getenv('CONVERSATIONS_TRAJECTORY_STEP', '3'))
+CONVERSATIONS_TRAJECTORY_MAX_CHARS: Final[int] = int(os.getenv('CONVERSATIONS_TRAJECTORY_MAX_CHARS', '120000'))
 
 # --- History RAG (entire server) ---
 HISTORY_ENABLED: Final[bool] = os.getenv('HISTORY_ENABLED', 'true').strip().lower() in ('1', 'true', 'yes')

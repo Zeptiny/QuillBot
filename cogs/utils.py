@@ -874,6 +874,66 @@ def _usage_summary(response: Any) -> str:
     return ', '.join(parts)
 
 
+def _get(msg: Any, key: str, default: Any = None) -> Any:
+    if isinstance(msg, dict):
+        return msg.get(key, default)
+    return getattr(msg, key, default)
+
+
+def serialize_trajectory(messages: list[Any]) -> list[dict]:
+    """Convert appended loop messages (SDK objects or dicts) to JSON-safe dicts.
+
+    Only a whitelist of fields is kept (role/content/tool_calls/tool_call_id):
+    provider extras such as ``reasoning``/thinking payloads are dropped because
+    most APIs reject them on input, and the result is what gets persisted in the
+    conversation store and replayed verbatim on follow-ups.
+    """
+    out: list[dict] = []
+    for msg in messages:
+        role = _get(msg, 'role')
+        if role == 'assistant':
+            content = _get(msg, 'content')
+            entry: dict = {
+                'role': 'assistant',
+                'content': content if isinstance(content, str) else None,
+            }
+            calls: list[dict] = []
+            for tc in _get(msg, 'tool_calls') or []:
+                fn = _get(tc, 'function') or {}
+                name = _get(fn, 'name')
+                tc_id = _get(tc, 'id')
+                if not name or not tc_id:
+                    continue
+                calls.append({
+                    'id': tc_id,
+                    'type': 'function',
+                    'function': {
+                        'name': name,
+                        'arguments': _get(fn, 'arguments') or '{}',
+                    },
+                })
+            if calls:
+                entry['tool_calls'] = calls
+            out.append(entry)
+        elif role == 'tool':
+            tc_id = _get(msg, 'tool_call_id')
+            content = _get(msg, 'content')
+            if not tc_id or not isinstance(content, str):
+                continue
+            out.append({'role': 'tool', 'tool_call_id': tc_id, 'content': content})
+        elif role == 'user':
+            # A leading user entry can only be the empty-answer retry nudge
+            # (emitted when the model returned no tool calls AND no content in
+            # round 1).  Keeping it would replay as two consecutive user
+            # messages — providers enforcing strict user/assistant alternation
+            # (Anthropic) reject that — so it is dropped from the capture.
+            if not out:
+                continue
+            content = _get(msg, 'content')
+            out.append({'role': 'user', 'content': content if isinstance(content, str) else ''})
+    return out
+
+
 async def run_tool_loop(
     client: AsyncOpenAI,
     model: str,
@@ -884,7 +944,7 @@ async def run_tool_loop(
     interaction: discord.Interaction | None = None,
     max_rounds: int = 6,
     dedup_key: Callable[[dict], str] | None = None,
-) -> tuple[str, list[dict]]:
+) -> tuple[str, list[dict], list[dict]]:
     """Run an agentic tool-calling loop until the LLM produces a final answer.
 
     Parameters
@@ -915,13 +975,21 @@ async def run_tool_loop(
 
     Returns
     -------
-    ``(answer_text, all_sources)`` where *all_sources* is the deduplicated list
-    of source dicts aggregated across all tool rounds.
+    ``(answer_text, all_sources, trajectory)`` where *all_sources* is the
+    deduplicated list of source dicts aggregated across all tool rounds and
+    *trajectory* is the JSON-safe list of messages appended during the loop
+    (assistant tool calls, tool results, the final answer — plus the
+    empty-answer retry nudge when it fired).  It is persisted with the
+    conversation turn and replayed verbatim on follow-ups, so later turns see
+    the full internal steps of earlier ones and the replayed prefix stays
+    byte-identical to what was actually sent (keeping provider prefix caches
+    effective).
     """
     all_sources: list[dict] = []
     seen_keys: set[str] = set()
     rounds_used = 0
     finish_reasons: list[str] = []
+    capture_start = len(messages)
 
     for round_num in range(1, max_rounds + 1):
         rounds_used = round_num
@@ -1026,16 +1094,19 @@ async def run_tool_loop(
             getattr(final_choice, 'finish_reason', None),
             _usage_summary(response),
         )
-        retry_messages = [*messages, {
+        # The nudge is appended to `messages` itself (payload-identical to the
+        # previous copy) so the captured trajectory includes exactly what was
+        # sent and the follow-up prefix keeps matching the provider cache.
+        messages.append({
             'role': 'user',
             'content': (
                 'Responda agora, em português, de forma direta e concisa, sem '
                 'usar nenhuma ferramenta. Use apenas as informações já coletadas.'
             ),
-        }]
+        })
         response = await client.chat.completions.create(
             model=model,
-            messages=retry_messages,
+            messages=messages,
             max_tokens=LLM_MAX_TOKENS,
         )
         final_choice = response.choices[0]
@@ -1051,7 +1122,9 @@ async def run_tool_loop(
             _usage_summary(response),
         )
         answer = 'Não foi possível gerar uma resposta.'
-    return answer, all_sources
+    messages.append({'role': 'assistant', 'content': answer})
+    trajectory = serialize_trajectory(messages[capture_start:])
+    return answer, all_sources, trajectory
 
 
 def truncate_safe(text: str, limit: int = 3800, suffix: str = '\n\n...') -> str:

@@ -19,6 +19,7 @@ from cogs import image_store as _image_store
 from cogs.conversation_store import (
     ConversationStore as _ConversationStore,
     add_participant as _add_participant,
+    apply_cache_control as _apply_cache_control,
     author_info as _author_info,
     build_conversation_block as _build_conversation_block,
     build_current_message as _build_current_message,
@@ -1049,7 +1050,7 @@ class DocsRAG(commands.Cog):
         )
 
         try:
-            answer, embeds, sources = await self._run_agent(
+            answer, embeds, sources, capture = await self._run_agent(
                 question, image_url=image_url, interaction=interaction
             )
             # Clear any in-progress status message before sending the final embed.
@@ -1064,7 +1065,8 @@ class DocsRAG(commands.Cog):
                     embed=embeds[0], view=PaginatedEmbedView(embeds), wait=True
                 )
             await self._store_conversation(
-                msg, question, answer, sources=sources, interaction=interaction
+                msg, question, answer, sources=sources, interaction=interaction,
+                capture=capture,
             )
 
         except RateLimitError:
@@ -1241,7 +1243,7 @@ class DocsRAG(commands.Cog):
         origin: str | None = None,
         context_message: discord.Message | None = None,
         prior_context: list[str] | None = None,
-    ) -> tuple[str, list[discord.Embed], list[dict]]:
+    ) -> tuple[str, list[discord.Embed], list[dict], dict]:
         """Run the LLM with tool-calling in a loop until it produces a final answer.
 
         When ``spark_report`` is provided the agent uses ``SPARK_MODEL``,
@@ -1271,9 +1273,10 @@ class DocsRAG(commands.Cog):
                 )
         history = history or []
         if history:
-            system_content += '\n\n' + _build_conversation_block(
-                history[-CONVERSATIONS_HISTORY_TURNS:]
-            )
+            # Full history (not the replay window): the block must only change
+            # when participants/channel actually change, or the system prompt
+            # would mutate every turn past the window and bust the cache.
+            system_content += '\n\n' + _build_conversation_block(history)
 
         # Inject persistent memory (pinned + semantically selected) ----------------
         # Memory selection and the recent channel window are per-request, so
@@ -1369,6 +1372,9 @@ class DocsRAG(commands.Cog):
             messages.extend(
                 _build_history_messages(history, max_turns=CONVERSATIONS_HISTORY_TURNS)
             )
+            # Breakpoint at the end of the replayed conversation: the current
+            # question and its per-request blocks ride after it.
+            messages[-1] = _apply_cache_control(messages[-1])
 
         # Current user message ---------------------------------------------------
         urls: list[str] = []
@@ -1376,7 +1382,7 @@ class DocsRAG(commands.Cog):
             urls.extend([u for u in image_urls if u])
         elif image_url:
             urls.append(image_url)
-        messages.append(_build_current_message(
+        current_message = _build_current_message(
             question,
             author=_author_info(user or (interaction.user if interaction else None)),
             ts=created_at.timestamp() if created_at else None,
@@ -1386,7 +1392,8 @@ class DocsRAG(commands.Cog):
             prior_context=prior_context,
             channel_id=getattr(channel, 'id', None),
             context_blocks='\n\n'.join(context_blocks) or None,
-        ))
+        )
+        messages.append(current_message)
 
         # Choose model and tool set based on session type ------------------------
         model = SPARK_MODEL if spark_report is not None else CHAT_MODEL
@@ -1399,7 +1406,7 @@ class DocsRAG(commands.Cog):
             )
         )
 
-        answer, all_sources = await run_tool_loop(
+        answer, all_sources, trajectory = await run_tool_loop(
             client=self.client,
             model=model,
             messages=messages,
@@ -1456,7 +1463,10 @@ class DocsRAG(commands.Cog):
                 )
             )
 
-        return answer, embeds, sources
+        return answer, embeds, sources, {
+            'user_message': current_message,
+            'trajectory': trajectory,
+        }
 
     async def _store_conversation(
         self,
@@ -1466,6 +1476,7 @@ class DocsRAG(commands.Cog):
         sources: list[dict] | None = None,
         spark_report: SparkReport | None = None,
         interaction: discord.Interaction | None = None,
+        capture: dict | None = None,
     ) -> None:
         """Persist a conversation exchange for follow-up replies."""
         user = interaction.user if interaction is not None else None
@@ -1481,6 +1492,8 @@ class DocsRAG(commands.Cog):
             channel_name=getattr(channel, 'name', None),
             images=[],
             sources=sources,
+            user_message=(capture or {}).get('user_message'),
+            trajectory=(capture or {}).get('trajectory'),
         )
         origin = {
             'channel_id': str(getattr(channel, 'id', '') or ''),
@@ -1552,7 +1565,7 @@ class DocsRAG(commands.Cog):
                 history = conv['data'].get('turns', []).copy()
                 prior_context = await _fetch_turn_gap(message, history)
 
-                answer, embeds, sources = await self._run_agent(
+                answer, embeds, sources, capture = await self._run_agent(
                     follow_up_question,
                     history=history,
                     image_urls=image_urls if image_urls else None,
@@ -1585,6 +1598,8 @@ class DocsRAG(commands.Cog):
                     sources=sources,
                     reply_to=ref_id,
                     prior_context=prior_context,
+                    user_message=capture.get('user_message'),
+                    trajectory=capture.get('trajectory'),
                 )
                 data = conv['data']
                 data['turns'] = _cap_turns(history + [turn], CONVERSATIONS_MAX_TURNS)
@@ -1624,7 +1639,7 @@ class DocsRAG(commands.Cog):
             'desempenho, se houver. Siga o protocolo diagnóstico.'
         )
         try:
-            answer, embeds, sources = await self._run_agent(
+            answer, embeds, sources, capture = await self._run_agent(
                 question,
                 spark_report=report,
                 title=embed_title,
@@ -1644,6 +1659,7 @@ class DocsRAG(commands.Cog):
             await self._store_conversation(
                 msg, question, answer,
                 sources=sources, spark_report=report, interaction=interaction,
+                capture=capture,
             )
 
         except RateLimitError:

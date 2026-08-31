@@ -14,6 +14,7 @@ from cogs import image_store
 from cogs.conversation_store import (
     ConversationStore,
     add_participant,
+    apply_cache_control,
     author_info,
     build_conversation_block,
     build_current_message,
@@ -551,7 +552,7 @@ class Commands(commands.Cog):
         )
 
         try:
-            answer, embeds, sources = await self._run_chat(
+            answer, embeds, sources, capture = await self._run_chat(
                 question,
                 image_url=image_url,
                 interaction=interaction,
@@ -578,6 +579,7 @@ class Commands(commands.Cog):
                 channel=interaction.channel,
                 created_at=interaction.created_at,
                 images=[image_url] if image_url else [],
+                capture=capture,
             )
 
         except RateLimitError:
@@ -612,6 +614,7 @@ class Commands(commands.Cog):
         images: list[str] | None = None,
         message_id: str | int | None = None,
         reply_to: str | int | None = None,
+        capture: dict | None = None,
     ) -> None:
         """Persist a brand-new conversation anchored on the bot's reply message."""
         author = author_info(user)
@@ -625,6 +628,8 @@ class Commands(commands.Cog):
             images=images,
             sources=sources,
             reply_to=reply_to,
+            user_message=(capture or {}).get('user_message'),
+            trajectory=(capture or {}).get('trajectory'),
         )
         origin = {
             'channel_id': str(getattr(channel, 'id', '') or ''),
@@ -660,7 +665,7 @@ class Commands(commands.Cog):
         origin: str | None = None,
         context_message: discord.Message | None = None,
         prior_context: list[str] | None = None,
-    ) -> tuple[str, list[discord.Embed], list[dict]]:
+    ) -> tuple[str, list[discord.Embed], list[dict], dict]:
         # Message layout is ordered for provider prefix caching: the system
         # prompt and replayed history stay byte-identical across follow-ups of
         # a conversation, while per-request blocks (clock/context, memory
@@ -668,8 +673,11 @@ class Commands(commands.Cog):
         system_content = GENERAL_SYSTEM_PROMPT
         history = history or []
         if history:
-            replay = history[-CONVERSATIONS_HISTORY_TURNS:]
-            system_content += '\n\n' + build_conversation_block(replay)
+            # Built from the FULL history (not the replay window) so it only
+            # changes when participants/channel actually change — deriving it
+            # from a sliding window would mutate the system prompt every turn
+            # past the window and bust the prefix cache.
+            system_content += '\n\n' + build_conversation_block(history)
         context_blocks: list[str] = []
         if user or guild or channel:
             try:
@@ -702,19 +710,25 @@ class Commands(commands.Cog):
                     context_blocks.append(chan_ctx)
             except Exception:
                 logger.exception('Failed to build recent channel context')
-        messages: list[dict] = [{'role': 'system', 'content': system_content}]
+        # Content-array format with an explicit cache_control breakpoint
+        # (Anthropic/Gemini via OpenRouter); OpenAI-compatible endpoints ignore
+        # the extra field. Same layout DocsRAG already uses.
+        messages: list[dict] = [apply_cache_control({'role': 'system', 'content': system_content})]
 
         if history:
             messages.extend(
                 build_history_messages(history, max_turns=CONVERSATIONS_HISTORY_TURNS)
             )
+            # Second breakpoint at the end of the replayed conversation: the
+            # current question and its per-request blocks ride after it.
+            messages[-1] = apply_cache_control(messages[-1])
 
         urls: list[str] = []
         if image_urls:
             urls.extend([u for u in image_urls if u])
         elif image_url:
             urls.append(image_url)
-        messages.append(build_current_message(
+        current_message = build_current_message(
             question,
             author=author_info(user or (interaction.user if interaction else None)),
             ts=created_at.timestamp() if created_at else None,
@@ -724,7 +738,8 @@ class Commands(commands.Cog):
             prior_context=prior_context,
             channel_id=getattr(channel, 'id', None),
             context_blocks='\n\n'.join(context_blocks) or None,
-        ))
+        )
+        messages.append(current_message)
 
         base_tools = list(TAVILY_TOOLS) if TAVILY_AVAILABLE else []
         base_tools.extend([CHANNEL_HISTORY_TOOL, GUILD_INFO_TOOL, SEARCH_HISTORY_TOOL, GET_MESSAGE_CONTEXT_TOOL, GET_USER_STATS_TOOL, COUNT_MENTIONS_TOOL, FIND_USER_TOOL])
@@ -773,7 +788,7 @@ class Commands(commands.Cog):
                 return label
             return f'🔧 Executando: {name}'
 
-        answer, all_sources = await run_tool_loop(
+        answer, all_sources, trajectory = await run_tool_loop(
             client=self.client,
             model=CHAT_MODEL,
             messages=messages,
@@ -820,7 +835,10 @@ class Commands(commands.Cog):
                 )
             )
 
-        return answer, embeds, sources
+        return answer, embeds, sources, {
+            'user_message': current_message,
+            'trajectory': trajectory,
+        }
 
     async def cog_app_command_error(
         self, interaction: discord.Interaction, error: app_commands.AppCommandError
@@ -870,7 +888,7 @@ class Commands(commands.Cog):
                             conv = fresh
                         history = conv['data'].get('turns', []).copy()
                         prior_context = await fetch_turn_gap(message, history)
-                        answer, embeds, sources = await self._run_chat(
+                        answer, embeds, sources, capture = await self._run_chat(
                             follow_up_question,
                             history=history,
                             image_urls=image_urls if image_urls else None,
@@ -901,6 +919,8 @@ class Commands(commands.Cog):
                             sources=sources,
                             reply_to=ref_id,
                             prior_context=prior_context,
+                            user_message=capture.get('user_message'),
+                            trajectory=capture.get('trajectory'),
                         )
                         data = conv['data']
                         data['turns'] = cap_turns(history + [turn], CONVERSATIONS_MAX_TURNS)
@@ -1017,7 +1037,7 @@ class Commands(commands.Cog):
         logger.info("Processing @mention chat user=%s guild=%s question=%r ref=%s images=%d", message.author.id, message.guild.id if message.guild else None, clean_question[:80], bool(ref_context), len(all_image_urls))
         async with message.channel.typing():
             try:
-                answer, embeds, sources = await self._run_chat(
+                answer, embeds, sources, capture = await self._run_chat(
                     clean_question,
                     image_urls=all_image_urls if all_image_urls else None,
                     user=message.author,
@@ -1040,6 +1060,7 @@ class Commands(commands.Cog):
                     created_at=message.created_at,
                     images=all_image_urls,
                     message_id=message.id,
+                    capture=capture,
                 )
             except RateLimitError:
                 await message.reply('⏳ Limite de requisições atingido. Tente novamente em alguns minutos.', mention_author=False)

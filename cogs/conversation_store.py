@@ -29,7 +29,14 @@ from typing import Any
 
 from cogs import image_store
 from cogs.utils import BR_TZ
-from config import CONVERSATIONS_GAP_MESSAGES, CONVERSATIONS_IMAGE_TURNS
+from config import (
+    CONVERSATIONS_GAP_MESSAGES,
+    CONVERSATIONS_IMAGE_TURNS,
+    CONVERSATIONS_TRAJECTORY_ENABLED,
+    CONVERSATIONS_TRAJECTORY_MAX_CHARS,
+    CONVERSATIONS_TRAJECTORY_STEP,
+    CONVERSATIONS_TRAJECTORY_TURNS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +46,152 @@ PRIOR_CONTEXT_HEADER = 'Mensagens no canal antes desta pergunta'
 # ---------------------------------------------------------------------------
 # Turn / metadata helpers
 # ---------------------------------------------------------------------------
+
+def stepped_floor(count: int, window: int, step: int) -> int:
+    """Start index that keeps slices sized between ``window - step + 1`` and ``window``.
+
+    Unlike ``history[-window:]`` (which slides by one on every append and would
+    change the replayed prefix — and thus bust provider prefix caches — on every
+    turn), the floor only advances in ``step`` increments once ``count`` exceeds
+    ``window``.  Each advance is a single deliberate re-render boundary.
+    """
+    if count <= window or step <= 0:
+        return 0
+    raw = ((count - window + step - 1) // step) * step
+    # With step <= window the raw floor already keeps slices within the window
+    # (count-1 only guards emptiness).  With a degenerate step > window there
+    # is no hysteresis to preserve, so cap the slice at the window instead.
+    cap = count - 1 if step <= window else max(0, count - window)
+    return min(raw, cap)
+
+
+def message_text(message: dict | None) -> str:
+    """Text content of an LLM message whose content is a string or a parts list."""
+    if not isinstance(message, dict):
+        return ''
+    content = message.get('content')
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return ''.join(
+            p.get('text') or ''
+            for p in content
+            if isinstance(p, dict) and p.get('type') == 'text'
+        )
+    return ''
+
+
+def apply_cache_control(message: dict) -> dict:
+    """Return a copy of *message* with an ephemeral cache breakpoint on its tail.
+
+    Anthropic/Gemini behind OpenRouter need explicit ``cache_control`` markers
+    to cache a prefix; OpenAI-compatible endpoints ignore the extra field.  The
+    breakpoint is metadata only — it never changes the tokens of the message it
+    marks, so adding/moving it does not invalidate an already-warm cache.
+    """
+    content = message.get('content')
+    if isinstance(content, str):
+        return {
+            **message,
+            'content': [{
+                'type': 'text',
+                'text': content,
+                'cache_control': {'type': 'ephemeral'},
+            }],
+        }
+    if isinstance(content, list) and content:
+        parts = [dict(p) for p in content if isinstance(p, dict)]
+        if parts and parts[-1].get('type') == 'text' and 'cache_control' not in parts[-1]:
+            parts[-1] = {**parts[-1], 'cache_control': {'type': 'ephemeral'}}
+            return {**message, 'content': parts}
+    return message
+
+
+def validate_trajectory(messages: list | None) -> list[dict] | None:
+    """Normalize/validate a stored trajectory; ``None`` when structurally broken.
+
+    Keeps only whitelisted fields (no provider ``reasoning``/thinking payloads)
+    and enforces OpenAI-compatible invariants: every ``tool`` message must
+    follow the assistant ``tool_calls`` entry that opened its id, and no
+    ``tool_calls`` may dangle without a result (providers reject both on input).
+    """
+    if not isinstance(messages, list) or not messages:
+        return None
+    cleaned: list[dict] = []
+    open_calls: set[str] = set()
+    for m in messages:
+        if not isinstance(m, dict):
+            return None
+        role = m.get('role')
+        if role == 'assistant':
+            content = m.get('content')
+            if content is not None and not isinstance(content, str):
+                return None
+            out: dict = {'role': 'assistant', 'content': content}
+            tcs = m.get('tool_calls')
+            if tcs is not None:
+                if not isinstance(tcs, list):
+                    return None
+                calls: list[dict] = []
+                for tc in tcs:
+                    if not isinstance(tc, dict):
+                        return None
+                    fn = (tc or {}).get('function') or {}
+                    tc_id, name = (tc or {}).get('id'), fn.get('name')
+                    if not tc_id or not name:
+                        return None
+                    open_calls.add(tc_id)
+                    calls.append({
+                        'id': tc_id,
+                        'type': 'function',
+                        'function': {'name': name, 'arguments': fn.get('arguments') or '{}'},
+                    })
+                if calls:
+                    out['tool_calls'] = calls
+            cleaned.append(out)
+        elif role == 'tool':
+            tc_id, content = m.get('tool_call_id'), m.get('content')
+            if not tc_id or tc_id not in open_calls or not isinstance(content, str):
+                return None
+            open_calls.discard(tc_id)
+            cleaned.append({'role': 'tool', 'tool_call_id': tc_id, 'content': content})
+        elif role == 'user':
+            content = m.get('content')
+            if not isinstance(content, str):
+                return None
+            cleaned.append({'role': 'user', 'content': content})
+        else:
+            return None
+    if open_calls:
+        return None
+    return cleaned
+
+
+def _trajectory_chars(trajectory: list[dict]) -> int:
+    total = 0
+    for m in trajectory:
+        if not isinstance(m, dict):
+            continue
+        content = m.get('content')
+        if isinstance(content, str):
+            total += len(content)
+        tcs = m.get('tool_calls')
+        if isinstance(tcs, list):
+            for tc in tcs:
+                if isinstance(tc, dict) and isinstance(tc.get('function'), dict):
+                    total += len(tc['function'].get('arguments') or '')
+    return total
+
+
+def _turn_replay_cost(turn: dict) -> int:
+    """Approximate payload size of replaying *turn* verbatim."""
+    if not isinstance(turn, dict):
+        return 0
+    um = turn.get('user_message')
+    total = len(um) if isinstance(um, str) else 0
+    traj = turn.get('trajectory')
+    return total + (_trajectory_chars(traj) if isinstance(traj, list) else 0)
+
 
 def author_info(user: Any) -> dict:
     """Extract stable author info (id / handle / display name) from a user."""
@@ -62,9 +215,22 @@ def make_turn(
     sources: list[dict] | None = None,
     reply_to: str | int | None = None,
     prior_context: list[str] | None = None,
+    user_message: dict | None = None,
+    trajectory: list[dict] | None = None,
 ) -> dict:
-    """Build a single conversation turn record."""
-    return {
+    """Build a single conversation turn record.
+
+    ``user_message`` is the exact message dict sent to the LLM for this turn
+    (only its text is kept — images are re-inlined from their stored refs, so
+    replay stays byte-identical without persisting base64 payloads).
+    ``trajectory`` is the serialized internal loop (tool calls/results + final
+    answer) captured by :func:`cogs.utils.run_tool_loop`; replaying it verbatim
+    lets follow-ups continue from the model's own prior steps.
+
+    The persisted ``user_message`` is the exact text sent to the LLM (images
+    are re-inlined from their stored refs on replay).
+    """
+    turn = {
         'question': question,
         'answer': answer,
         'author': author or {'id': '', 'name': '', 'display': ''},
@@ -81,6 +247,21 @@ def make_turn(
         'reply_to': str(reply_to) if reply_to else None,
         'prior_context': [l for l in (prior_context or []) if l][:max(30, CONVERSATIONS_GAP_MESSAGES)],
     }
+    captured_text = message_text(user_message)
+    if captured_text:
+        turn['user_message'] = captured_text
+    if CONVERSATIONS_TRAJECTORY_ENABLED and trajectory:
+        cleaned = validate_trajectory(trajectory)
+        if not cleaned:
+            logger.warning('[conversation] dropping invalid trajectory for a new turn')
+        elif _trajectory_chars(cleaned) > CONVERSATIONS_TRAJECTORY_MAX_CHARS:
+            logger.warning(
+                '[conversation] dropping oversized trajectory (%d chars > %d)',
+                _trajectory_chars(cleaned), CONVERSATIONS_TRAJECTORY_MAX_CHARS,
+            )
+        else:
+            turn['trajectory'] = cleaned
+    return turn
 
 
 def cap_turns(turns: list[dict], max_turns: int) -> list[dict]:
@@ -160,30 +341,98 @@ def _append_image_marker(text: str, count: int) -> str:
     return f'{text}\n\n{marker}' if text else marker
 
 
+def _replay_verbatim_turn(turn: dict, image_budget: int) -> tuple[list[dict], int] | None:
+    """Rebuild the exact messages of a captured turn, or ``None`` to fall back.
+
+    The user message is replayed byte-identically from its stored text (images
+    re-inlined from their refs — the files are immutable, so the parts are too),
+    followed by the stored trajectory (tool calls, results, final answer).
+    Inlined images are charged against *image_budget* (shared with the compact
+    path) so a multi-turn window cannot balloon the request past the provider's
+    image limits; turns that lose the budget get the same text marker as old
+    compact turns.
+    """
+    text = turn.get('user_message')
+    if not isinstance(text, str) or not text.strip():
+        return None
+    raw_images = turn.get('images')
+    images = [u for u in raw_images if isinstance(u, str) and u] if isinstance(raw_images, list) else []
+    inline, _ = _split_images(images[:max(0, image_budget)])
+    dropped = len(images) - len(inline)
+    if dropped:
+        text = _append_image_marker(text, dropped)
+    if inline:
+        user_msg: dict = {'role': 'user', 'content': [{'type': 'text', 'text': text}, *inline]}
+    else:
+        user_msg = {'role': 'user', 'content': text}
+    trajectory = validate_trajectory(turn.get('trajectory'))
+    if not trajectory:
+        return [user_msg, {'role': 'assistant', 'content': turn.get('answer') or ''}], len(inline)
+    if trajectory[-1].get('role') != 'assistant':
+        trajectory = [*trajectory, {'role': 'assistant', 'content': turn.get('answer') or ''}]
+    return [user_msg, *trajectory], len(inline)
+
+
 def build_history_messages(
     history: list[dict], *, max_turns: int = 16, max_images: int = 4,
     image_turns: int = CONVERSATIONS_IMAGE_TURNS,
+    trajectory_turns: int | None = None,
+    trajectory_step: int = CONVERSATIONS_TRAJECTORY_STEP,
+    trajectory_max_chars: int = CONVERSATIONS_TRAJECTORY_MAX_CHARS,
 ) -> list[dict]:
     """Render stored turns as attributed user/assistant message pairs.
 
-    Each user message is prefixed with ``[Por Autor (@handle) • author_id=… •
-    data hora]`` plus extra metadata: speaker change, ``↩ reply_to=`` and
-    ``msg_id=``. Channel chatter captured between turns (``prior_context``) is
-    injected above the question as a ``[Mensagens no canal antes desta
-    pergunta]`` block, tagged with the channel when known. Sources used in a
-    turn are appended to its assistant message.
+    Turns inside the trajectory window (the most recent ones) are replayed
+    **verbatim** — their exact user message plus the internal tool-calling
+    trajectory captured when they ran — so follow-ups see the model's own prior
+    steps, and the replayed prefix stays byte-identical to what was previously
+    sent, which keeps provider prefix caches effective.  Older turns use the
+    compact rendering: each user message is prefixed with ``[Por Autor
+    (@handle) • author_id=… • data hora]`` plus extra metadata (speaker change,
+    ``↩ reply_to=``, ``msg_id=``), channel chatter captured between turns
+    (``prior_context``) is injected above the question, and sources used in a
+    turn are appended to its assistant message.  Verbatim turns rely on the
+    attribution baked into their captured text instead of these prefixes.
+
+    Both windows advance in ``trajectory_step`` increments (see
+    :func:`stepped_floor`) so the rendered history only changes at deliberate
+    collapse boundaries instead of sliding on every follow-up; the trajectory
+    window additionally shrinks until replayed payload fits
+    ``trajectory_max_chars``.
 
     Images are inlined as base64 data URIs only for the last ``image_turns``
-    turns (within ``max_images``); older turns — and turns whose images are
-    legacy URLs or missing files — get a text marker instead. Raw URLs are
-    never sent: some providers hang or reject URL-based ``image_url`` parts.
+    compact-rendered turns (within ``max_images``); verbatim turns inline their
+    own stored images.  Turns whose images are legacy URLs or missing files get
+    a text marker instead.  Raw URLs are never sent: some providers hang or
+    reject URL-based ``image_url`` parts.
     """
-    turns = history[-max_turns:]
-    inline_from = max(0, len(turns) - image_turns)
+    if trajectory_turns is None:
+        trajectory_turns = CONVERSATIONS_TRAJECTORY_TURNS if CONVERSATIONS_TRAJECTORY_ENABLED else 0
+    step = max(1, trajectory_step)
+    replay_from = stepped_floor(len(history), max_turns, step)
+    turns = history[replay_from:]
+
+    verbatim_from = len(turns)
+    if trajectory_turns > 0:
+        verbatim_from = stepped_floor(len(turns), trajectory_turns, step)
+        while verbatim_from < len(turns):
+            cost = sum(_turn_replay_cost(t) for t in turns[verbatim_from:])
+            if cost <= max(0, trajectory_max_chars):
+                break
+            verbatim_from = min(len(turns), verbatim_from + step)
+
     messages: list[dict] = []
     prev_author_id: str | None = None
     image_budget = max_images
+    inline_from = max(0, len(turns) - image_turns)
     for idx, turn in enumerate(turns):
+        if idx >= verbatim_from:
+            replayed = _replay_verbatim_turn(turn, image_budget)
+            if replayed is not None:
+                replayed_messages, images_used = replayed
+                image_budget -= images_used
+                messages.extend(replayed_messages)
+                continue
         author = turn.get('author') or {}
         meta = [f"Por {_author_label(author)}"]
         if author.get('id'):
