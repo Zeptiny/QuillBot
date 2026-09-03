@@ -8,7 +8,7 @@ from discord.ext import commands
 from openai import AsyncOpenAI, RateLimitError
 
 from cogs import image_store
-from cogs.utils import PaginatedEmbedView, split_response
+from cogs.utils import PaginatedEmbedView, _usage_summary, split_response
 from config import (
     CHAT_MODEL,
     COOLDOWN_PER,
@@ -396,6 +396,7 @@ class LogAnalyzer(commands.Cog):
             messages=messages,
             max_tokens=1500,
         )
+        logger.debug("Log analysis usage=[%s]", _usage_summary(response))
         return response.choices[0].message.content
 
     @app_commands.command(name='analyze', description='Analisa um log de servidor Minecraft com IA')

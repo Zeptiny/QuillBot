@@ -861,17 +861,50 @@ def history_tool_status(name: str, args: dict) -> str | None:
     return None
 
 
+def _cached_tokens(usage: Any) -> int | None:
+    """Cached prompt tokens from OpenAI/OpenRouter or Anthropic-style usage."""
+    if usage is None:
+        return None
+    details = _get(usage, 'prompt_tokens_details', None)
+    cached = _get(details, 'cached_tokens', None) if details is not None else None
+    if cached is None:
+        cached = _get(usage, 'cache_read_input_tokens', None)
+    return cached
+
+
 def _usage_summary(response: Any) -> str:
-    """Format token usage info from a chat completion for log lines."""
-    usage = getattr(response, 'usage', None)
+    """Format token usage (incl. cached prefix tokens) for log lines."""
+    usage = _get(response, 'usage', None)
     if usage is None:
         return 'n/a'
-    parts = [f'prompt={usage.prompt_tokens}', f'completion={usage.completion_tokens}']
-    details = getattr(usage, 'completion_tokens_details', None)
-    reasoning = getattr(details, 'reasoning_tokens', None) if details is not None else None
+    parts = [
+        f'prompt={_get(usage, "prompt_tokens", None)}',
+        f'completion={_get(usage, "completion_tokens", None)}',
+    ]
+    cached = _cached_tokens(usage)
+    if cached is not None:
+        prompt = _get(usage, 'prompt_tokens', None) or 0
+        suffix = f' (hit={round(100 * cached / prompt)}%)' if prompt else ''
+        parts.append(f'cached={cached}{suffix}')
+    details = _get(usage, 'completion_tokens_details', None)
+    reasoning = _get(details, 'reasoning_tokens', None) if details is not None else None
     if reasoning is not None:
         parts.append(f'reasoning={reasoning}')
     return ', '.join(parts)
+
+
+def _accumulate_usage(totals: dict[str, int], response: Any) -> None:
+    """Add one completion's usage into *totals* (prompt/completion/cached)."""
+    usage = _get(response, 'usage', None)
+    if usage is None:
+        return
+    for key in ('prompt_tokens', 'completion_tokens'):
+        value = _get(usage, key, None)
+        if value:
+            totals[key] += value
+    cached = _cached_tokens(usage)
+    if cached:
+        totals['cached_tokens'] += cached
 
 
 def _get(msg: Any, key: str, default: Any = None) -> Any:
@@ -989,6 +1022,7 @@ async def run_tool_loop(
     seen_keys: set[str] = set()
     rounds_used = 0
     finish_reasons: list[str] = []
+    usage_totals: dict[str, int] = {'prompt_tokens': 0, 'completion_tokens': 0, 'cached_tokens': 0}
     capture_start = len(messages)
 
     for round_num in range(1, max_rounds + 1):
@@ -999,6 +1033,7 @@ async def run_tool_loop(
             max_tokens=LLM_MAX_TOKENS,
             tools=tools,
         )
+        _accumulate_usage(usage_totals, response)
 
         choice = response.choices[0]
         finish_reason = getattr(choice, 'finish_reason', None) or 'unknown'
@@ -1084,6 +1119,7 @@ async def run_tool_loop(
             messages=messages,
             max_tokens=LLM_MAX_TOKENS,
         )
+        _accumulate_usage(usage_totals, response)
 
     final_choice = response.choices[0]
     answer = final_choice.message.content or ''
@@ -1109,6 +1145,7 @@ async def run_tool_loop(
             messages=messages,
             max_tokens=LLM_MAX_TOKENS,
         )
+        _accumulate_usage(usage_totals, response)
         final_choice = response.choices[0]
         answer = final_choice.message.content or ''
     if not answer.strip():
@@ -1124,6 +1161,18 @@ async def run_tool_loop(
         answer = 'Não foi possível gerar uma resposta.'
     messages.append({'role': 'assistant', 'content': answer})
     trajectory = serialize_trajectory(messages[capture_start:])
+    prompt_total = usage_totals['prompt_tokens']
+    if prompt_total:
+        cached_total = usage_totals['cached_tokens']
+        logger.info(
+            "Turn usage: model=%s rounds=%d prompt=%d cached=%d hit=%.0f%% completion=%d",
+            model,
+            rounds_used,
+            prompt_total,
+            cached_total,
+            100.0 * cached_total / prompt_total,
+            usage_totals['completion_tokens'],
+        )
     return answer, all_sources, trajectory
 
 
