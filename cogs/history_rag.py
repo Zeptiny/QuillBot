@@ -837,23 +837,32 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
         except Exception:
             logger.exception("Failed backfill channel %s", cid)
 
-    def _append_chunks(self, gid: int, chunks: list[dict], embeddings: list):
+    def _append_chunks(self, gid: int, chunks: list[dict], embeddings: list) -> bool:
         if not chunks or not embeddings:
-            return
+            return False
         stacked = np.asarray(embeddings, dtype=np.float32)
         if stacked.ndim != 2 or stacked.shape[0] != len(chunks):
             logger.warning(
                 "Embedding batch mismatch guild %s: %s embeddings for %s chunks",
                 gid, stacked.shape, len(chunks),
             )
-            return
+            return False
         mat = self._matrices.get(gid)
+        if mat is not None and mat.shape[0] and (
+            mat.ndim != 2 or mat.shape[1] != stacked.shape[1]
+        ):
+            logger.warning(
+                "Embedding width mismatch guild %s: existing %s, batch %s",
+                gid, mat.shape, stacked.shape,
+            )
+            return False
         self._matrices[gid] = (
             stacked if mat is None or mat.shape[0] == 0 else np.vstack([mat, stacked])
         )
         for ch in chunks:
             self._chunks[gid].append(ch)
             self._msg_index[gid][int(ch["msg_id"])] = len(self._chunks[gid]) - 1
+        return True
 
     async def _index_batch(self, guild: discord.Guild, channel: discord.abc.Messageable, msgs: list[discord.Message]):
         if not msgs:
@@ -904,10 +913,12 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
             return
         lock = self._lock(gid)
         if lock.locked():
-            self._append_chunks(gid, chunks, embeddings)
+            appended = self._append_chunks(gid, chunks, embeddings)
         else:
             async with lock:
-                self._append_chunks(gid, chunks, embeddings)
+                appended = self._append_chunks(gid, chunks, embeddings)
+        if not appended:
+            return
         logger.info("Indexed %d msgs guild %s channel %s (total %d)", len(chunks), gid, cid, len(self._chunks[gid]))
         try:
             batch_ids = [str(c['msg_id']) for c in chunks]
@@ -951,10 +962,25 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
             chunk = self._chunks[gid][idx]
             if chunk.get("content") == new_content:
                 return
+            window_line = format_message_line(after)
+            chunk_text = "\n".join(chunk.get("window_lines", []) + [window_line])
+            emb = np.asarray((await self._embed_batch([chunk_text]))[0], dtype=np.float32)
+            mat = self._matrices.get(gid)
+            if (
+                mat is None
+                or mat.ndim != 2
+                or not 0 <= idx < mat.shape[0]
+                or emb.ndim != 1
+                or mat.shape[1] != emb.shape[0]
+            ):
+                logger.warning(
+                    "Edited embedding width mismatch guild %s: existing %s, edited %s",
+                    gid, None if mat is None else mat.shape, emb.shape,
+                )
+                return
             chunk["content"] = new_content
-            chunk["window_line"] = format_message_line(after)
-            chunk["chunk_text"] = "\n".join(chunk.get("window_lines", []) + [chunk["window_line"]])
-            emb = np.asarray((await self._embed_batch([chunk["chunk_text"]]))[0], dtype=np.float32)
+            chunk["window_line"] = window_line
+            chunk["chunk_text"] = chunk_text
             self._matrices[gid][idx] = emb
             await asyncio.to_thread(self._upsert_chunks_to_db, gid, [chunk], [emb])
             await asyncio.to_thread(self._upsert_authors, gid, [chunk], count_msg_ids=set())
