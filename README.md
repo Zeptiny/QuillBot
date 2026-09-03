@@ -32,7 +32,7 @@ Built with [discord.py](https://discordpy.readthedocs.io/) + RAG (Retrieval-Augm
 | **Spark Profiler** | Full report parsing, bottleneck diagnosis, platform-aware recommendations |
 | **Plugin Search** | Concurrent search across Modrinth, Hangar, SpigotMC |
 | **Server Tools** | JVM flags, server status checks, docs changelog |
-| **Lore Encyclopedia** | Bot-curated server memory: history, inside jokes, glossary, milestones — with full admin control (revert/lock/approve) and an append-only audit log |
+| **Persistent Memory** | The bot remembers: atomic facts about the server and its members, auto-injected into every conversation, with inline LLM writes, pinning, dedupe, full audit history and admin control |
 
 All AI responses are in **Brazilian Portuguese** and formatted for Discord embeds.
 
@@ -43,10 +43,10 @@ All AI responses are in **Brazilian Portuguese** and formatted for Discord embed
 ### AI-Powered Commands
 
 #### `/ask <question> [image]`
-Ask any Minecraft server administration question. Uses an agentic RAG loop — the LLM automatically calls `search_docs`, `search_plugins`, `search_lore`, `search_history`, and context tools to ground its answer in real documentation.
+Ask any Minecraft server administration question. Uses an agentic RAG loop — the LLM automatically calls `search_docs`, `search_plugins`, `memory_search`, `search_history`, and context tools to ground its answer in real documentation.
 
 - **Model:** `CHAT_MODEL` (default: `qwen/qwen3.6-plus`)
-- **Tools available:** `search_docs`, `search_plugins`, `search_lore`, `save_lore`, `get_channel_history`, `get_guild_info`, `search_history`, `get_message_context`
+- **Tools available:** `search_docs`, `search_plugins`, `memory_search`, `memory_write`, `memory_about`, `get_channel_history`, `get_guild_info`, `search_history`, `get_message_context`, `find_user`, `sql_history`
 - **Features:** Image/screenshot analysis, 5-minute ephemeral prompt+report cache, paginated multi-embed output with source links, reply to continue conversation (30 min TTL, 200 conversations), cooldown per user
 - **Follow-up:** Reply to the bot's response to continue the conversation with full history
 
@@ -87,31 +87,34 @@ Re-index documentation vectors.
 - Shows `⏳ Indexando...` guard — blocks `/ask`/`/docs` queries during indexing
 - Per-source commit SHA tracking for granular updates
 
-#### `/lore <subcommand>` — Server Lore Encyclopedia
-Structured community memory: server history, events, inside jokes, glossary terms, milestones, and notable people. The bot manages it autonomously via `search_lore` / `save_lore` tools in `/ask`, `/chat` and @mention flows; admins retain full control.
+#### `/memory <subcommand>` — Persistent Bot Memory
+The bot maintains long-term memories: atomic one-sentence facts about the server (guild-wide) or about individual users (scoped, privacy-guarded). Relevant memories are **automatically injected** into every `/ask`, `/chat` and @mention turn — the LLM doesn't need to search first.
 
 | Subcommand | Who | Description |
 |---|---|---|
-| `/lore list [category]` | everyone | Paginated list of entries (pending entries admin-only) |
-| `/lore show <term>` | everyone | Entry details + sources; admins also see history IDs |
-| `/lore add` | Admin | Create an entry manually |
-| `/lore edit <term>` | Admin | Edit content / aliases / category |
-| `/lore delete <term>` | Admin | Archive (always reversible — no hard deletes) |
-| `/lore restore <id>` | Admin | Restore any version by history ID |
-| `/lore approve <term>` | Admin | Approve a pending `person` entry (works without the log channel) |
-| `/lore lock` / `/lore unlock <term>` | Admin | Toggle `curated` protection — bot can read but never write |
-| `/lore export` | Admin | Full JSON export |
+| `/memory list [kind]` | everyone | Paginated list (users see guild memories + their own; admins see all) |
+| `/memory show <id>` | everyone | Memory details (own or guild-wide only); admins also see history IDs |
+| `/memory edit <id>` | Admin | Edit content / importance |
+| `/memory delete <id>` | Admin | Archive (always reversible — no hard deletes) |
+| `/memory restore <id>` | Admin | Restore any version by history ID |
+| `/memory pin` / `/memory unpin <id>` | Admin | Toggle pinned (always injected; admins bypass the pin limit) |
+| `/memory whoami` | everyone | See everything the bot remembers about you |
+| `/memory forget-me` | everyone | Hard-delete all memories about you (irreversible) |
+| `/memory forget <user>` | Admin | Hard-delete all memories about a user |
+| `/memory export` | Admin | Full JSON export |
 
 **How it works:**
-- **Single mutation path** — every write (bot or admin) funnels through `LoreStore`, which applies the change and records the before/after snapshot into `lore_history` in one SQLite transaction (partial failures roll back)
-- **Provenance required** — `save_lore` refuses create/update writes without `sources` shaped as guild-scoped `discord.com/channels/...` jump URLs; sources accumulate per entry
-- **Pending guard** — bot-created `person` entries stay `pending` (hidden from search) until an admin approves via log-channel button or `/lore approve`
-- **Transparency channel** — with `LORE_LOG_CHANNEL_ID` set, every mutation posts an embed with actor, reason, sources, and **↩️ Reverter / 🔒 Proteger / ✅ Aprovar** buttons (admin-only, same guild)
-- **Silent reads** — `search_lore` returns no source pages (responses stay clean); hits are console-logged (`[lore] hit: …`)
-- **Alias-first matching** — exact term > alias > substring (min length 3) > embedding fallback (reuses DocsRAG/HistoryRAG embedding clients; deferred until lexical hits miss)
-- **Rate guard** — bot writes capped at `LORE_BOT_WRITE_LIMIT`/hour per guild (rejected calls don't consume quota)
-- **Tool errors degrade gracefully** — lore failures return error strings to the LLM instead of aborting `/ask`//`/chat`
-- Set `LORE_ENABLED=false` to remove the tools and prompt guidance entirely
+- **LLM tools** — `memory_search` (hybrid lexical→semantic recall with importance/recency re-ranking), `memory_write` (`create`/`update`/`forget`, one mutation path, dedupe-guarded), `memory_about` (compact per-user profile)
+- **Auto-injection** — every turn embeds the current question and selects the top memories (cosine + importance + participant boost); pinned memories always ride along (importance-ranked, capped). User memories only participate when their subject is in the conversation (speaker, @mention, reply target)
+- **Pinning** — bot can pin too (`pinned=true` in `memory_write`, capped at `MEMORY_PIN_LIMIT`/guild, audited via `pinned_by`); admins pin/unpin without the cap
+- **Dedupe** — creates are refused when semantically similar (cosine ≥ `MEMORY_DEDUPE_THRESHOLD`) to an existing memory in the same scope; the LLM is told to `update` instead
+- **Single mutation path** — every write funnels through `MemoryStore`, which applies the change and records a before/after snapshot into `memory_history` in one SQLite transaction
+- **Rate guard** — bot writes capped at `MEMORY_BOT_WRITE_LIMIT`/hour per guild; `MEMORY_MAX_PER_SUBJECT` active memories per scope
+- **Transparency channel** — with `MEMORY_LOG_CHANNEL_ID` set, every mutation posts an embed with a **↩️ Reverter** button (admin-only, same guild)
+- **Privacy** — `/memory whoami` + `/memory forget-me` are self-service; purges hard-delete memories and their history
+- **One-time migration** — existing `lore.db` entries import automatically on first start (curated → pinned, pending skipped; `lore.db` is kept on disk untouched)
+- Tool errors degrade gracefully — memory failures return error strings to the LLM instead of aborting `/ask`/`/chat`
+- Set `MEMORY_ENABLED=false` to remove the tools and prompt guidance entirely
 
 ---
 
@@ -177,6 +180,7 @@ Background RAG over the entire Discord server's message history:
 - **Live ingestion:** Every new message is chunked with a 5-message sliding window for local context, embedded, and persisted per-guild (`data/history/<guild_id>.json + .npy`)
 - **Dedup + deletion:** Tracks `msg_id → index`, handles `on_message_delete`
 - **Search tool:** `search_history` / `search_docs` equivalent available to the LLM in all agentic loops
+- **SQL tool:** `sql_history` — LLM-written analytical SELECTs over the history DB (exact counts, GROUP BY, mentions, replies, FTS5, REGEXP), sandboxed four ways: single-SELECT validation + guild scoping, read-only URI + `PRAGMA query_only`, `set_authorizer` (writes/ATTACH/PRAGMA denied, `chunks.embedding` never emitted), and a progress-handler timeout (`HISTORY_SQL_TIMEOUT_SECONDS`). Disable with `HISTORY_SQL_TOOL_ENABLED=false`; rows/output caps via `HISTORY_SQL_MAX_ROWS`.
 
 ---
 
@@ -204,11 +208,21 @@ while tool_calls and rounds < MAX_TOOL_ROUNDS:
 
 - Parallel tool calls per round when the LLM requests multiple
 
+### Trajectory Replay (`CONVERSATIONS_TRAJECTORY_*`)
+Each turn captures the **exact rendered user message** plus the serialized internal loop (assistant tool calls, tool results, final answer). On follow-ups, the most recent `CONVERSATIONS_TRAJECTORY_TURNS` turns are replayed **verbatim** — the model literally sees its own prior tool calls and their results instead of a distilled Q/A pair. Older turns (and turns captured before this feature, or whose trajectory was dropped as invalid/oversized) fall back to the compact attributed rendering.
+
+Replay windows advance in `CONVERSATIONS_TRAJECTORY_STEP`-turn steps (hysteresis), so the replayed prefix only changes at deliberate collapse boundaries — not sliding every turn — which is what keeps the provider prefix cache effective. Explicit `cache_control` breakpoints mark the system prompt and the last replayed history message for Anthropic/Gemini via OpenRouter; OpenAI-compatible endpoints ignore them and cache automatically. Captured trajectories are sanitized on persist (no `reasoning`/thinking payloads, tool-call/result pairing enforced).
+
 ### Rate Limiting
 `COOLDOWN_RATE` / `COOLDOWN_PER` (default `1` per `30s`) per user on `/ask`, `/chat`, `/analyze`. Follow-up replies share a `TTLCache` cooldown. Exceeding returns an ephemeral `⏳ Aguarde Xs` message.
 
 ### Context Injection
 Every AI call receives a `<contexto>` block with user (display name, account age, join date, roles), guild (name, member count, channels, roles), channel, and temporal (BRT + UTC) context.
+
+When `CHANNEL_CONTEXT_MESSAGES` > 0 (default `10`), `/ask`, `/chat`, @mention and reply follow-ups also receive a `<mensagens_recentes_do_canal>` block — the latest N channel messages in chronological order, same format as the `get_channel_history` tool. The triggering message is excluded; set `0` to disable. Reply follow-ups use the captured gap block (`prior_context`, see `CONVERSATIONS_GAP_MESSAGES`) instead of this recent-channel window whenever a gap was captured.
+
+### Prefix-Cache-Friendly Message Layout
+The LLM message list is ordered so conversation follow-ups reuse a cached prefix: `[system (persona + static conversation summary)] → [replayed history turns] → [current message]`. All per-request blocks — `<contexto>` (clock), the semantically-selected memory block, and the recent channel window — ride on the **final user message** instead of the system prompt, so the system prompt + history stay byte-identical across turns and providers can prefix-cache them (typically 80–95% input-token savings on cached prefixes).
 
 ---
 
@@ -252,7 +266,7 @@ QuillBot/
 │   ├── docs_rag.py       # RAG pipeline — indexing, search, reranking, /ask, /reindex, agentic loop + Spark diagnosis
 │   ├── history_rag.py    # Server-wide history RAG — backfill, live ingestion, per-guild vector stores
 │   ├── log_analyzer.py   # Passive log detection, pattern matching, /analyze, file upload to mclo.gs
-│   ├── lore.py           # Lore encyclopedia — bot-managed entries, admin commands, audit history, log channel
+│   ├── memory.py         # Persistent memory — auto-injection, LLM write tools, admin commands, audit history, log channel, lore migration
 │   ├── plugins.py        # /plugin, /status, /changelog — plugin search & server status
 │   ├── spark.py          # /spark command + passive spark.lucko.me detection
 │   ├── spark_parser.py   # Spark JSON parsing, summary/detail builders, call-tree rendering
@@ -263,7 +277,8 @@ QuillBot/
 │   └── errors.py         # 25 compiled Minecraft error regex patterns + pt-BR responses
 └── data/
     ├── vectors.json/.npy # Docs RAG vector store
-    ├── lore.db           # Lore encyclopedia (entries + history)
+    ├── memory.db          # Persistent memory (memories + history)
+    ├── lore.db            # Legacy lore encyclopedia (kept as migration source)
     └── history/          # Per-guild history stores
 ```
 
@@ -316,6 +331,9 @@ cp .env.example .env   # if available, otherwise create .env manually
 | `LOCAL_EMBEDDING_MODEL` | `sentence-transformers/all-MiniLM-L6-v2` | Model when `EMBEDDING_PROVIDER=local` |
 | `LOCAL_EMBEDDING_DEVICE` | `cpu` | Device for local embeddings |
 | `RERANK_ENABLED` | `true` | Enable reranking (only when base URL is OpenRouter) |
+| `RERANK_PROVIDER` | `auto` | `auto` (remote on OpenRouter, local elsewhere), `local` (cross-encoder) or `remote` (OpenRouter `/rerank`) |
+| `LOCAL_RERANK_MODEL` | `cross-encoder/ms-marco-MiniLM-L-6-v2` | Cross-encoder used when the rerank provider is local |
+| `LOCAL_RERANK_DEVICE` | `cpu` | Device for the local reranker (defaults to `LOCAL_EMBEDDING_DEVICE`) |
 
 ### Feature Flags
 
@@ -324,8 +342,9 @@ cp .env.example .env   # if available, otherwise create .env manually
 | `WEB_SEARCH_ENABLED` | `true` | Enable Tavily web search |
 | `TAVILY_API_KEY` | — | Required when web search is enabled |
 | `CHAT_MENTION_ENABLED` | `true` | Enable @mention chat mode |
+| `CHANNEL_CONTEXT_MESSAGES` | `10` | Latest channel messages auto-injected as context into `/ask`, `/chat`, @mention and reply follow-ups (`0` disables) |
 | `HISTORY_ENABLED` | `true` | Enable server history RAG |
-| `LORE_ENABLED` | `true` | Enable the lore encyclopedia |
+| `MEMORY_ENABLED` | `true` | Enable persistent memory (cog not loaded when false) |
 | `LOG_LEVEL` | `INFO` | Python logging level |
 
 ### History RAG
@@ -333,19 +352,52 @@ cp .env.example .env   # if available, otherwise create .env manually
 | Variable | Default | Description |
 |---|---|---|
 | `HISTORY_VECTOR_STORE_DIR` | `data/history` | Per-guild history storage dir |
+| `HISTORY_DB_PATH` | `data/history/history.db` | SQLite history DB (defaults to `<HISTORY_VECTOR_STORE_DIR>/history.db`) |
 | `HISTORY_WINDOW_SIZE` | `5` | Sliding window of prior messages per chunk |
+| `HISTORY_WINDOW_OVERLAP` | `1` | Overlap between consecutive chunks |
 | `HISTORY_BACKFILL_LIMIT` | _(none)_ | Max messages to backfill per channel (unset = all) |
 | `HISTORY_MAX_MSG_LENGTH` | `800` | Max chars per message in history chunks |
 | `HISTORY_EXCLUDE_BOTS` | `true` | Exclude bot messages from history |
+| `HISTORY_INGEST_BATCH_SIZE` | `10` | Messages per embedding batch during live ingestion |
+| `HISTORY_INGEST_FLUSH_SECONDS` | `2.0` | Max delay before a partial batch is flushed |
+| `HISTORY_SNAPSHOT_INTERVAL` | `300` | Seconds between vector-store snapshots to disk |
+| `HISTORY_QUERY_CACHE_SIZE` | `200` | LRU query result cache size |
+| `HISTORY_DEDUPE_WINDOW_MINUTES` | `10` | Adjacent results in the same channel treated as one window and deduplicated (`0` disables) |
+| `HISTORY_RERANK_ENABLED` | `true` | Rerank history search results |
+| `HISTORY_RERANK_PROVIDER` | `auto` | Rerank provider for history search (defaults to `RERANK_PROVIDER`) |
+| `HISTORY_RERANK_MODEL` | `LOCAL_RERANK_MODEL` | Remote rerank model for history search |
+| `HISTORY_TIME_DECAY_LAMBDA` | `0.0` | Exponential decay on recency for `recent` sorting (`0` disables) |
+| `HISTORY_HYBRID_WEIGHT_SEMANTIC` | `0.65` | Semantic weight of the semantic/keyword hybrid blend |
+| `HISTORY_HYBRID_WEIGHT_KEYWORD` | `0.35` | Keyword (FTS5) weight of the hybrid blend |
+| `HISTORY_RRF_K` | `60` | Reciprocal-rank-fusion constant |
+| `HISTORY_SQL_TOOL_ENABLED` | `true` | Enable the read-only `sql_history` LLM tool |
+| `HISTORY_SQL_TIMEOUT_SECONDS` | `5` | Query timeout enforced by the SQLite progress handler |
+| `HISTORY_SQL_MAX_ROWS` | `200` | Max rows returned / shown to the LLM |
 
-### Lore Encyclopedia
+### Vision Images
 
 | Variable | Default | Description |
 |---|---|---|
-| `LORE_ENABLED` | `true` | Enable the lore cog (cog is not loaded when false) |
-| `LORE_DB_PATH` | `data/lore.db` | SQLite path for entries + history |
-| `LORE_LOG_CHANNEL_ID` | _(none)_ | Channel ID for mutation log embeds (Revert/Lock/Approve buttons). Unset = console logging only |
-| `LORE_BOT_WRITE_LIMIT` | `10` | Max bot (`save_lore`) writes per hour per guild |
+| `IMAGES_DIR` | `data/images` | Where downloaded images are persisted |
+| `IMAGE_MAX_SIDE` | `640` | Max dimension (px) of re-encoded JPEGs |
+| `IMAGE_JPEG_QUALITY` | `80` | JPEG quality of re-encoded images |
+| `IMAGE_RETENTION_SECONDS` | `86400` | Stored images swept after this many seconds |
+| `CONVERSATIONS_IMAGE_TURNS` | `3` | Inline stored images only for the most recent N history turns (older become text markers) |
+
+### Memory
+
+| Variable | Default | Description |
+|---|---|---|
+| `MEMORY_ENABLED` | `true` | Enable the memory cog (cog is not loaded when false) |
+| `MEMORY_DB_PATH` | `data/memory.db` | SQLite path for memories + history |
+| `MEMORY_LOG_CHANNEL_ID` | _(none)_ | Channel ID for mutation log embeds (Revert button). Unset = console logging only |
+| `MEMORY_BOT_WRITE_LIMIT` | `20` | Max bot (`memory_write`) writes per hour per guild |
+| `MEMORY_INJECT_LIMIT` | `5` | Semantically selected memories injected per turn (pinned ride along separately) |
+| `MEMORY_PIN_LIMIT` | `12` | Max pinned memories per guild (bot is capped; admins bypass) |
+| `MEMORY_MAX_PER_SUBJECT` | `200` | Max active memories per scope (guild or user) |
+| `MEMORY_SEMANTIC_MIN_SCORE` | `0.35` | Min cosine for semantic search/injection hits |
+| `MEMORY_DEDUPE_THRESHOLD` | `0.85` | Cosine above which a create is refused as duplicate |
+| `LORE_DB_PATH` | `data/lore.db` | Legacy lore DB — one-time migration source for memory.db |
 
 ### Docs / RAG Indexing
 
@@ -363,6 +415,11 @@ cp .env.example .env   # if available, otherwise create .env manually
 | `CONVERSATIONS_MAX_STORED` | `200` | Max conversations kept per flow (chat/ask) |
 | `CONVERSATIONS_MAX_TURNS` | `24` | Max turns stored per conversation |
 | `CONVERSATIONS_HISTORY_TURNS` | `16` | Turns replayed to the LLM per request |
+| `CONVERSATIONS_GAP_MESSAGES` | `20` | Max channel messages captured between two bot-directed turns as `prior_context` (`0` disables) |
+| `CONVERSATIONS_TRAJECTORY_ENABLED` | `true` | Capture and replay the internal LLM trajectory (tool calls/results + exact user message) per turn |
+| `CONVERSATIONS_TRAJECTORY_TURNS` | `6` | Most recent N turns replayed **verbatim** with their trajectory (older turns use the compact Q/A rendering) |
+| `CONVERSATIONS_TRAJECTORY_STEP` | `3` | Window advances in steps of N turns — prefix-cache hysteresis so the replayed prefix only changes at deliberate boundaries |
+| `CONVERSATIONS_TRAJECTORY_MAX_CHARS` | `120000` | Hard budget on the replayed trajectory payload; turns are collapsed to compact rendering when exceeded |
 
 ### Other
 
@@ -372,6 +429,21 @@ cp .env.example .env   # if available, otherwise create .env manually
 | `COOLDOWN_PER` | `30` | Cooldown window in seconds (per user) |
 | `MAX_CONTENT_SIZE` | `5242880` | Max bytes fetched from paste services (5 MB) |
 | `MAX_LOG_CONTEXT` | `12000` | Max chars sent to LLM for log analysis |
+
+### API Request Logging
+
+Implemented in [`api_logger.py`](api_logger.py) — patches the `aiohttp`/`httpx` transports so every outbound HTTP request (Discord REST, LLM API, Tavily, GitHub, plugin APIs) and every inbound Discord interaction is appended as one JSON line to a rotating file. See [SETUP.md](SETUP.md) for sample lines and privacy notes.
+
+| Variable | Default | Description |
+|---|---|---|
+| `API_REQUEST_LOG_ENABLED` | `true` | Master switch |
+| `API_REQUEST_LOG_PATH` | `data/api_requests.log` | Log file path (parent dirs created) |
+| `API_REQUEST_LOG_MAX_BYTES` | `10485760` | Rotate after this many bytes |
+| `API_REQUEST_LOG_BACKUPS` | `5` | Rotated files to keep |
+| `API_REQUEST_LOG_DISCORD` | `true` | `false` omits outbound Discord REST traffic (inbound interactions are logged regardless) |
+| `API_REQUEST_LOG_CONSOLE` | `false` | Also mirror log lines to stdout / docker logs |
+| `API_REQUEST_LOG_BODY` | `openai,tavily` | Services whose request/response bodies are logged (`all`/`none` accepted) |
+| `API_REQUEST_LOG_BODY_MAX_CHARS` | `20000` | Per-body truncation limit |
 
 ---
 
@@ -384,7 +456,7 @@ python main.py
 On startup the bot:
 
 1. Validates `BOT_TOKEN` (exits if missing; warns if `TAVILY_API_KEY` missing while web search is enabled)
-2. Loads cogs in order: `log_analyzer` → `history_rag` → `commands` → `plugins` → `spark` → `docs_rag` → `lore`
+2. Loads cogs in order: `log_analyzer` → `history_rag` → `commands` → `plugins` → `spark` → `docs_rag` → `memory` (first run imports legacy `lore.db` automatically)
 3. Loads cached vectors from disk or indexes all doc sources
 4. Starts periodic reindex loop + background history backfill
 5. Syncs slash commands with Discord

@@ -15,9 +15,11 @@ from discord import app_commands
 from discord.ext import commands, tasks
 from openai import AsyncOpenAI, RateLimitError
 
+from cogs import image_store as _image_store
 from cogs.conversation_store import (
     ConversationStore as _ConversationStore,
     add_participant as _add_participant,
+    apply_cache_control as _apply_cache_control,
     author_info as _author_info,
     build_conversation_block as _build_conversation_block,
     build_current_message as _build_current_message,
@@ -25,7 +27,7 @@ from cogs.conversation_store import (
     cap_turns as _cap_turns,
     make_turn as _make_turn,
 )
-from cogs.lore import SAVE_LORE_TOOL, SEARCH_LORE_TOOL
+from cogs.memory import MEMORY_ABOUT_TOOL, MEMORY_SEARCH_TOOL, MEMORY_WRITE_TOOL
 from cogs.plugin_apis import HTTP_HEADERS as _HTTP_HEADERS
 from cogs.plugin_apis import search_all as _search_plugins_all
 from cogs.spark_parser import (
@@ -36,21 +38,22 @@ from cogs.spark_parser import (
 )
 from cogs.utils import PaginatedEmbedView, build_source_pages, run_tool_loop, split_response
 from cogs.utils import (
-    AGGREGATE_USER_TOPICS_TOOL as _AGGREGATE_USER_TOPICS_TOOL,
     CHANNEL_HISTORY_TOOL as _CHANNEL_HISTORY_TOOL,
     COUNT_MENTIONS_TOOL as _COUNT_MENTIONS_TOOL,
+    FIND_USER_TOOL as _FIND_USER_TOOL,
     GET_MESSAGE_CONTEXT_TOOL as _GET_MESSAGE_CONTEXT_TOOL,
-    GET_TEMPORAL_HEATMAP_TOOL as _GET_TEMPORAL_HEATMAP_TOOL,
     GET_USER_STATS_TOOL as _GET_USER_STATS_TOOL,
-    GET_USER_TIMELINE_TOOL as _GET_USER_TIMELINE_TOOL,
     GUILD_INFO_TOOL as _GUILD_INFO_TOOL,
     SEARCH_HISTORY_TOOL as _SEARCH_HISTORY_TOOL,
+    SQL_HISTORY_TOOL as _SQL_HISTORY_TOOL,
     build_full_context_block as _build_full_context_block,
-    build_guild_context as _build_guild_context,
-    fetch_channel_history as _fetch_channel_history,
-    fetch_message_context as _fetch_message_context,
+    exec_history_tool as _exec_history_tool,
+    fetch_recent_channel_context as _fetch_recent_channel_context,
+    fetch_turn_gap as _fetch_turn_gap,
+    history_tool_status as _history_tool_status,
 )
 from config import (
+    CHANNEL_CONTEXT_MESSAGES,
     CHAT_MODEL,
     COOLDOWN_PER,
     COOLDOWN_RATE,
@@ -65,9 +68,10 @@ from config import (
     EMBEDDING_MODEL,
     EMBEDDING_PROVIDER,
     GITHUB_API,
+    HISTORY_SQL_TOOL_ENABLED,
     LOCAL_EMBEDDING_DEVICE,
     LOCAL_EMBEDDING_MODEL,
-    LORE_ENABLED,
+    MEMORY_ENABLED,
     OPENAI_API_KEY,
     OPENAI_BASE_URL,
     OPENROUTER_API_KEY,
@@ -82,14 +86,31 @@ logger = logging.getLogger(__name__)
 
 MAX_TOOL_ROUNDS = 6  # Safety cap on tool-calling iterations
 
-_LORE_INSTRUCTIONS = (
-    "- Para perguntas sobre a história do servidor, pessoas, piadas internas, glossário da "
-    "comunidade ou marcos, use `search_lore` antes de `search_history` — o lore é a fonte "
-    "curada e canônica do passado do servidor.\n"
-    "- Ao descobrir, com base no histórico, um fato do servidor digno de memória (evento, "
-    "piada interna, termo do glossário, marco, pessoa marcante), salve com `save_lore` "
-    "incluindo `sources` com os links das mensagens que o comprovam.\n"
-) if LORE_ENABLED else ""
+
+def _conversation_participants(message: discord.Message) -> set[str]:
+    """User ids relevant to a message: author, mentions and reply target."""
+    ids = {str(message.author.id)}
+    for u in getattr(message, 'mentions', []):
+        if not u.bot:
+            ids.add(str(u.id))
+    ref = getattr(message, 'reference', None)
+    ref_msg = getattr(ref, 'resolved', None)
+    ref_author = getattr(ref_msg, 'author', None)
+    if ref_author is not None and not ref_author.bot:
+        ids.add(str(ref_author.id))
+    return ids
+
+_MEMORY_INSTRUCTIONS = (
+    "- Você tem uma memória persistente: um bloco <memory> com lembranças relevantes é "
+    "injetado automaticamente no início de cada resposta. Use-o naturalmente — nunca "
+    "mencione o bloco nem os IDs [mem #N]. Para lembrar de algo não injetado, use "
+    "`memory_search`; para contextualizar quem é alguém, use `memory_about`.\n"
+    "- Ao descobrir algo digno de memória (preferência estável, fato sobre pessoa, evento "
+    "marcante, habilidade ensinada), salve com `memory_write` — uma frase autocontida por "
+    "memória, em terceira pessoa. Atualize com action=update quando o fato mudar e use "
+    "action=forget quando deixar de valer. Use pinned=true só para fatos centrais e "
+    "permanentes.\n"
+) if MEMORY_ENABLED else ""
 
 _DISCORD_FORMAT_GUIDE = (
     "A resposta será exibida no Discord (embed description) — use APENAS sintaxe que o Discord renderiza:\n"
@@ -111,7 +132,7 @@ SYSTEM_PROMPT = (
     "<instructions>\n"
     "- Para qualquer pergunta técnica sobre configuração, administração ou otimização de "
     "servidores Minecraft, chame `search_docs` imediatamente.\n"
-    + _LORE_INSTRUCTIONS +
+    + _MEMORY_INSTRUCTIONS +
     "- Baseie cada resposta nos dados retornados pelas ferramentas, não em conhecimento de treinamento.\n"
     "- Se a pergunta for vaga ou ambígua, peça esclarecimentos — omita chamadas de ferramentas.\n"
     "- Cite valores e trechos de configuração exatamente como retornados pelas ferramentas. "
@@ -287,19 +308,19 @@ TOOLS = [
         },
     },
 ]
-if LORE_ENABLED:
-    TOOLS.extend([SEARCH_LORE_TOOL, SAVE_LORE_TOOL])
+if MEMORY_ENABLED:
+    TOOLS.extend([MEMORY_SEARCH_TOOL, MEMORY_WRITE_TOOL, MEMORY_ABOUT_TOOL])
 TOOLS.extend([
     _CHANNEL_HISTORY_TOOL,
     _GUILD_INFO_TOOL,
     _SEARCH_HISTORY_TOOL,
     _GET_MESSAGE_CONTEXT_TOOL,
     _GET_USER_STATS_TOOL,
-    _AGGREGATE_USER_TOPICS_TOOL,
-    _GET_USER_TIMELINE_TOOL,
     _COUNT_MENTIONS_TOOL,
-    _GET_TEMPORAL_HEATMAP_TOOL,
+    _FIND_USER_TOOL,
 ])
+if HISTORY_SQL_TOOL_ENABLED:
+    TOOLS.append(_SQL_HISTORY_TOOL)
 
 # Additional tools injected only when a Spark report is active in the session.
 _SPARK_SECTIONS_STR = ', '.join(f'"{s}"' for s in _SPARK_SECTIONS)
@@ -434,7 +455,7 @@ class DocsRAG(commands.Cog):
         self._local_embed_model = None
         self._local_embed_dim: int | None = None
         self.session: aiohttp.ClientSession | None = None
-        self.chunks: list[dict] = []  # {content, path, title, embedding, source, doc_url}
+        self.chunks: list[dict] = []  # {content, path, title, source, doc_url}; embeddings live only in _emb_matrix
         self._last_commit_sha: str | None = None
         self._indexing: bool = False
         self._emb_matrix: np.ndarray | None = None  # (N, dim) float32 for vectorized search
@@ -507,15 +528,6 @@ class DocsRAG(commands.Cog):
 
     # --- Vector Storage ---
 
-    def _rebuild_matrix(self) -> None:
-        """Rebuild the numpy embedding matrix from current chunks."""
-        if not self.chunks:
-            self._emb_matrix = None
-            return
-        self._emb_matrix = np.array(
-            [c['embedding'] for c in self.chunks], dtype=np.float32
-        )
-
     def _save_vectors(self):
         """Persist chunk metadata to JSON and embeddings to a numpy binary file."""
         os.makedirs(os.path.dirname(VECTOR_STORE_PATH), exist_ok=True)
@@ -536,9 +548,7 @@ class DocsRAG(commands.Cog):
         with open(VECTOR_STORE_PATH, 'w', encoding='utf-8') as f:
             json.dump(meta, f, ensure_ascii=False)
         npy_path = os.path.splitext(VECTOR_STORE_PATH)[0] + '.npy'
-        embeddings = np.array([c['embedding'] for c in self.chunks], dtype=np.float32)
-        np.save(npy_path, embeddings)
-        self._emb_matrix = embeddings
+        np.save(npy_path, self._emb_matrix)
         logger.info("Saved %d vectors to %s + %s", len(self.chunks), VECTOR_STORE_PATH, npy_path)
 
     def _load_vectors(self) -> bool:
@@ -566,14 +576,10 @@ class DocsRAG(commands.Cog):
                         embeddings.shape[1], self._local_embed_dim,
                     )
                     return False
-                for chunk, emb in zip(chunks, embeddings):
-                    chunk['embedding'] = emb
             elif chunks and 'embedding' in chunks[0]:
                 # Old JSON-with-embeddings format — migrate on load
                 logger.info("Migrating vector store from JSON to binary format...")
                 embeddings = np.array([c.pop('embedding') for c in chunks], dtype=np.float32)
-                for chunk, emb in zip(chunks, embeddings):
-                    chunk['embedding'] = emb
             else:
                 logger.warning("No embeddings found in vector store, will reindex")
                 return False
@@ -582,8 +588,8 @@ class DocsRAG(commands.Cog):
                 chunk.setdefault('source', "Miners' Refuge")
                 chunk.setdefault('doc_url', path_to_docs_url(chunk['path']))
             self.chunks = chunks
+            self._emb_matrix = embeddings
             self._last_commit_sha = data.get('commit_sha')
-            self._rebuild_matrix()
             logger.info(
                 "Loaded %d vectors from disk (commit: %s)",
                 len(self.chunks),
@@ -873,7 +879,11 @@ class DocsRAG(commands.Cog):
 
         self.chunks = [c for c in all_chunks if 'embedding' in c]
         logger.info("Documentation indexed: %d chunks with embeddings", len(self.chunks))
-        self._rebuild_matrix()
+        # The float32 matrix is the single source of truth for embeddings:
+        # pop() the per-chunk copies (Python-float lists cost ~8x the matrix).
+        self._emb_matrix = np.array(
+            [c.pop('embedding') for c in self.chunks], dtype=np.float32
+        )
 
         # Track per-source SHAs and timestamps
         if sources is not None:
@@ -1013,7 +1023,6 @@ class DocsRAG(commands.Cog):
                     'O arquivo enviado não é uma imagem válida.', ephemeral=True
                 )
                 return
-            image_url = image.url
 
         await interaction.response.defer(thinking=True)
         try:
@@ -1021,13 +1030,16 @@ class DocsRAG(commands.Cog):
         except discord.HTTPException:
             pass
 
+        if image:
+            image_url = await _image_store.persist_attachment(image)
+
         logger.info(
             "Processing /ask user=%s guild=%s question=%r",
             interaction.user.id, interaction.guild_id, question[:80],
         )
 
         try:
-            answer, embeds, sources = await self._run_agent(
+            answer, embeds, sources, capture = await self._run_agent(
                 question, image_url=image_url, interaction=interaction
             )
             # Clear any in-progress status message before sending the final embed.
@@ -1042,7 +1054,8 @@ class DocsRAG(commands.Cog):
                     embed=embeds[0], view=PaginatedEmbedView(embeds), wait=True
                 )
             await self._store_conversation(
-                msg, question, answer, sources=sources, interaction=interaction
+                msg, question, answer, sources=sources, interaction=interaction,
+                capture=capture,
             )
 
         except RateLimitError:
@@ -1074,18 +1087,22 @@ class DocsRAG(commands.Cog):
         channel: discord.abc.Messageable | None = None,
         guild: discord.Guild | None = None,
         user: discord.abc.User | discord.Member | None = None,
+        origin: str | None = None,
+        participant_ids: set[str] | None = None,
     ) -> tuple[str, list[dict]]:
         """Execute a tool call and return (result_text, source_chunks)."""
-        if name == 'search_lore' or name == 'save_lore':
-            lore_cog = self.bot.get_cog('Lore')
-            if not lore_cog:
-                return 'Enciclopédia de lore não disponível.', []
+        if name in ('memory_search', 'memory_write', 'memory_about'):
+            mem_cog = self.bot.get_cog('Memory')
+            if not mem_cog:
+                return 'Memória não disponível.', []
             if not guild:
-                return 'Lore requer estar em um servidor.', []
+                return 'Memória requer estar em um servidor.', []
             actor_name = f'bot (via {user.display_name})' if user is not None else 'bot'
-            return await lore_cog.exec_tool(
+            return await mem_cog.exec_tool(
                 name, args, guild=guild, actor_name=actor_name,
                 requester=user, channel=channel,
+                origin=origin,
+                participant_ids=participant_ids,
             )
 
         if name == 'search_docs':
@@ -1116,144 +1133,9 @@ class DocsRAG(commands.Cog):
                 )
             return '\n\n'.join(lines), []
 
-        if name == 'get_channel_history':
-            b = bot or self.bot
-            ch = channel
-            limit = args.get('limit', 20)
-            cid = args.get('channel_id')
-            text = await _fetch_channel_history(b, ch, limit=limit, channel_id=cid)
-            return text, []
-
-        if name == 'get_guild_info':
-            g = guild
-            if not g:
-                return "Fora de um servidor (DM).", []
-            text = _build_guild_context(g)
-            try:
-                chs = [f"#{c.name} ({c.id})" for c in g.channels if isinstance(c, discord.TextChannel)][:30]
-                if chs:
-                    text += "\nCanais de texto: " + ", ".join(chs)
-            except Exception:
-                pass
-            return text, []
-
-        if name == 'search_history':
-            hist = self.bot.get_cog('HistoryRAG')
-            if not hist:
-                return "Histórico não disponível.", []
-            g = guild
-            if not g:
-                return "Busca no histórico requer estar em um servidor.", []
-            query = args.get('query', '')
-            limit = max(1, min(12, int(args.get('limit', 5))))
-            try:
-                results = await hist.search(query, g.id, limit=limit, channel_id=args.get('channel_id'), author_id=args.get('author_id'), author_name=args.get('author_name'), after=args.get('after'), before=args.get('before'), search_mode=args.get('search_mode','hybrid'), sort_by=args.get('sort_by','relevance'))  # type: ignore
-            except Exception:
-                logger.exception("search_history failed in docs_rag")
-                return "Erro ao buscar no histórico.", []
-            if not results:
-                return "Nenhuma mensagem relevante encontrada no histórico.", []
-            parts = []
-            for r in results:
-                jump = r.get('jump_url', '')
-                link = f"[ver]({jump})" if jump else ""
-                window = r.get('chunk_text', r.get('content', ''))[:1200]
-                header = f"**{r.get('author_full','?')}** em #{r.get('channel_name','?')} — {r.get('ts','')} {link} (score {r.get('_score',0):.2f})"
-                parts.append(f"{header}\n```\n{window}\n```\n`msg_id={r.get('msg_id')} channel_id={r.get('channel_id')}`")
-            return "\n\n---\n\n".join(parts), []
-
-        if name == 'get_user_stats':
-            hist = self.bot.get_cog('HistoryRAG')
-            if not hist:
-                return "Histórico não disponível.", []
-            g = guild
-            if not g:
-                return "Requer servidor.", []
-            try:
-                stats = await hist.get_user_stats(g.id, author_id=args.get('author_id'), author_name=args.get('author_name'))  # type: ignore
-            except Exception:
-                logger.exception("get_user_stats failed")
-                return "Erro ao buscar estatísticas.", []
-            if "error" in stats:
-                return stats["error"], []
-            lines = [f"Usuário: {stats['author_full']} ({', '.join(stats['author_ids'])})", f"Total: {stats['total_messages']} msgs | Média: {stats['avg_length']} chars", f"Canais: {', '.join(f'{k}={v}' for k,v in stats['top_channels'])}", f"Horários: {', '.join(f'{h}h={v}' for h,v in stats['top_hours'])}", f"Período: {stats['first_seen']} → {stats['last_seen']}", f"Exemplo: {stats['example_content']} {stats['example_jump']}"]
-            return "\n".join(lines), []
-
-        if name == 'aggregate_user_topics':
-            hist = self.bot.get_cog('HistoryRAG')
-            if not hist:
-                return "Histórico não disponível.", []
-            g = guild
-            if not g:
-                return "Requer servidor.", []
-            try:
-                topics = await hist.aggregate_user_topics(g.id, author_id=args.get('author_id'), author_name=args.get('author_name'), top_k=int(args.get('top_k',5)))  # type: ignore
-            except Exception:
-                logger.exception("aggregate_user_topics failed")
-                return "Erro ao agregar tópicos.", []
-            if not topics:
-                return "Nenhum tópico encontrado.", []
-            parts = [f"**{t['topic']}** — {t['count']}× — {t['example'][:150]} [{t['channel']}] {t['jump_url']}" for t in topics]
-            return "\n".join(parts), []
-
-        if name == 'get_user_timeline':
-            hist = self.bot.get_cog('HistoryRAG')
-            if not hist:
-                return "Histórico não disponível.", []
-            g = guild
-            if not g:
-                return "Requer servidor.", []
-            try:
-                tl = await hist.get_user_timeline(g.id, author_id=args.get('author_id'), author_name=args.get('author_name'), query=args.get('query'), limit=int(args.get('limit',10)), after=args.get('after'), before=args.get('before'), channel_id=args.get('channel_id'), sort_by=args.get('sort_by','recent'))  # type: ignore
-            except Exception:
-                logger.exception("get_user_timeline failed")
-                return "Erro ao buscar timeline.", []
-            if not tl:
-                return "Nenhuma mensagem na timeline.", []
-            parts = []
-            for r in tl:
-                jump = r.get('jump_url','')
-                link = f"[ver]({jump})" if jump else ""
-                parts.append(f"[{r.get('ts','')}] **{r.get('author_full','?')}** #{r.get('channel_name','?')} {link}\n{r.get('content','')[:400]}")
-            return "\n\n---\n\n".join(parts), []
-
-        if name == 'count_mentions':
-            hist = self.bot.get_cog('HistoryRAG')
-            if not hist:
-                return "Histórico não disponível.", []
-            g = guild
-            if not g:
-                return "Requer servidor.", []
-            try:
-                groups = await hist.count_mentions(g.id, query=args.get('query',''), group_by=args.get('group_by','author'), limit=int(args.get('limit',10)), after=args.get('after'), before=args.get('before'))  # type: ignore
-            except Exception:
-                logger.exception("count_mentions failed")
-                return "Erro ao contar menções.", []
-            if not groups:
-                return "Nenhuma menção encontrada.", []
-            lines = [f"{gr['key']}: {gr['count']}× — ex: {gr['example'].get('content','')[:120]}" for gr in groups]
-            return "\n".join(lines), []
-
-        if name == 'get_temporal_heatmap':
-            hist = self.bot.get_cog('HistoryRAG')
-            if not hist:
-                return "Histórico não disponível.", []
-            g = guild
-            if not g:
-                return "Requer servidor.", []
-            try:
-                heat = await hist.get_temporal_heatmap(g.id, query=args.get('query',''), bucket=args.get('bucket','day'), after=args.get('after'), before=args.get('before'))  # type: ignore
-            except Exception:
-                logger.exception("get_temporal_heatmap failed")
-                return "Erro ao gerar heatmap.", []
-            if not heat:
-                return "Nenhum dado temporal.", []
-            lines = [f"{h['bucket']}: {'█'*min(h['count'],20)} {h['count']}" for h in heat]
-            return "\n".join(lines), []
-
-        if name == 'get_message_context':
-            text = await _fetch_message_context(self.bot, channel_id=args.get('channel_id',''), message_id=args.get('message_id',''), window=args.get('window', 5))
-            return text, []
+        result = await _exec_history_tool(name, args, bot=bot or self.bot, guild=guild, channel=channel)
+        if result is not None:
+            return result
 
         if name == 'get_spark_detail':
             if spark_report is None:
@@ -1297,31 +1179,17 @@ class DocsRAG(commands.Cog):
         if tool_name == 'search_plugins':
             query = args.get('query', '')
             return f'🔌 Pesquisando plugins: *{query[:60]}*'
-        if tool_name == 'get_channel_history':
-            lim = args.get('limit', 20)
-            cid = args.get('channel_id')
-            return f'📜 Lendo histórico ({lim} msgs)' + (f' canal {cid}' if cid else '')
-        if tool_name == 'get_guild_info':
-            return '🏰 Coletando informações do servidor'
-        if tool_name == 'search_history':
-            q = args.get('query','')[:40]
-            return f'🔎 Buscando no histórico: *{q}*'
-        if tool_name == 'get_user_stats':
-            return f'📊 Estatísticas de {args.get("author_id") or args.get("author_name","usuário")}…'
-        if tool_name == 'aggregate_user_topics':
-            return f'🏷️ Tópicos de {args.get("author_id") or args.get("author_name","usuário")}…'
-        if tool_name == 'get_user_timeline':
-            return f'🕰️ Timeline {args.get("query","")[:30]}…'
-        if tool_name == 'count_mentions':
-            return f'🔢 Contando menções: *{args.get("query","")[:30]}*'
-        if tool_name == 'get_temporal_heatmap':
-            return f'📅 Heatmap: *{args.get("query","")[:30]}*'
-        if tool_name == 'get_message_context':
-            return f'🧩 Contexto da mensagem {args.get("message_id","")}…'
-        if tool_name == 'search_lore':
-            return f"📖 Consultando lore: *{args.get('query', '')[:40]}*"
-        if tool_name == 'save_lore':
-            return f"📖 Atualizando lore: *{args.get('term', '')[:40]}*"
+        label = _history_tool_status(tool_name, args)
+        if label is not None:
+            return label
+        if tool_name == 'memory_search':
+            return f"🧠 Recordando: *{args.get('query', '')[:40]}*"
+        if tool_name == 'memory_write':
+            act = args.get('action', 'write')
+            tgt = str(args.get('memory_id') or args.get('content') or args.get('content_match') or '')[:40]
+            return f'🧠 Memória — {act}: *{tgt}*'
+        if tool_name == 'memory_about':
+            return f"🧠 Relembrando {args.get('user', 'quem pergunta')}…"
         if tool_name == 'get_spark_detail':
             section = args.get('section', '')
             section_names = {
@@ -1360,7 +1228,11 @@ class DocsRAG(commands.Cog):
         guild: discord.Guild | None = None,
         channel: discord.abc.Messageable | None = None,
         created_at: datetime.datetime | None = None,
-    ) -> tuple[str, list[discord.Embed], list[dict]]:
+        participant_ids: set[str] | None = None,
+        origin: str | None = None,
+        context_message: discord.Message | None = None,
+        prior_context: list[str] | None = None,
+    ) -> tuple[str, list[discord.Embed], list[dict], dict]:
         """Run the LLM with tool-calling in a loop until it produces a final answer.
 
         When ``spark_report`` is provided the agent uses ``SPARK_MODEL``,
@@ -1390,10 +1262,43 @@ class DocsRAG(commands.Cog):
                 )
         history = history or []
         if history:
-            system_content += '\n\n' + _build_conversation_block(
-                history[-CONVERSATIONS_HISTORY_TURNS:],
-                current_author=_author_info(user or (interaction.user if interaction else None)),
-            )
+            # Full history (not the replay window): the block must only change
+            # when participants/channel actually change, or the system prompt
+            # would mutate every turn past the window and bust the cache.
+            system_content += '\n\n' + _build_conversation_block(history)
+
+        # Inject persistent memory (pinned + semantically selected) ----------------
+        # Memory selection and the recent channel window are per-request, so
+        # they ride on the final user message (with the clock-bearing context
+        # block) instead of the system prompt. This keeps the system prompt and
+        # replayed history byte-identical across follow-ups, making provider
+        # prefix caching effective.
+        context_blocks: list[str] = []
+        if MEMORY_ENABLED and guild is not None:
+            mem_cog = self.bot.get_cog('Memory')
+            if mem_cog is not None:
+                try:
+                    mem_block = await mem_cog.build_memory_block(
+                        guild.id, question,
+                        speaker_id=str(user.id) if user is not None else None,
+                        participant_ids=participant_ids,
+                    )
+                    if mem_block:
+                        context_blocks.append(mem_block)
+                except Exception:
+                    logger.exception('Failed to build memory block for _run_agent')
+
+        # Recent channel messages as conversation context ------------------------
+        # (skipped when the turn's own channel gap was captured as prior_context)
+        if CHANNEL_CONTEXT_MESSAGES > 0 and not prior_context and not any(t.get('prior_context') for t in (history or [])):
+            try:
+                chan_ctx = await _fetch_recent_channel_context(
+                    self.bot, channel, before=context_message,
+                )
+                if chan_ctx:
+                    context_blocks.append(chan_ctx)
+            except Exception:
+                logger.exception('Failed to build recent channel context for _run_agent')
 
         messages: list[dict] = [
             {
@@ -1413,10 +1318,14 @@ class DocsRAG(commands.Cog):
         ]
 
         # Inject user/guild/channel/temporal awareness ---------------------------
+        # This block carries the current clock, so it rides on the final user
+        # message (context_blocks) instead of a message before the history —
+        # placing it before the history would defeat prefix caching.
         if user or guild or channel or created_at:
             try:
                 ctx_block = _build_full_context_block(user, guild, channel, created_at)
-                messages.append({'role': 'user', 'content': ctx_block})
+                if ctx_block:
+                    context_blocks.insert(0, ctx_block)
             except Exception:
                 logger.exception("Failed to build context block for _run_agent")
 
@@ -1452,6 +1361,9 @@ class DocsRAG(commands.Cog):
             messages.extend(
                 _build_history_messages(history, max_turns=CONVERSATIONS_HISTORY_TURNS)
             )
+            # Breakpoint at the end of the replayed conversation: the current
+            # question and its per-request blocks ride after it.
+            messages[-1] = _apply_cache_control(messages[-1])
 
         # Current user message ---------------------------------------------------
         urls: list[str] = []
@@ -1459,24 +1371,31 @@ class DocsRAG(commands.Cog):
             urls.extend([u for u in image_urls if u])
         elif image_url:
             urls.append(image_url)
-        messages.append(_build_current_message(
+        current_message = _build_current_message(
             question,
             author=_author_info(user or (interaction.user if interaction else None)),
             ts=created_at.timestamp() if created_at else None,
             image_urls=urls,
             reply_to=reply_to,
             in_conversation=bool(history),
-        ))
+            prior_context=prior_context,
+            channel_id=getattr(channel, 'id', None),
+            context_blocks='\n\n'.join(context_blocks) or None,
+        )
+        messages.append(current_message)
 
         # Choose model and tool set based on session type ------------------------
         model = SPARK_MODEL if spark_report is not None else CHAT_MODEL
         active_tools = TOOLS + SPARK_TOOLS if spark_report is not None else TOOLS
 
         exec_tool = (
-            lambda name, args: self._exec_tool(name, args, spark_report=spark_report, bot=self.bot, channel=channel, guild=guild, user=user)
+            lambda name, args: self._exec_tool(
+                name, args, spark_report=spark_report, bot=self.bot, channel=channel,
+                guild=guild, user=user, origin=origin, participant_ids=participant_ids,
+            )
         )
 
-        answer, all_sources = await run_tool_loop(
+        answer, all_sources, trajectory = await run_tool_loop(
             client=self.client,
             model=model,
             messages=messages,
@@ -1533,7 +1452,10 @@ class DocsRAG(commands.Cog):
                 )
             )
 
-        return answer, embeds, sources
+        return answer, embeds, sources, {
+            'user_message': current_message,
+            'trajectory': trajectory,
+        }
 
     async def _store_conversation(
         self,
@@ -1543,6 +1465,7 @@ class DocsRAG(commands.Cog):
         sources: list[dict] | None = None,
         spark_report: SparkReport | None = None,
         interaction: discord.Interaction | None = None,
+        capture: dict | None = None,
     ) -> None:
         """Persist a conversation exchange for follow-up replies."""
         user = interaction.user if interaction is not None else None
@@ -1558,6 +1481,8 @@ class DocsRAG(commands.Cog):
             channel_name=getattr(channel, 'name', None),
             images=[],
             sources=sources,
+            user_message=(capture or {}).get('user_message'),
+            trajectory=(capture or {}).get('trajectory'),
         )
         origin = {
             'channel_id': str(getattr(channel, 'id', '') or ''),
@@ -1609,7 +1534,10 @@ class DocsRAG(commands.Cog):
         if not follow_up_question and not message.attachments:
             return
 
-        image_urls: list[str] = [att.url for att in message.attachments if att.content_type and att.content_type.startswith('image/')]
+        image_urls: list[str] = await _image_store.persist_images(
+            att for att in message.attachments
+            if att.content_type and att.content_type.startswith('image/')
+        )
 
         if not follow_up_question:
             follow_up_question = 'Analise esta imagem.'
@@ -1618,11 +1546,15 @@ class DocsRAG(commands.Cog):
         # (in-memory only — lost on restart, text history survives).
         spark_report: SparkReport | None = self._spark_by_conv.get(conv['conv_id'])
 
-        async with message.channel.typing():
+        async with self.store.conversation_lock(conv['conv_id']), message.channel.typing():
             try:
+                fresh = await self.store.get_by_handle(ref_id)
+                if fresh:
+                    conv = fresh
                 history = conv['data'].get('turns', []).copy()
+                prior_context = await _fetch_turn_gap(message, history)
 
-                answer, embeds, sources = await self._run_agent(
+                answer, embeds, sources, capture = await self._run_agent(
                     follow_up_question,
                     history=history,
                     image_urls=image_urls if image_urls else None,
@@ -1632,6 +1564,10 @@ class DocsRAG(commands.Cog):
                     channel=message.channel,
                     created_at=message.created_at,
                     reply_to=str(ref_id),
+                    participant_ids=_conversation_participants(message),
+                    origin=message.jump_url,
+                    context_message=message,
+                    prior_context=prior_context,
                 )
                 if len(embeds) == 1:
                     reply = await message.reply(embed=embeds[0])
@@ -1650,6 +1586,9 @@ class DocsRAG(commands.Cog):
                     images=image_urls,
                     sources=sources,
                     reply_to=ref_id,
+                    prior_context=prior_context,
+                    user_message=capture.get('user_message'),
+                    trajectory=capture.get('trajectory'),
                 )
                 data = conv['data']
                 data['turns'] = _cap_turns(history + [turn], CONVERSATIONS_MAX_TURNS)
@@ -1689,7 +1628,7 @@ class DocsRAG(commands.Cog):
             'desempenho, se houver. Siga o protocolo diagnóstico.'
         )
         try:
-            answer, embeds, sources = await self._run_agent(
+            answer, embeds, sources, capture = await self._run_agent(
                 question,
                 spark_report=report,
                 title=embed_title,
@@ -1709,6 +1648,7 @@ class DocsRAG(commands.Cog):
             await self._store_conversation(
                 msg, question, answer,
                 sources=sources, spark_report=report, interaction=interaction,
+                capture=capture,
             )
 
         except RateLimitError:

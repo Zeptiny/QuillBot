@@ -10,9 +10,11 @@ from discord import app_commands
 from discord.ext import commands
 from openai import AsyncOpenAI, RateLimitError
 
+from cogs import image_store
 from cogs.conversation_store import (
     ConversationStore,
     add_participant,
+    apply_cache_control,
     author_info,
     build_conversation_block,
     build_current_message,
@@ -20,33 +22,34 @@ from cogs.conversation_store import (
     cap_turns,
     make_turn,
 )
-from cogs.lore import SAVE_LORE_TOOL, SEARCH_LORE_TOOL
+from cogs.memory import MEMORY_ABOUT_TOOL, MEMORY_SEARCH_TOOL, MEMORY_WRITE_TOOL
 from cogs.tavily_tools import TOOLS as TAVILY_TOOLS
 from cogs.tavily_tools import exec_tool as tavily_exec_tool
 from cogs.tavily_tools import status_label as tavily_status_label
 from cogs.tavily_tools import MAX_TOOL_ROUNDS as TAVILY_MAX_ROUNDS
 from cogs.utils import (
-    AGGREGATE_USER_TOPICS_TOOL,
     CHANNEL_HISTORY_TOOL,
     COUNT_MENTIONS_TOOL,
+    FIND_USER_TOOL,
     GET_MESSAGE_CONTEXT_TOOL,
-    GET_TEMPORAL_HEATMAP_TOOL,
     GET_USER_STATS_TOOL,
-    GET_USER_TIMELINE_TOOL,
     GUILD_INFO_TOOL,
     PaginatedEmbedView,
     SEARCH_HISTORY_TOOL,
+    SQL_HISTORY_TOOL,
     build_full_context_block,
-    build_guild_context,
+    build_source_pages,
     build_temporal_context,
     build_user_context,
-    fetch_channel_history,
-    fetch_message_context,
-    build_source_pages,
+    exec_history_tool,
+    fetch_recent_channel_context,
+    fetch_turn_gap,
+    history_tool_status,
     run_tool_loop,
     split_response,
 )
 from config import (
+    CHANNEL_CONTEXT_MESSAGES,
     CHAT_MENTION_ENABLED,
     CHAT_MODEL,
     CONVERSATIONS_DB_PATH,
@@ -57,7 +60,8 @@ from config import (
     COOLDOWN_PER,
     COOLDOWN_RATE,
     DOCS_BASE_URL,
-    LORE_ENABLED,
+    HISTORY_SQL_TOOL_ENABLED,
+    MEMORY_ENABLED,
     OPENAI_API_KEY,
     OPENAI_BASE_URL,
     TAVILY_AVAILABLE,
@@ -65,12 +69,32 @@ from config import (
 
 logger = logging.getLogger(__name__)
 
-_LORE_INSTRUCTIONS = (
-    "- Perguntas sobre a história, pessoas, piadas internas, glossário ou marcos do "
-    "servidor: use `search_lore` (enciclopédia curada) antes de `search_history`. "
-    "Fatos dignos de memória comprovados no histórico podem ser salvos com `save_lore` "
-    "(sempre inclua `sources` com os links das mensagens).\n"
-) if LORE_ENABLED else ""
+
+def _conversation_participants(message: discord.Message) -> set[str]:
+    """User ids relevant to a message: author, mentions and reply target."""
+    ids = {str(message.author.id)}
+    for u in getattr(message, 'mentions', []):
+        if not u.bot:
+            ids.add(str(u.id))
+    ref = getattr(message, 'reference', None)
+    ref_msg = getattr(ref, 'resolved', None)
+    ref_author = getattr(ref_msg, 'author', None)
+    if ref_author is not None and not ref_author.bot:
+        ids.add(str(ref_author.id))
+    return ids
+
+_MEMORY_INSTRUCTIONS = (
+    "- Você tem uma memória persistente: um bloco <memory> com lembranças "
+    "relevantes é injetado automaticamente no início de cada resposta. Use-o "
+    "naturalmente — nunca mencione o bloco nem os IDs [mem #N].\n"
+    "- Para lembrar de algo não injetado, use `memory_search`; para contextualizar "
+    "quem é alguém, use `memory_about`.\n"
+    "- Ao descobrir algo digno de memória (preferência estável, fato sobre pessoa, "
+    "evento marcante, habilidade ensinada), salve com `memory_write` — uma frase "
+    "autocontida por memória, em terceira pessoa. Atualize com action=update quando "
+    "o fato mudar e use action=forget quando deixar de valer. Use pinned=true só "
+    "para fatos centrais e permanentes.\n"
+) if MEMORY_ENABLED else ""
 
 _WEB_SEARCH_INSTRUCTIONS = (
     "- Para informações em tempo real ou recentes, use as ferramentas de busca web.\n"
@@ -99,7 +123,7 @@ GENERAL_SYSTEM_PROMPT = (
     "</role>\n\n"
     "<instructions>\n"
     "- Responda perguntas gerais com base no seu conhecimento.\n"
-    + _LORE_INSTRUCTIONS
+    + _MEMORY_INSTRUCTIONS
     + (_WEB_SEARCH_INSTRUCTIONS if TAVILY_AVAILABLE else '') +
     "- Seja honesto quando não souber a resposta — não invente informações.\n"
     "</instructions>\n\n"
@@ -512,7 +536,6 @@ class Commands(commands.Cog):
                     'O arquivo enviado não é uma imagem válida.', ephemeral=True
                 )
                 return
-            image_url = image.url
 
         await interaction.response.defer(thinking=True)
         try:
@@ -520,13 +543,16 @@ class Commands(commands.Cog):
         except discord.HTTPException:
             pass
 
+        if image:
+            image_url = await image_store.persist_attachment(image)
+
         logger.info(
             "Processing /chat user=%s guild=%s question=%r",
             interaction.user.id, interaction.guild_id, question[:80],
         )
 
         try:
-            answer, embeds, sources = await self._run_chat(
+            answer, embeds, sources, capture = await self._run_chat(
                 question,
                 image_url=image_url,
                 interaction=interaction,
@@ -553,6 +579,7 @@ class Commands(commands.Cog):
                 channel=interaction.channel,
                 created_at=interaction.created_at,
                 images=[image_url] if image_url else [],
+                capture=capture,
             )
 
         except RateLimitError:
@@ -587,6 +614,7 @@ class Commands(commands.Cog):
         images: list[str] | None = None,
         message_id: str | int | None = None,
         reply_to: str | int | None = None,
+        capture: dict | None = None,
     ) -> None:
         """Persist a brand-new conversation anchored on the bot's reply message."""
         author = author_info(user)
@@ -600,6 +628,8 @@ class Commands(commands.Cog):
             images=images,
             sources=sources,
             reply_to=reply_to,
+            user_message=(capture or {}).get('user_message'),
+            trajectory=(capture or {}).get('trajectory'),
         )
         origin = {
             'channel_id': str(getattr(channel, 'id', '') or ''),
@@ -631,47 +661,92 @@ class Commands(commands.Cog):
         channel: discord.abc.GuildChannel | discord.Thread | discord.DMChannel | None = None,
         created_at: datetime.datetime | None = None,
         reply_to: str | None = None,
-    ) -> tuple[str, list[discord.Embed], list[dict]]:
-        context_block = None
+        participant_ids: set[str] | None = None,
+        origin: str | None = None,
+        context_message: discord.Message | None = None,
+        prior_context: list[str] | None = None,
+    ) -> tuple[str, list[discord.Embed], list[dict], dict]:
+        # Message layout is ordered for provider prefix caching: the system
+        # prompt and replayed history stay byte-identical across follow-ups of
+        # a conversation, while per-request blocks (clock/context, memory
+        # selection, recent channel window) ride on the final user message.
+        system_content = GENERAL_SYSTEM_PROMPT
+        history = history or []
+        if history:
+            # Built from the FULL history (not the replay window) so it only
+            # changes when participants/channel actually change — deriving it
+            # from a sliding window would mutate the system prompt every turn
+            # past the window and bust the prefix cache.
+            system_content += '\n\n' + build_conversation_block(history)
+        context_blocks: list[str] = []
         if user or guild or channel:
             try:
                 context_block = build_full_context_block(user or (interaction.user if interaction else None), guild or (interaction.guild if interaction else None), channel or (interaction.channel if interaction else None), created_at or (interaction.created_at if interaction else None))
+                if context_block:
+                    context_blocks.append(context_block)
             except Exception:
                 logger.exception("Failed to build context block")
-        system_content = GENERAL_SYSTEM_PROMPT
-        if context_block:
-            system_content = f"{GENERAL_SYSTEM_PROMPT}\n\n{context_block}"
-        history = history or []
-        if history:
-            replay = history[-CONVERSATIONS_HISTORY_TURNS:]
-            system_content += '\n\n' + build_conversation_block(
-                replay, current_author=author_info(user or (interaction.user if interaction else None))
-            )
-        messages: list[dict] = [{'role': 'system', 'content': system_content}]
+        if MEMORY_ENABLED:
+            mem_cog = self.bot.get_cog('Memory')
+            if mem_cog is not None and (guild or (interaction.guild if interaction else None)):
+                try:
+                    mem_block = await mem_cog.build_memory_block(
+                        (guild or interaction.guild).id, question,
+                        speaker_id=str(user.id) if user is not None else None,
+                        participant_ids=participant_ids,
+                    )
+                    if mem_block:
+                        context_blocks.append(mem_block)
+                except Exception:
+                    logger.exception('Failed to build memory block')
+        if CHANNEL_CONTEXT_MESSAGES > 0 and not prior_context and not any(t.get('prior_context') for t in (history or [])):
+            try:
+                chan_ctx = await fetch_recent_channel_context(
+                    self.bot,
+                    channel or (interaction.channel if interaction else None),
+                    before=context_message,
+                )
+                if chan_ctx:
+                    context_blocks.append(chan_ctx)
+            except Exception:
+                logger.exception('Failed to build recent channel context')
+        # Content-array format with an explicit cache_control breakpoint
+        # (Anthropic/Gemini via OpenRouter); OpenAI-compatible endpoints ignore
+        # the extra field. Same layout DocsRAG already uses.
+        messages: list[dict] = [apply_cache_control({'role': 'system', 'content': system_content})]
 
         if history:
             messages.extend(
                 build_history_messages(history, max_turns=CONVERSATIONS_HISTORY_TURNS)
             )
+            # Second breakpoint at the end of the replayed conversation: the
+            # current question and its per-request blocks ride after it.
+            messages[-1] = apply_cache_control(messages[-1])
 
         urls: list[str] = []
         if image_urls:
             urls.extend([u for u in image_urls if u])
         elif image_url:
             urls.append(image_url)
-        messages.append(build_current_message(
+        current_message = build_current_message(
             question,
             author=author_info(user or (interaction.user if interaction else None)),
             ts=created_at.timestamp() if created_at else None,
             image_urls=urls,
             reply_to=reply_to,
             in_conversation=bool(history),
-        ))
+            prior_context=prior_context,
+            channel_id=getattr(channel, 'id', None),
+            context_blocks='\n\n'.join(context_blocks) or None,
+        )
+        messages.append(current_message)
 
         base_tools = list(TAVILY_TOOLS) if TAVILY_AVAILABLE else []
-        base_tools.extend([CHANNEL_HISTORY_TOOL, GUILD_INFO_TOOL, SEARCH_HISTORY_TOOL, GET_MESSAGE_CONTEXT_TOOL, GET_USER_STATS_TOOL, AGGREGATE_USER_TOPICS_TOOL, GET_USER_TIMELINE_TOOL, COUNT_MENTIONS_TOOL, GET_TEMPORAL_HEATMAP_TOOL])
-        if LORE_ENABLED:
-            base_tools.extend([SEARCH_LORE_TOOL, SAVE_LORE_TOOL])
+        base_tools.extend([CHANNEL_HISTORY_TOOL, GUILD_INFO_TOOL, SEARCH_HISTORY_TOOL, GET_MESSAGE_CONTEXT_TOOL, GET_USER_STATS_TOOL, COUNT_MENTIONS_TOOL, FIND_USER_TOOL])
+        if HISTORY_SQL_TOOL_ENABLED:
+            base_tools.append(SQL_HISTORY_TOOL)
+        if MEMORY_ENABLED:
+            base_tools.extend([MEMORY_SEARCH_TOOL, MEMORY_WRITE_TOOL, MEMORY_ABOUT_TOOL])
         active_tools = base_tools if base_tools else None
         fallback_channel = channel or (interaction.channel if interaction else None)
         fallback_guild = guild or (interaction.guild if interaction else None)
@@ -679,178 +754,41 @@ class Commands(commands.Cog):
         async def _exec(name: str, args: dict) -> tuple[str, list[dict]]:
             if name in ('web_search', 'web_extract'):
                 return await tavily_exec_tool(name, args)
-            if name in ('search_lore', 'save_lore'):
-                lore_cog = self.bot.get_cog('Lore')
-                if not lore_cog:
-                    return 'Enciclopédia de lore não disponível.', []
+            if name in ('memory_search', 'memory_write', 'memory_about'):
+                mem_cog = self.bot.get_cog('Memory')
+                if not mem_cog:
+                    return 'Memória não disponível.', []
                 g = fallback_guild
                 if not g:
-                    return 'Lore requer estar em um servidor.', []
+                    return 'Memória requer estar em um servidor.', []
                 actor_name = f'bot (via {user.display_name})' if user is not None else 'bot'
-                return await lore_cog.exec_tool(
+                return await mem_cog.exec_tool(
                     name, args, guild=g, actor_name=actor_name,
-                    requester=user, channel=channel,
+                    requester=user, channel=channel, origin=origin,
+                    participant_ids=participant_ids,
                 )
-            if name == 'get_channel_history':
-                text = await fetch_channel_history(self.bot, fallback_channel, limit=args.get('limit', 20), channel_id=args.get('channel_id'))
-                return text, []
-            if name == 'get_guild_info':
-                g = guild or (interaction.guild if interaction else None)
-                if not g:
-                    return "Fora de um servidor (DM).", []
-                text = build_guild_context(g)
-                # add channel list
-                try:
-                    chs = [f"#{c.name} ({c.id})" for c in g.channels if isinstance(c, discord.TextChannel)][:30]
-                    if chs:
-                        text += "\nCanais de texto: " + ", ".join(chs)
-                except Exception:
-                    pass
-                return text, []
-            if name == 'search_history':
-                hist = self.bot.get_cog('HistoryRAG')
-                if not hist:
-                    return "Histórico não disponível.", []
-                g = fallback_guild
-                if not g:
-                    return "Busca no histórico requer estar em um servidor.", []
-                query = args.get('query', '')
-                limit = max(1, min(12, int(args.get('limit', 5))))
-                try:
-                    results = await hist.search(query, g.id, limit=limit, channel_id=args.get('channel_id'), author_id=args.get('author_id'), author_name=args.get('author_name'), after=args.get('after'), before=args.get('before'), search_mode=args.get('search_mode','hybrid'), sort_by=args.get('sort_by','relevance'))  # type: ignore
-                except Exception:
-                    logger.exception("search_history failed")
-                    return "Erro ao buscar no histórico.", []
-                if not results:
-                    return "Nenhuma mensagem relevante encontrada no histórico.", []
-                parts = []
-                for r in results:
-                    jump = r.get('jump_url', '')
-                    link = f"[ver]({jump})" if jump else ""
-                    window = r.get('chunk_text', r.get('content', ''))[:1200]
-                    header = f"**{r.get('author_full','?')}** em #{r.get('channel_name','?')} — {r.get('ts','')} {link} (score {r.get('_score',0):.2f})"
-                    parts.append(f"{header}\n```\n{window}\n```\n`msg_id={r.get('msg_id')} channel_id={r.get('channel_id')}`")
-                return "\n\n---\n\n".join(parts), []
-            if name == 'get_user_stats':
-                hist = self.bot.get_cog('HistoryRAG')
-                if not hist:
-                    return "Histórico não disponível.", []
-                g = fallback_guild
-                if not g:
-                    return "Requer servidor.", []
-                try:
-                    stats = await hist.get_user_stats(g.id, author_id=args.get('author_id'), author_name=args.get('author_name'))  # type: ignore
-                except Exception:
-                    logger.exception("get_user_stats failed")
-                    return "Erro ao buscar estatísticas.", []
-                if "error" in stats:
-                    return stats["error"], []
-                lines = [f"Usuário: {stats['author_full']} ({', '.join(stats['author_ids'])})", f"Total: {stats['total_messages']} msgs | Média: {stats['avg_length']} chars", f"Canais: {', '.join(f'{k}={v}' for k,v in stats['top_channels'])}", f"Horários: {', '.join(f'{h}h={v}' for h,v in stats['top_hours'])}", f"Período: {stats['first_seen']} → {stats['last_seen']}", f"Exemplo: {stats['example_content']} {stats['example_jump']}"]
-                return "\n".join(lines), []
-            if name == 'aggregate_user_topics':
-                hist = self.bot.get_cog('HistoryRAG')
-                if not hist:
-                    return "Histórico não disponível.", []
-                g = fallback_guild
-                if not g:
-                    return "Requer servidor.", []
-                try:
-                    topics = await hist.aggregate_user_topics(g.id, author_id=args.get('author_id'), author_name=args.get('author_name'), top_k=int(args.get('top_k',5)))  # type: ignore
-                except Exception:
-                    logger.exception("aggregate_user_topics failed")
-                    return "Erro ao agregar tópicos.", []
-                if not topics:
-                    return "Nenhum tópico encontrado.", []
-                parts = [f"**{t['topic']}** — {t['count']}× — {t['example'][:150]} [{t['channel']}] {t['jump_url']}" for t in topics]
-                return "\n".join(parts), []
-            if name == 'get_user_timeline':
-                hist = self.bot.get_cog('HistoryRAG')
-                if not hist:
-                    return "Histórico não disponível.", []
-                g = fallback_guild
-                if not g:
-                    return "Requer servidor.", []
-                try:
-                    tl = await hist.get_user_timeline(g.id, author_id=args.get('author_id'), author_name=args.get('author_name'), query=args.get('query'), limit=int(args.get('limit',10)), after=args.get('after'), before=args.get('before'), channel_id=args.get('channel_id'), sort_by=args.get('sort_by','recent'))  # type: ignore
-                except Exception:
-                    logger.exception("get_user_timeline failed")
-                    return "Erro ao buscar timeline.", []
-                if not tl:
-                    return "Nenhuma mensagem na timeline.", []
-                parts = []
-                for r in tl:
-                    jump = r.get('jump_url','')
-                    link = f"[ver]({jump})" if jump else ""
-                    parts.append(f"[{r.get('ts','')}] **{r.get('author_full','?')}** #{r.get('channel_name','?')} {link}\n{r.get('content','')[:400]}")
-                return "\n\n---\n\n".join(parts), []
-            if name == 'count_mentions':
-                hist = self.bot.get_cog('HistoryRAG')
-                if not hist:
-                    return "Histórico não disponível.", []
-                g = fallback_guild
-                if not g:
-                    return "Requer servidor.", []
-                try:
-                    groups = await hist.count_mentions(g.id, query=args.get('query',''), group_by=args.get('group_by','author'), limit=int(args.get('limit',10)), after=args.get('after'), before=args.get('before'))  # type: ignore
-                except Exception:
-                    logger.exception("count_mentions failed")
-                    return "Erro ao contar menções.", []
-                if not groups:
-                    return "Nenhuma menção encontrada.", []
-                lines = [f"{gr['key']}: {gr['count']}× — ex: {gr['example'].get('content','')[:120]}" for gr in groups]
-                return "\n".join(lines), []
-            if name == 'get_temporal_heatmap':
-                hist = self.bot.get_cog('HistoryRAG')
-                if not hist:
-                    return "Histórico não disponível.", []
-                g = fallback_guild
-                if not g:
-                    return "Requer servidor.", []
-                try:
-                    heat = await hist.get_temporal_heatmap(g.id, query=args.get('query',''), bucket=args.get('bucket','day'), after=args.get('after'), before=args.get('before'))  # type: ignore
-                except Exception:
-                    logger.exception("get_temporal_heatmap failed")
-                    return "Erro ao gerar heatmap.", []
-                if not heat:
-                    return "Nenhum dado temporal.", []
-                lines = [f"{h['bucket']}: {'█'*min(h['count'],20)} {h['count']}" for h in heat]
-                return "\n".join(lines), []
-            if name == 'get_message_context':
-                text = await fetch_message_context(self.bot, channel_id=args.get('channel_id',''), message_id=args.get('message_id',''), window=args.get('window', 5))
-                return text, []
+            result = await exec_history_tool(name, args, bot=self.bot, guild=fallback_guild, channel=fallback_channel)
+            if result is not None:
+                return result
             return f'Ferramenta desconhecida: {name}', []
 
         def _status(name: str, args: dict) -> str:
             if name in ('web_search', 'web_extract'):
                 return tavily_status_label(name, args)
-            if name == 'search_lore':
-                return f"📖 Consultando lore: *{args.get('query', '')[:40]}*"
-            if name == 'save_lore':
-                return f"📖 Atualizando lore: *{args.get('term', '')[:40]}*"
-            if name == 'get_channel_history':
-                lim = args.get('limit', 20)
-                cid = args.get('channel_id')
-                return f'📜 Lendo histórico ({lim} msgs)' + (f' canal {cid}' if cid else '')
-            if name == 'get_guild_info':
-                return '🏰 Coletando informações do servidor'
-            if name == 'search_history':
-                q = args.get('query','')[:40]
-                return f'🔎 Buscando no histórico: *{q}*'
-            if name == 'get_user_stats':
-                return f'📊 Estatísticas de {args.get("author_id") or args.get("author_name","usuário")}…'
-            if name == 'aggregate_user_topics':
-                return f'🏷️ Tópicos de {args.get("author_id") or args.get("author_name","usuário")}…'
-            if name == 'get_user_timeline':
-                return f'🕰️ Timeline {args.get("query","")[:30]}…'
-            if name == 'count_mentions':
-                return f'🔢 Contando menções: *{args.get("query","")[:30]}*'
-            if name == 'get_temporal_heatmap':
-                return f'📅 Heatmap: *{args.get("query","")[:30]}*'
-            if name == 'get_message_context':
-                return f'🧩 Contexto da mensagem {args.get("message_id","")}…'
+            if name == 'memory_search':
+                return f"🧠 Recordando: *{args.get('query', '')[:40]}*"
+            if name == 'memory_write':
+                act = args.get('action', 'write')
+                tgt = str(args.get('memory_id') or args.get('content') or args.get('content_match') or '')[:40]
+                return f'🧠 Memória — {act}: *{tgt}*'
+            if name == 'memory_about':
+                return f"🧠 Relembrando {args.get('user', 'quem pergunta')}…"
+            label = history_tool_status(name, args)
+            if label is not None:
+                return label
             return f'🔧 Executando: {name}'
 
-        answer, all_sources = await run_tool_loop(
+        answer, all_sources, trajectory = await run_tool_loop(
             client=self.client,
             model=CHAT_MODEL,
             messages=messages,
@@ -897,7 +835,10 @@ class Commands(commands.Cog):
                 )
             )
 
-        return answer, embeds, sources
+        return answer, embeds, sources, {
+            'user_message': current_message,
+            'trajectory': trajectory,
+        }
 
     async def cog_app_command_error(
         self, interaction: discord.Interaction, error: app_commands.AppCommandError
@@ -934,13 +875,20 @@ class Commands(commands.Cog):
                     follow_up_question = re.sub(r'\s+', ' ', follow_up_question).strip()
                 if not follow_up_question and not message.attachments:
                     return
-                image_urls = [att.url for att in message.attachments if att.content_type and att.content_type.startswith('image/')]
+                image_urls = await image_store.persist_images(
+                    att for att in message.attachments
+                    if att.content_type and att.content_type.startswith('image/')
+                )
                 if not follow_up_question:
                     follow_up_question = 'Analise esta imagem.'
-                async with message.channel.typing():
+                async with self.store.conversation_lock(conv['conv_id']), message.channel.typing():
                     try:
+                        fresh = await self.store.get_by_handle(ref_id)
+                        if fresh:
+                            conv = fresh
                         history = conv['data'].get('turns', []).copy()
-                        answer, embeds, sources = await self._run_chat(
+                        prior_context = await fetch_turn_gap(message, history)
+                        answer, embeds, sources, capture = await self._run_chat(
                             follow_up_question,
                             history=history,
                             image_urls=image_urls if image_urls else None,
@@ -949,6 +897,10 @@ class Commands(commands.Cog):
                             channel=message.channel,
                             created_at=message.created_at,
                             reply_to=str(ref_id),
+                            participant_ids=_conversation_participants(message),
+                            origin=message.jump_url,
+                            context_message=message,
+                            prior_context=prior_context,
                         )
                         if len(embeds) == 1:
                             reply = await message.reply(embed=embeds[0])
@@ -966,6 +918,9 @@ class Commands(commands.Cog):
                             images=image_urls,
                             sources=sources,
                             reply_to=ref_id,
+                            prior_context=prior_context,
+                            user_message=capture.get('user_message'),
+                            trajectory=capture.get('trajectory'),
                         )
                         data = conv['data']
                         data['turns'] = cap_turns(history + [turn], CONVERSATIONS_MAX_TURNS)
@@ -988,6 +943,15 @@ class Commands(commands.Cog):
             return
         if not self.bot.user or not self.bot.user.mentioned_in(message):
             return
+        if message.reference and message.reference.message_id:
+            docs_cog = self.bot.get_cog('DocsRAG')
+            if docs_cog is not None:
+                try:
+                    existing = await docs_cog.store.get_by_handle(message.reference.message_id)
+                except Exception:
+                    existing = None
+                if existing:
+                    return
         if not self.client:
             try:
                 await message.reply('⚠️ Chat indisponível: chave de API não configurada.', mention_author=False)
@@ -1007,9 +971,12 @@ class Commands(commands.Cog):
         clean_question = mention_pattern.sub('', message.content).strip()
         # Also strip any extra mention artifacts and whitespace
         clean_question = re.sub(r'\s+', ' ', clean_question).strip()
-        current_image_urls = [att.url for att in message.attachments if att.content_type and att.content_type.startswith('image/')]
+        current_image_urls = await image_store.persist_images(
+            att for att in message.attachments
+            if att.content_type and att.content_type.startswith('image/')
+        )
         ref_context = ""
-        ref_image_urls: list[str] = []
+        ref_image_urls: list[discord.Attachment] = []
         if message.reference and message.reference.message_id:
             ref_msg = message.reference.resolved
             if ref_msg is None:
@@ -1028,7 +995,7 @@ class Commands(commands.Cog):
                         ref_content = ref_content[:1500] + "…"
                     for att in getattr(ref_msg, 'attachments', []):
                         if att.content_type and att.content_type.startswith('image/'):
-                            ref_image_urls.append(att.url)
+                            ref_image_urls.append(att)
                     attach_names = [att.filename for att in getattr(ref_msg, 'attachments', []) if not (att.content_type and att.content_type.startswith('image/'))]
                     parts = [f"[Mensagem respondida — {ref_author} (@{ref_msg.author.name})]"]
                     if ref_content:
@@ -1049,7 +1016,7 @@ class Commands(commands.Cog):
                         ref_context = "\n".join(parts)
                 except Exception:
                     logger.exception("Failed to build ref context")
-        all_image_urls = current_image_urls + ref_image_urls
+        all_image_urls = current_image_urls + await image_store.persist_images(ref_image_urls)
         if ref_context:
             if clean_question:
                 clean_question = f"{ref_context}\n---\n{clean_question}"
@@ -1070,13 +1037,16 @@ class Commands(commands.Cog):
         logger.info("Processing @mention chat user=%s guild=%s question=%r ref=%s images=%d", message.author.id, message.guild.id if message.guild else None, clean_question[:80], bool(ref_context), len(all_image_urls))
         async with message.channel.typing():
             try:
-                answer, embeds, sources = await self._run_chat(
+                answer, embeds, sources, capture = await self._run_chat(
                     clean_question,
                     image_urls=all_image_urls if all_image_urls else None,
                     user=message.author,
                     guild=message.guild,
                     channel=message.channel,
                     created_at=message.created_at,
+                    participant_ids=_conversation_participants(message),
+                    origin=message.jump_url,
+                    context_message=message,
                 )
                 if len(embeds) == 1:
                     reply = await message.reply(embed=embeds[0], mention_author=False)
@@ -1090,6 +1060,7 @@ class Commands(commands.Cog):
                     created_at=message.created_at,
                     images=all_image_urls,
                     message_id=message.id,
+                    capture=capture,
                 )
             except RateLimitError:
                 await message.reply('⏳ Limite de requisições atingido. Tente novamente em alguns minutos.', mention_author=False)

@@ -4,13 +4,18 @@ import datetime
 import json
 import logging
 from collections.abc import Awaitable, Callable
-from typing import Any
+from typing import Any, Final
 from zoneinfo import ZoneInfo
 
 import discord
 from openai import AsyncOpenAI
 
-from config import LLM_MAX_TOKENS
+from config import (
+    CHANNEL_CONTEXT_MESSAGES,
+    CONVERSATIONS_GAP_MESSAGES,
+    HISTORY_SQL_TOOL_ENABLED,
+    LLM_MAX_TOKENS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +28,9 @@ CHANNEL_HISTORY_TOOL = {
         'description': (
             'Busca mensagens recentes do canal atual ou de outro canal do servidor. '
             'Use quando o usuário perguntar sobre conversas anteriores, contexto recente, '
-            'ou quando precisar entender o que foi discutido antes. Retorna autor, horário e conteúdo.'
+            'ou quando precisar entender o que foi discutido antes. Cada linha segue o formato '
+            '[data] Nome (@usuário) <author_id=…>: conteúdo ↩ reply_to=… [msg_id=…]. '
+            'Use author_id/msg_id/reply_to com search_history, get_user_stats ou get_message_context.'
         ),
         'parameters': {
             'type': 'object',
@@ -66,7 +73,10 @@ SEARCH_HISTORY_TOOL = {
             'Busca semanticamente no histórico completo do servidor (RAG). '
             'Use quando o usuário perguntar sobre conversas anteriores, decisões, '
             'problemas já discutidos, ou contexto que pode estar no chat. Retorna '
-            'mensagens relevantes com autor, canal, horário e link, incluindo 5 mensagens de contexto local.'
+            'mensagens relevantes com autor, canal, horário e link, incluindo 5 mensagens de contexto local. '
+            'Cada resultado traz channel_id e msg_id — use com get_message_context para expandir o contexto. '
+            'Mensagens do mesmo trecho de conversa são agrupadas em um único resultado. '
+            'Para filtrar por autor conhecendo apenas o nome, resolva o author_id com find_user primeiro.'
         ),
         'parameters': {
             'type': 'object',
@@ -134,51 +144,6 @@ GET_USER_STATS_TOOL = {
     },
 }
 
-AGGREGATE_USER_TOPICS_TOOL = {
-    'type': 'function',
-    'function': {
-        'name': 'aggregate_user_topics',
-        'description': (
-            'Agrupa e conta os principais tópicos/assuntos de um usuário. Retorna lista de tópicos com contagem e exemplo. '
-            'Use para "sobre o que X fala mais?" ou "quais os assuntos favoritos de X?".'
-        ),
-        'parameters': {
-            'type': 'object',
-            'properties': {
-                'author_id': {'type': 'string', 'description': 'ID do usuário.'},
-                'author_name': {'type': 'string', 'description': 'Nome parcial se ID desconhecido.'},
-                'top_k': {'type': 'integer', 'description': 'Número de tópicos (padrão 5, máx 10).'},
-            },
-            'required': [],
-        },
-    },
-}
-
-GET_USER_TIMELINE_TOOL = {
-    'type': 'function',
-    'function': {
-        'name': 'get_user_timeline',
-        'description': (
-            'Retorna timeline cronológica de mensagens de um usuário, opcionalmente filtrada por tópico/query. '
-            'Use para "quando X mencionou Y?" ou "mostre histórico de X sobre Y".'
-        ),
-        'parameters': {
-            'type': 'object',
-            'properties': {
-                'author_id': {'type': 'string', 'description': 'ID do usuário.'},
-                'author_name': {'type': 'string', 'description': 'Nome parcial.'},
-                'query': {'type': 'string', 'description': 'Opcional: filtrar timeline por tópico/query semântica.'},
-                'limit': {'type': 'integer', 'description': 'Número de resultados (padrão 10, máx 20).'},
-                'after': {'type': 'string', 'description': 'Data inicial ISO.'},
-                'before': {'type': 'string', 'description': 'Data final ISO.'},
-                'channel_id': {'type': 'string', 'description': 'Opcional: restringir a canal.'},
-                'sort_by': {'type': 'string', 'enum': ['recent', 'oldest'], 'description': 'Ordenação (padrão recent).'},
-            },
-            'required': [],
-        },
-    },
-}
-
 COUNT_MENTIONS_TOOL = {
     'type': 'function',
     'function': {
@@ -201,34 +166,17 @@ COUNT_MENTIONS_TOOL = {
     },
 }
 
-GET_TEMPORAL_HEATMAP_TOOL = {
-    'type': 'function',
-    'function': {
-        'name': 'get_temporal_heatmap',
-        'description': (
-            'Gera heatmap temporal de um tópico: contagem de mensagens por dia/semana. '
-            'Use para "quando falamos sobre X?" ou evolução temporal de um assunto.'
-        ),
-        'parameters': {
-            'type': 'object',
-            'properties': {
-                'query': {'type': 'string', 'description': 'Tópico/query.'},
-                'bucket': {'type': 'string', 'enum': ['day', 'week'], 'description': 'Granularidade (padrão day).'},
-                'after': {'type': 'string', 'description': 'Data inicial ISO.'},
-                'before': {'type': 'string', 'description': 'Data final ISO.'},
-            },
-            'required': ['query'],
-        },
-    },
-}
-
 GET_MESSAGE_CONTEXT_TOOL = {
     'type': 'function',
     'function': {
         'name': 'get_message_context',
         'description': (
             'Retorna o contexto local ao redor de uma mensagem específica (5 antes e 5 depois). '
-            'Use após search_history para expandir o contexto de um resultado relevante.'
+            'Use após search_history para expandir o contexto de um resultado relevante. '
+            'Aceita o msg_id ou reply_to visto em qualquer linha de mensagem, desde que combinados '
+            'com o channel_id exibido nos cabeçalhos de resultado/blocos ou com o canal atual. '
+            'Resultados próximos no tempo são agrupados pelo search_history — use esta ferramenta '
+            'para ver as mensagens vizinhas de um cluster.'
         ),
         'parameters': {
             'type': 'object',
@@ -251,6 +199,74 @@ GET_MESSAGE_CONTEXT_TOOL = {
     },
 }
 
+FIND_USER_TOOL = {
+    'type': 'function',
+    'function': {
+        'name': 'find_user',
+        'description': (
+            'Resolve um usuário do servidor pelo nome (atual, antigo ou apelido), @handle ou ID. '
+            'Retorna a identidade canônica (author_id), apelidos conhecidos, total de mensagens, '
+            'período de atividade e canais mais ativos. '
+            'Use ANTES de search_history ou get_user_stats quando souber apenas o '
+            'nome da pessoa — passe o author_id retornado como filtro dessas ferramentas. '
+            'Sem query, lista os usuários mais ativos do servidor.'
+        ),
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'query': {
+                    'type': 'string',
+                    'description': 'Nome (parcial ok, sem diferenciação de maiúsculas), @handle ou ID do Discord. Omita para listar os mais ativos.',
+                },
+                'limit': {
+                    'type': 'integer',
+                    'description': 'Máximo de usuários (padrão 5, máximo 12).',
+                },
+            },
+            'required': [],
+        },
+    },
+}
+
+SQL_HISTORY_TOOL = {
+    'type': 'function',
+    'function': {
+        'name': 'sql_history',
+        'description': (
+            'Executa UM SELECT SQL somente-leitura no banco do histórico do servidor '
+            'para perguntas analíticas que o search_history não cobre: contagens exatas, '
+            'agrupamentos, cruzamentos, regex, menções e respostas. '
+            'OBRIGATÓRIO: a consulta deve citar o guild_id do servidor atual e ler apenas '
+            'as tabelas abaixo (leituras da coluna chunks.embedding e qualquer escrita são bloqueadas). '
+            'Sem busca semântica aqui — para "sobre o que falamos" use search_history. '
+            'Esquema: chunks(msg_id, guild_id, channel_id, channel_name, author_id, author_name, '
+            'author_full, content, chunk_text, window_line, window_lines, reply_to, ts ISO-8601 UTC, '
+            'jump_url, embedding BLOB proibido) — 1 linha por mensagem indexada (bots excluídos); '
+            'authors(guild_id, author_id, display_name, handle, full_label, aliases JSON, first_seen, '
+            'last_seen, msg_count); chunks_fts(msg_id, guild_id, chunk_text, content) — índice FTS5. '
+            'Exemplos: top falantes de um tópico: '
+            "\"SELECT c.author_full, COUNT(*) n FROM chunks c JOIN chunks_fts f ON f.msg_id=c.msg_id "
+            "WHERE f.guild_id=123 AND chunks_fts MATCH '\"lag\" AND server' GROUP BY c.author_full ORDER BY n DESC\"; "
+            'menções de usuário: c.content LIKE \'%<@ID>%\' OR c.content LIKE \'%<@!ID>%\'; '
+            'respostas a uma mensagem: c.reply_to=\'MSG_ID\'; respostas em geral: c.reply_to IS NOT NULL; '
+            'por mês: GROUP BY substr(c.ts,1,7); por hora: GROUP BY substr(c.ts,12,2); '
+            "FTS5: MATCH '\"frase exata\" AND (a OR b) NOT c', prefixo 'palavra*'; "
+            'REGEXP(padrão, texto) e REGEXP sempre com re.IGNORECASE; '
+            'data: compare c.ts como texto ISO ou use datetime(c.ts). Sempre termine com LIMIT.'
+        ),
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'sql': {
+                    'type': 'string',
+                    'description': 'Um único SELECT (ou WITH ... SELECT) SQLite, já com o filtro guild_id do servidor atual.',
+                },
+            },
+            'required': ['sql'],
+        },
+    },
+}
+
 
 def _fmt_dt(dt: datetime.datetime | None) -> str:
     if not dt:
@@ -259,6 +275,128 @@ def _fmt_dt(dt: datetime.datetime | None) -> str:
         return dt.astimezone(BR_TZ).strftime("%d/%m/%Y %H:%M BRT")
     except Exception:
         return dt.isoformat()
+
+
+def _fmt_dt_line(dt: datetime.datetime | None) -> str:
+    if not dt:
+        return "—"
+    try:
+        return dt.astimezone(BR_TZ).strftime("%d/%m/%Y %H:%M")
+    except Exception:
+        return dt.isoformat()
+
+
+# ---------------------------------------------------------------------------
+# Canonical message-line format
+#
+# Every renderer of Discord messages (channel history, message context,
+# search results, history chunks, conversation turns) emits lines in this
+# exact shape so the LLM can cross-reference messages between tools:
+#
+#   [dd/mm/aaaa HH:MM] Display (@handle) <author_id=123>: content ↩ reply_to=456 (Alvo) [msg_id=789]
+#
+# - ``author_id`` feeds search_history/get_user_stats filters;
+# - ``reply_to`` (only for replies) feeds get_message_context;
+# - ``msg_id`` always comes LAST so content truncation never eats it.
+# ---------------------------------------------------------------------------
+
+MESSAGE_LINE_MAX_CONTENT: Final[int] = 800
+
+
+def _flatten(s: str) -> str:
+    return ' '.join(s.split())
+
+
+def _clip(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[:limit] + '…'
+
+
+def message_content_text(msg: discord.Message, *, max_length: int = MESSAGE_LINE_MAX_CONTENT) -> str:
+    """Flattened message content with attachment/embed markers, never empty."""
+    c = msg.content or ""
+    if msg.attachments:
+        c += " " + " ".join(f"[anexo:{a.filename}]" for a in msg.attachments)
+    if not c.strip() and msg.embeds:
+        try:
+            c = f"[embed: {msg.embeds[0].title or msg.embeds[0].description[:100]}]"
+        except Exception:
+            c = "[embed]"
+    c = _flatten(c)
+    if not c:
+        c = "[sem texto]"
+    return _clip(c, max_length)
+
+
+def format_message_line(msg: discord.Message) -> str:
+    """Render a Discord message in the canonical line format."""
+    display = _flatten(getattr(msg.author, 'display_name', None) or str(msg.author))
+    handle = _flatten(getattr(msg.author, 'name', None) or '')
+    author = f"{display} (@{handle})" if handle else display
+    author_id = getattr(msg.author, 'id', '')
+    line = f"[{_fmt_dt_line(msg.created_at)}] {author} <author_id={author_id}>: {message_content_text(msg)}"
+    ref = getattr(msg, 'reference', None)
+    ref_id = getattr(ref, 'message_id', None)
+    if ref_id:
+        target = ""
+        resolved = getattr(ref, 'resolved', None)
+        if resolved is not None and not isinstance(resolved, discord.DeletedReferencedMessage):
+            rdisplay = _flatten(getattr(resolved.author, 'display_name', '') or '')
+            if rdisplay:
+                target = f" ({rdisplay})"
+        line += f" ↩ reply_to={ref_id}{target}"
+    line += f" [msg_id={msg.id}]"
+    return line
+
+
+def format_chunk_line(ch: dict) -> str:
+    """Render a stored history chunk (cogs/history_rag.py) in the canonical format."""
+    ts_raw = str(ch.get('ts', ''))
+    try:
+        dt = datetime.datetime.fromisoformat(ts_raw.replace('Z', '+00:00'))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        ts = dt.astimezone(BR_TZ).strftime("%d/%m/%Y %H:%M")
+    except Exception:
+        ts = ts_raw[:19]
+    author = _flatten(str(ch.get('author_full') or ch.get('author_name') or '?'))
+    content = _clip(_flatten(str(ch.get('content', ''))), MESSAGE_LINE_MAX_CONTENT)
+    if not content:
+        content = '[sem texto]'
+    line = f"[{ts}] {author} <author_id={ch.get('author_id', '?')}>: {content}"
+    if ch.get('reply_to'):
+        line += f" ↩ reply_to={ch['reply_to']}"
+    return f"{line} [msg_id={ch.get('msg_id', '')}]"
+
+
+def render_search_results(results: list[dict], *, window_chars: int = 1200, include_msg_id: bool = True) -> str:
+    """Render search_history results (shared by commands.py and docs_rag.py)."""
+    parts: list[str] = []
+    for r in results:
+        jump = r.get('jump_url', '')
+        link = f"[ver]({jump})" if jump else ''
+        header = (
+            f"**{r.get('author_full', '?')}** em #{r.get('channel_name', '?')} "
+            f"(channel_id={r.get('channel_id', '?')}) — {str(r.get('ts', ''))[:19]} "
+            f"{link} (score {r.get('_score', 0):.2f})"
+        )
+        raw_lines = str(r.get('chunk_text', r.get('content', ''))).replace('```', 'ˋˋˋ').split('\n')
+        kept: list[str] = []
+        used = 0
+        dropped = 0
+        for line in raw_lines:
+            cost = len(line) + (1 if kept else 0)
+            if used + cost > window_chars:
+                dropped = len(raw_lines) - len(kept)
+                break
+            kept.append(line)
+            used += cost
+        if dropped:
+            kept.append(f"… (+{dropped} linhas)")
+        body = f"{header}\n```\n" + '\n'.join(kept) + "\n```"
+        if include_msg_id:
+            body += f"\n`msg_id={r.get('msg_id')}`"
+        parts.append(body)
+    return "\n\n---\n\n".join(parts)
 
 
 def build_user_context(member: discord.abc.User | discord.Member | None) -> str:
@@ -358,6 +496,7 @@ async def fetch_channel_history(
     channel: discord.abc.Messageable | None,
     limit: int = 20,
     channel_id: str | None = None,
+    before: discord.abc.Snowflake | None = None,
 ) -> str:
     target = channel
     if channel_id:
@@ -376,20 +515,8 @@ async def fetch_channel_history(
     limit = max(1, min(50, int(limit)))
     lines: list[str] = []
     try:
-        async for msg in target.history(limit=limit):
-            ts = _fmt_dt(msg.created_at)
-            author = getattr(msg.author, 'display_name', str(msg.author))
-            content = msg.content or ""
-            if msg.attachments:
-                content += " " + " ".join(f"[anexo:{a.filename}]" for a in msg.attachments)
-            if msg.embeds and not content:
-                content = f"[embed: {msg.embeds[0].title or 'sem título'}]"
-            content = content.replace("\n", " ").strip()
-            if len(content) > 350:
-                content = content[:350] + "…"
-            if not content:
-                content = "[sem texto]"
-            lines.append(f"[{ts}] {author}: {content}")
+        async for msg in target.history(limit=limit, before=before):
+            lines.append(format_message_line(msg))
     except discord.Forbidden:
         return "Sem permissão para ler histórico deste canal."
     except Exception as e:
@@ -398,8 +525,94 @@ async def fetch_channel_history(
     if not lines:
         return "Nenhuma mensagem encontrada no histórico."
     lines.reverse()
-    header = f"Histórico de #{getattr(target, 'name', target.id)} (últimas {len(lines)} mensagens, cronológica):\n"
+    header = (
+        f"Histórico de #{getattr(target, 'name', target.id)} "
+        f"(channel_id={target.id}) — últimas {len(lines)} mensagens, cronológica:\n"
+    )
     return header + "\n".join(lines)
+
+
+async def fetch_recent_channel_context(
+    bot: discord.Client,
+    channel: discord.abc.Messageable | None,
+    *,
+    before: discord.abc.Snowflake | None = None,
+    limit: int | None = None,
+) -> str | None:
+    """Latest channel messages as auto-injected LLM context.
+
+    Controlled by ``CHANNEL_CONTEXT_MESSAGES`` (0 disables). Returns ``None``
+    when disabled or without a readable channel. ``before`` excludes the
+    triggering message from the window (mention/follow-up flows).
+    """
+    n = CHANNEL_CONTEXT_MESSAGES if limit is None else limit
+    if n <= 0 or channel is None:
+        return None
+    text = await fetch_channel_history(bot, channel, limit=n, before=before)
+    return f"<mensagens_recentes_do_canal>\n{text}\n</mensagens_recentes_do_canal>"
+
+
+async def fetch_channel_gap(
+    channel: discord.abc.Messageable | None,
+    *,
+    after_id: str | int,
+    before: discord.abc.Snowflake,
+    skip_ids: set[str] | None = None,
+    limit: int | None = None,
+) -> list[str]:
+    """Human channel messages between a stored turn and a new follow-up.
+
+    Anchors on the previous bot-directed turn's message id and returns the
+    chatter in between as canonical lines (bot messages excluded — bot answers
+    are already replayed as conversation turns). The walk goes backwards from
+    ``before`` and stops at the anchor id, so nothing older than the previous
+    turn leaks in; only human messages consume the budget, so truncation keeps
+    the NEWEST chatter lines. Controlled by ``CONVERSATIONS_GAP_MESSAGES``
+    (0 disables). Returns [] on failure — the recent-channel window is then
+    the fallback.
+    """
+    n = CONVERSATIONS_GAP_MESSAGES if limit is None else limit
+    if n <= 0 or channel is None or not hasattr(channel, "history"):
+        return []
+    try:
+        anchor = discord.Object(id=int(after_id))
+    except (TypeError, ValueError):
+        return []
+    skip = {str(s) for s in (skip_ids or set()) if s}
+    skip.add(str(after_id))
+    lines: list[str] = []
+    try:
+        async for msg in channel.history(limit=max(n * 3, 100), before=before):
+            if msg.id <= anchor.id:
+                break
+            if msg.author.bot or str(msg.id) in skip:
+                continue
+            if not msg.content and not msg.attachments and not msg.embeds:
+                continue
+            lines.append(format_message_line(msg))
+            if len(lines) >= n:
+                break
+    except Exception:
+        logger.exception("fetch_channel_gap failed")
+        return []
+    lines.reverse()
+    return lines
+
+
+async def fetch_turn_gap(message: discord.Message, history: list[dict]) -> list[str]:
+    """Channel chatter since the previous bot-directed turn (same channel only)."""
+    last_turn = history[-1] if history else None
+    anchor_id = (last_turn or {}).get('message_id')
+    if not anchor_id:
+        return []
+    if last_turn.get('channel_id') and str(last_turn['channel_id']) != str(message.channel.id):
+        return []
+    return await fetch_channel_gap(
+        message.channel,
+        after_id=anchor_id,
+        before=message,
+        skip_ids={t.get('message_id') for t in history if t.get('message_id')},
+    )
 
 
 async def fetch_message_context(
@@ -407,29 +620,41 @@ async def fetch_message_context(
     channel_id: str,
     message_id: str,
     window: int = 5,
-) -> str:
-    window = max(1, min(10, int(window)))
+    guild_id: int | None = None,
+) -> str | None:
+    """Fetch ±window messages around one message via the Discord API.
+
+    Returns None on any failure (missing message, missing channel, no
+    permission, invalid ids, channel outside the requesting guild) so callers
+    can fall back to the history index.
+    """
+    try:
+        window = max(1, min(10, int(window)))
+    except (TypeError, ValueError):
+        window = 5
     try:
         cid = int(channel_id)
         mid = int(message_id)
-    except ValueError:
-        return "IDs inválidos."
+    except (TypeError, ValueError):
+        return None
     channel = bot.get_channel(cid)
     if channel is None:
         try:
             channel = await bot.fetch_channel(cid)
         except Exception:
-            return f"Canal {channel_id} não encontrado."
+            return None
+    if guild_id is not None and getattr(channel, "guild", None) is not None and channel.guild.id != guild_id:
+        return None
     if not hasattr(channel, "fetch_message") or not hasattr(channel, "history"):
-        return "Canal não suporta histórico."
+        return None
     try:
         target = await channel.fetch_message(mid)
     except discord.NotFound:
-        return f"Mensagem {message_id} não encontrada."
+        return None
     except discord.Forbidden:
-        return "Sem permissão para ler esta mensagem."
-    except Exception as e:
-        return f"Erro ao buscar mensagem: {e}"
+        return None
+    except Exception:
+        return None
     before: list[discord.Message] = []
     after: list[discord.Message] = []
     try:
@@ -444,38 +669,302 @@ async def fetch_message_context(
     except Exception:
         pass
     def fmt(m: discord.Message, highlight: bool = False) -> str:
-        ts = _fmt_dt(m.created_at)
-        author = getattr(m.author, 'display_name', str(m.author))
-        content = (m.content or "").replace("\n", " ").strip()
-        if m.attachments:
-            content += " " + " ".join(f"[anexo:{a.filename}]" for a in m.attachments)
-        if not content:
-            content = "[sem texto]"
-        if len(content) > 350:
-            content = content[:350] + "…"
         prefix = "▶ " if highlight else "  "
-        return f"{prefix}[{ts}] {author}: {content} (id={m.id})"
+        return prefix + format_message_line(m)
     lines: list[str] = []
     for m in before:
         lines.append(fmt(m))
-    lines.append(fmt(target, True) + "  ← alvo")
+    lines.append(fmt(target, True))
     for m in after:
         lines.append(fmt(m))
-    header = f"Contexto ao redor de {message_id} em #{getattr(channel, 'name', channel_id)} (±{window}):\n"
+    header = (
+        f"Contexto ao redor de {message_id} em #{getattr(channel, 'name', channel_id)} "
+        f"(channel_id={channel.id}, ±{window}):\n"
+    )
     return header + "\n".join(lines)
 
 
+async def exec_history_tool(
+    name: str,
+    args: dict,
+    *,
+    bot: discord.Client,
+    guild: discord.Guild | None,
+    channel: discord.abc.Messageable | None,
+) -> tuple[str, list[dict]] | None:
+    """Run one of the shared history/context tools.
+
+    Returns ``None`` for any other tool name so callers fall through to their
+    own handlers. Guild/channel resolution stays at the caller.
+    """
+    if name == 'get_channel_history':
+        text = await fetch_channel_history(bot, channel, limit=args.get('limit', 20), channel_id=args.get('channel_id'))
+        return text, []
+    if name == 'get_guild_info':
+        if not guild:
+            return "Fora de um servidor (DM).", []
+        text = build_guild_context(guild)
+        try:
+            chs = [f"#{c.name} ({c.id})" for c in guild.channels if isinstance(c, discord.TextChannel)][:30]
+            if chs:
+                text += "\nCanais de texto: " + ", ".join(chs)
+        except Exception:
+            pass
+        return text, []
+    if name == 'search_history':
+        hist = bot.get_cog('HistoryRAG')
+        if not hist:
+            return "Histórico não disponível.", []
+        if not guild:
+            return "Busca no histórico requer estar em um servidor.", []
+        query = args.get('query', '')
+        limit = max(1, min(12, int(args.get('limit', 5))))
+        try:
+            results = await hist.search(query, guild.id, limit=limit, channel_id=args.get('channel_id'), author_id=args.get('author_id'), author_name=args.get('author_name'), after=args.get('after'), before=args.get('before'), search_mode=args.get('search_mode','hybrid'), sort_by=args.get('sort_by','relevance'))  # type: ignore
+        except Exception:
+            logger.exception("search_history failed")
+            return "Erro ao buscar no histórico.", []
+        if not results:
+            return "Nenhuma mensagem relevante encontrada no histórico.", []
+        return render_search_results(results), []
+    if name == 'get_user_stats':
+        hist = bot.get_cog('HistoryRAG')
+        if not hist:
+            return "Histórico não disponível.", []
+        if not guild:
+            return "Requer servidor.", []
+        try:
+            stats = await hist.get_user_stats(guild.id, author_id=args.get('author_id'), author_name=args.get('author_name'))  # type: ignore
+        except Exception:
+            logger.exception("get_user_stats failed")
+            return "Erro ao buscar estatísticas.", []
+        if "error" in stats:
+            return stats["error"], []
+        lines = [f"Usuário: {stats['author_full']} ({', '.join(stats['author_ids'])})", f"Total: {stats['total_messages']} msgs | Média: {stats['avg_length']} chars", f"Canais: {', '.join(f'{k}={v}' for k,v in stats['top_channels'])}", f"Horários: {', '.join(f'{h}h={v}' for h,v in stats['top_hours'])}", f"Período: {stats['first_seen']} → {stats['last_seen']}", f"Exemplo: {stats['example_content']} {stats['example_jump']}"]
+        return "\n".join(lines), []
+    if name == 'count_mentions':
+        hist = bot.get_cog('HistoryRAG')
+        if not hist:
+            return "Histórico não disponível.", []
+        if not guild:
+            return "Requer servidor.", []
+        try:
+            groups = await hist.count_mentions(guild.id, query=args.get('query',''), group_by=args.get('group_by','author'), limit=int(args.get('limit',10)), after=args.get('after'), before=args.get('before'))  # type: ignore
+        except Exception:
+            logger.exception("count_mentions failed")
+            return "Erro ao contar menções.", []
+        if not groups:
+            return "Nenhuma menção encontrada.", []
+        lines = [f"{gr['key']}: {gr['count']}× — ex: {gr['example'].get('content','')[:120]}" for gr in groups]
+        return "\n".join(lines), []
+    if name == 'find_user':
+        hist = bot.get_cog('HistoryRAG')
+        if not hist:
+            return "Histórico não disponível.", []
+        if not guild:
+            return "Busca de usuários requer estar em um servidor.", []
+        query = args.get('query', '')
+        try:
+            limit = max(1, min(12, int(args.get('limit', 5))))
+        except (TypeError, ValueError):
+            limit = 5
+        try:
+            users = await hist.find_users(guild.id, query, limit=limit)  # type: ignore
+        except Exception:
+            logger.exception("find_user failed")
+            return "Erro ao buscar usuários.", []
+        if not users:
+            return (
+                f"Nenhum usuário encontrado para: {query or '(vazio)'}. "
+                "Tente search_history com author_name se a pessoa já falou no servidor."
+            ), []
+        lines = []
+        for u in users:
+            label = u.get('full_label') or u.get('display_name') or u.get('author_id', '?')
+            lines.append(
+                f"**{label}** <author_id={u.get('author_id','?')}> — "
+                f"{u.get('msg_count', 0)} msgs, {str(u.get('first_seen',''))[:10]} → {str(u.get('last_seen',''))[:10]}"
+            )
+            aliases = [a for a in u.get('aliases', []) if a and a != u.get('display_name')]
+            if aliases:
+                lines.append(f"  Também conhecido como: {', '.join(aliases[:5])}")
+            if u.get('top_channels'):
+                chans = ', '.join(f"#{c} ({n})" for c, n in u['top_channels'][:3])
+                lines.append(f"  Canais mais ativos: {chans}")
+        return "\n".join(lines), []
+    if name == 'sql_history':
+        if not HISTORY_SQL_TOOL_ENABLED:
+            return 'Ferramenta sql_history desativada por configuração (HISTORY_SQL_TOOL_ENABLED).', []
+        hist = bot.get_cog('HistoryRAG')
+        if not hist:
+            return 'Histórico não disponível.', []
+        if not guild:
+            return 'Consulta SQL requer estar em um servidor.', []
+        sql = args.get('sql', '')
+        try:
+            text = await hist.exec_sql(guild.id, sql)  # type: ignore
+        except ValueError as e:
+            return f'Consulta rejeitada: {e} Reescreva e tente de novo.', []
+        except Exception as e:
+            logger.exception('sql_history failed')
+            return f'Erro SQL: {e} Corrija a consulta (veja esquema na descrição da ferramenta).', []
+        return text, []
+    if name == 'get_message_context':
+        try:
+            window = max(1, min(10, int(args.get('window', 5))))
+        except (TypeError, ValueError):
+            window = 5
+        text = await fetch_message_context(
+            bot,
+            channel_id=args.get('channel_id',''),
+            message_id=args.get('message_id',''),
+            window=window,
+            guild_id=guild.id if guild else None,
+        )
+        if text is None:
+            hist = bot.get_cog('HistoryRAG')
+            if hist and guild:
+                try:
+                    text = await hist.get_message_context_from_index(  # type: ignore
+                        guild.id, args.get('channel_id',''), args.get('message_id',''), window,
+                    )
+                except Exception:
+                    logger.exception("indexed get_message_context fallback failed")
+        if text is None:
+            text = f"Mensagem {args.get('message_id','')} não encontrada (nem via API, nem no índice)."
+        return text, []
+    return None
+
+
+def history_tool_status(name: str, args: dict) -> str | None:
+    """Status label for the shared history/context tools, ``None`` otherwise."""
+    if name == 'get_channel_history':
+        lim = args.get('limit', 20)
+        cid = args.get('channel_id')
+        return f'📜 Lendo histórico ({lim} msgs)' + (f' canal {cid}' if cid else '')
+    if name == 'get_guild_info':
+        return '🏰 Coletando informações do servidor'
+    if name == 'search_history':
+        q = args.get('query','')[:40]
+        return f'🔎 Buscando no histórico: *{q}*'
+    if name == 'get_user_stats':
+        return f'📊 Estatísticas de {args.get("author_id") or args.get("author_name","usuário")}…'
+    if name == 'count_mentions':
+        return f'🔢 Contando menções: *{args.get("query","")[:30]}*'
+    if name == 'get_message_context':
+        return f'🧩 Contexto da mensagem {args.get("message_id","")}…'
+    if name == 'find_user':
+        return f'👤 Localizando usuário: *{str(args.get("query") or "")[:40] or "mais ativos"}*'
+    if name == 'sql_history':
+        snippet = ' '.join(str(args.get('sql') or '').split())[:60]
+        return f'🗄️ Consultando histórico (SQL): `{snippet}`'
+    return None
+
+
+def _cached_tokens(usage: Any) -> int | None:
+    """Cached prompt tokens from OpenAI/OpenRouter or Anthropic-style usage."""
+    if usage is None:
+        return None
+    details = _get(usage, 'prompt_tokens_details', None)
+    cached = _get(details, 'cached_tokens', None) if details is not None else None
+    if cached is None:
+        cached = _get(usage, 'cache_read_input_tokens', None)
+    return cached
+
+
 def _usage_summary(response: Any) -> str:
-    """Format token usage info from a chat completion for log lines."""
-    usage = getattr(response, 'usage', None)
+    """Format token usage (incl. cached prefix tokens) for log lines."""
+    usage = _get(response, 'usage', None)
     if usage is None:
         return 'n/a'
-    parts = [f'prompt={usage.prompt_tokens}', f'completion={usage.completion_tokens}']
-    details = getattr(usage, 'completion_tokens_details', None)
-    reasoning = getattr(details, 'reasoning_tokens', None) if details is not None else None
+    parts = [
+        f'prompt={_get(usage, "prompt_tokens", None)}',
+        f'completion={_get(usage, "completion_tokens", None)}',
+    ]
+    cached = _cached_tokens(usage)
+    if cached is not None:
+        prompt = _get(usage, 'prompt_tokens', None) or 0
+        suffix = f' (hit={round(100 * cached / prompt)}%)' if prompt else ''
+        parts.append(f'cached={cached}{suffix}')
+    details = _get(usage, 'completion_tokens_details', None)
+    reasoning = _get(details, 'reasoning_tokens', None) if details is not None else None
     if reasoning is not None:
         parts.append(f'reasoning={reasoning}')
     return ', '.join(parts)
+
+
+def _accumulate_usage(totals: dict[str, int], response: Any) -> None:
+    """Add one completion's usage into *totals* (prompt/completion/cached)."""
+    usage = _get(response, 'usage', None)
+    if usage is None:
+        return
+    for key in ('prompt_tokens', 'completion_tokens'):
+        value = _get(usage, key, None)
+        if value:
+            totals[key] += value
+    cached = _cached_tokens(usage)
+    if cached:
+        totals['cached_tokens'] += cached
+
+
+def _get(msg: Any, key: str, default: Any = None) -> Any:
+    if isinstance(msg, dict):
+        return msg.get(key, default)
+    return getattr(msg, key, default)
+
+
+def serialize_trajectory(messages: list[Any]) -> list[dict]:
+    """Convert appended loop messages (SDK objects or dicts) to JSON-safe dicts.
+
+    Only a whitelist of fields is kept (role/content/tool_calls/tool_call_id):
+    provider extras such as ``reasoning``/thinking payloads are dropped because
+    most APIs reject them on input, and the result is what gets persisted in the
+    conversation store and replayed verbatim on follow-ups.
+    """
+    out: list[dict] = []
+    for msg in messages:
+        role = _get(msg, 'role')
+        if role == 'assistant':
+            content = _get(msg, 'content')
+            entry: dict = {
+                'role': 'assistant',
+                'content': content if isinstance(content, str) else None,
+            }
+            calls: list[dict] = []
+            for tc in _get(msg, 'tool_calls') or []:
+                fn = _get(tc, 'function') or {}
+                name = _get(fn, 'name')
+                tc_id = _get(tc, 'id')
+                if not name or not tc_id:
+                    continue
+                calls.append({
+                    'id': tc_id,
+                    'type': 'function',
+                    'function': {
+                        'name': name,
+                        'arguments': _get(fn, 'arguments') or '{}',
+                    },
+                })
+            if calls:
+                entry['tool_calls'] = calls
+            out.append(entry)
+        elif role == 'tool':
+            tc_id = _get(msg, 'tool_call_id')
+            content = _get(msg, 'content')
+            if not tc_id or not isinstance(content, str):
+                continue
+            out.append({'role': 'tool', 'tool_call_id': tc_id, 'content': content})
+        elif role == 'user':
+            # A leading user entry can only be the empty-answer retry nudge
+            # (emitted when the model returned no tool calls AND no content in
+            # round 1).  Keeping it would replay as two consecutive user
+            # messages — providers enforcing strict user/assistant alternation
+            # (Anthropic) reject that — so it is dropped from the capture.
+            if not out:
+                continue
+            content = _get(msg, 'content')
+            out.append({'role': 'user', 'content': content if isinstance(content, str) else ''})
+    return out
 
 
 async def run_tool_loop(
@@ -488,7 +977,7 @@ async def run_tool_loop(
     interaction: discord.Interaction | None = None,
     max_rounds: int = 6,
     dedup_key: Callable[[dict], str] | None = None,
-) -> tuple[str, list[dict]]:
+) -> tuple[str, list[dict], list[dict]]:
     """Run an agentic tool-calling loop until the LLM produces a final answer.
 
     Parameters
@@ -519,13 +1008,22 @@ async def run_tool_loop(
 
     Returns
     -------
-    ``(answer_text, all_sources)`` where *all_sources* is the deduplicated list
-    of source dicts aggregated across all tool rounds.
+    ``(answer_text, all_sources, trajectory)`` where *all_sources* is the
+    deduplicated list of source dicts aggregated across all tool rounds and
+    *trajectory* is the JSON-safe list of messages appended during the loop
+    (assistant tool calls, tool results, the final answer — plus the
+    empty-answer retry nudge when it fired).  It is persisted with the
+    conversation turn and replayed verbatim on follow-ups, so later turns see
+    the full internal steps of earlier ones and the replayed prefix stays
+    byte-identical to what was actually sent (keeping provider prefix caches
+    effective).
     """
     all_sources: list[dict] = []
     seen_keys: set[str] = set()
     rounds_used = 0
     finish_reasons: list[str] = []
+    usage_totals: dict[str, int] = {'prompt_tokens': 0, 'completion_tokens': 0, 'cached_tokens': 0}
+    capture_start = len(messages)
 
     for round_num in range(1, max_rounds + 1):
         rounds_used = round_num
@@ -535,6 +1033,7 @@ async def run_tool_loop(
             max_tokens=LLM_MAX_TOKENS,
             tools=tools,
         )
+        _accumulate_usage(usage_totals, response)
 
         choice = response.choices[0]
         finish_reason = getattr(choice, 'finish_reason', None) or 'unknown'
@@ -620,6 +1119,7 @@ async def run_tool_loop(
             messages=messages,
             max_tokens=LLM_MAX_TOKENS,
         )
+        _accumulate_usage(usage_totals, response)
 
     final_choice = response.choices[0]
     answer = final_choice.message.content or ''
@@ -630,18 +1130,22 @@ async def run_tool_loop(
             getattr(final_choice, 'finish_reason', None),
             _usage_summary(response),
         )
-        retry_messages = [*messages, {
+        # The nudge is appended to `messages` itself (payload-identical to the
+        # previous copy) so the captured trajectory includes exactly what was
+        # sent and the follow-up prefix keeps matching the provider cache.
+        messages.append({
             'role': 'user',
             'content': (
                 'Responda agora, em português, de forma direta e concisa, sem '
                 'usar nenhuma ferramenta. Use apenas as informações já coletadas.'
             ),
-        }]
+        })
         response = await client.chat.completions.create(
             model=model,
-            messages=retry_messages,
+            messages=messages,
             max_tokens=LLM_MAX_TOKENS,
         )
+        _accumulate_usage(usage_totals, response)
         final_choice = response.choices[0]
         answer = final_choice.message.content or ''
     if not answer.strip():
@@ -655,7 +1159,21 @@ async def run_tool_loop(
             _usage_summary(response),
         )
         answer = 'Não foi possível gerar uma resposta.'
-    return answer, all_sources
+    messages.append({'role': 'assistant', 'content': answer})
+    trajectory = serialize_trajectory(messages[capture_start:])
+    prompt_total = usage_totals['prompt_tokens']
+    if prompt_total:
+        cached_total = usage_totals['cached_tokens']
+        logger.info(
+            "Turn usage: model=%s rounds=%d prompt=%d cached=%d hit=%.0f%% completion=%d",
+            model,
+            rounds_used,
+            prompt_total,
+            cached_total,
+            100.0 * cached_total / prompt_total,
+            usage_totals['completion_tokens'],
+        )
+    return answer, all_sources, trajectory
 
 
 def truncate_safe(text: str, limit: int = 3800, suffix: str = '\n\n...') -> str:

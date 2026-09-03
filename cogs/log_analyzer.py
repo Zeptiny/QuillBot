@@ -7,7 +7,8 @@ from discord import app_commands
 from discord.ext import commands
 from openai import AsyncOpenAI, RateLimitError
 
-from cogs.utils import PaginatedEmbedView, split_response
+from cogs import image_store
+from cogs.utils import PaginatedEmbedView, _usage_summary, split_response
 from config import (
     CHAT_MODEL,
     COOLDOWN_PER,
@@ -359,7 +360,7 @@ class LogAnalyzer(commands.Cog):
 
     # --- AI Log Analysis ---
 
-    async def _analyze_with_ai(self, log_content: str | None = None, image_url: str | None = None) -> str | None:
+    async def _analyze_with_ai(self, log_content: str | None = None, image_ref: str | None = None) -> str | None:
         """Send log content and/or image to the LLM for analysis."""
         if not self.ai_client:
             return None
@@ -374,16 +375,18 @@ class LogAnalyzer(commands.Cog):
                 log_content = _extract_relevant_lines(log_content, MAX_LOG_CONTEXT)
             user_parts.append({'type': 'text', 'text': f"Analise este log:\n\n```\n{log_content}\n```"})
 
-        if image_url:
+        image_part = None
+        if image_ref:
             if not user_parts:
                 user_parts.append({'type': 'text', 'text': 'Analise esta imagem de log/erro de servidor Minecraft:'})
-            user_parts.append({'type': 'image_url', 'image_url': {'url': image_url}})
+            image_part = image_store.image_part(image_ref)
 
         if not user_parts:
             return None
 
         # Use vision format (list of content parts) when image is present
-        if image_url:
+        if image_part:
+            user_parts.append(image_part)
             messages.append({'role': 'user', 'content': user_parts})
         else:
             messages.append({'role': 'user', 'content': user_parts[0]['text']})
@@ -393,6 +396,7 @@ class LogAnalyzer(commands.Cog):
             messages=messages,
             max_tokens=1500,
         )
+        logger.debug("Log analysis usage=[%s]", _usage_summary(response))
         return response.choices[0].message.content
 
     @app_commands.command(name='analyze', description='Analisa um log de servidor Minecraft com IA')
@@ -428,7 +432,6 @@ class LogAnalyzer(commands.Cog):
                     'O arquivo enviado não é uma imagem válida.', ephemeral=True
                 )
                 return
-            image_url = image.url
 
         # Validate link format *before* deferring so invalid links fail fast
         fetch_url = None
@@ -448,6 +451,9 @@ class LogAnalyzer(commands.Cog):
             "Processing /analyze user=%s guild=%s",
             interaction.user.id, interaction.guild_id,
         )
+
+        if image:
+            image_url = await image_store.persist_attachment(image)
 
         log_content = None
         content_truncated = False
@@ -469,7 +475,7 @@ class LogAnalyzer(commands.Cog):
             return
 
         try:
-            analysis = await self._analyze_with_ai(log_content=log_content, image_url=image_url)
+            analysis = await self._analyze_with_ai(log_content=log_content, image_ref=image_url)
         except RateLimitError:
             await interaction.followup.send(
                 '⏳ Limite de requisições atingido. Tente novamente em alguns minutos.'
