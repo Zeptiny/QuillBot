@@ -455,7 +455,7 @@ class DocsRAG(commands.Cog):
         self._local_embed_model = None
         self._local_embed_dim: int | None = None
         self.session: aiohttp.ClientSession | None = None
-        self.chunks: list[dict] = []  # {content, path, title, embedding, source, doc_url}
+        self.chunks: list[dict] = []  # {content, path, title, source, doc_url}; embeddings live only in _emb_matrix
         self._last_commit_sha: str | None = None
         self._indexing: bool = False
         self._emb_matrix: np.ndarray | None = None  # (N, dim) float32 for vectorized search
@@ -528,15 +528,6 @@ class DocsRAG(commands.Cog):
 
     # --- Vector Storage ---
 
-    def _rebuild_matrix(self) -> None:
-        """Rebuild the numpy embedding matrix from current chunks."""
-        if not self.chunks:
-            self._emb_matrix = None
-            return
-        self._emb_matrix = np.array(
-            [c['embedding'] for c in self.chunks], dtype=np.float32
-        )
-
     def _save_vectors(self):
         """Persist chunk metadata to JSON and embeddings to a numpy binary file."""
         os.makedirs(os.path.dirname(VECTOR_STORE_PATH), exist_ok=True)
@@ -557,9 +548,7 @@ class DocsRAG(commands.Cog):
         with open(VECTOR_STORE_PATH, 'w', encoding='utf-8') as f:
             json.dump(meta, f, ensure_ascii=False)
         npy_path = os.path.splitext(VECTOR_STORE_PATH)[0] + '.npy'
-        embeddings = np.array([c['embedding'] for c in self.chunks], dtype=np.float32)
-        np.save(npy_path, embeddings)
-        self._emb_matrix = embeddings
+        np.save(npy_path, self._emb_matrix)
         logger.info("Saved %d vectors to %s + %s", len(self.chunks), VECTOR_STORE_PATH, npy_path)
 
     def _load_vectors(self) -> bool:
@@ -587,14 +576,10 @@ class DocsRAG(commands.Cog):
                         embeddings.shape[1], self._local_embed_dim,
                     )
                     return False
-                for chunk, emb in zip(chunks, embeddings):
-                    chunk['embedding'] = emb
             elif chunks and 'embedding' in chunks[0]:
                 # Old JSON-with-embeddings format — migrate on load
                 logger.info("Migrating vector store from JSON to binary format...")
                 embeddings = np.array([c.pop('embedding') for c in chunks], dtype=np.float32)
-                for chunk, emb in zip(chunks, embeddings):
-                    chunk['embedding'] = emb
             else:
                 logger.warning("No embeddings found in vector store, will reindex")
                 return False
@@ -603,8 +588,8 @@ class DocsRAG(commands.Cog):
                 chunk.setdefault('source', "Miners' Refuge")
                 chunk.setdefault('doc_url', path_to_docs_url(chunk['path']))
             self.chunks = chunks
+            self._emb_matrix = embeddings
             self._last_commit_sha = data.get('commit_sha')
-            self._rebuild_matrix()
             logger.info(
                 "Loaded %d vectors from disk (commit: %s)",
                 len(self.chunks),
@@ -894,7 +879,11 @@ class DocsRAG(commands.Cog):
 
         self.chunks = [c for c in all_chunks if 'embedding' in c]
         logger.info("Documentation indexed: %d chunks with embeddings", len(self.chunks))
-        self._rebuild_matrix()
+        # The float32 matrix is the single source of truth for embeddings:
+        # pop() the per-chunk copies (Python-float lists cost ~8x the matrix).
+        self._emb_matrix = np.array(
+            [c.pop('embedding') for c in self.chunks], dtype=np.float32
+        )
 
         # Track per-source SHAs and timestamps
         if sources is not None:

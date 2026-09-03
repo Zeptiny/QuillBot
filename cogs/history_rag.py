@@ -428,13 +428,10 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
                     "jump_url": jump_url or "",
                 })
             # Bulk-decode all embeddings into one contiguous, writable matrix
-            # (on_message_edit overwrites rows in place) instead of per-row
-            # frombuffer + list-fed np.array. Chunks alias the matrix rows, so
-            # the joined bytes buffer is freed instead of staying resident.
+            # (on_message_edit overwrites rows in place). The matrix is the
+            # single in-memory home for embeddings — chunks never hold copies.
             raw = b"".join(r[_EMB_COL] for r in rows)
             matrix = np.frombuffer(raw, dtype=np.float32).reshape(len(rows), dim).copy()
-            for i, chunk in enumerate(chunks):
-                chunk["embedding"] = matrix[i]
             self._chunks[guild_id] = chunks
             self._matrices[guild_id] = matrix
             self._msg_index[guild_id] = {int(c["msg_id"]): i for i, c in enumerate(chunks)}
@@ -445,7 +442,7 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
             logger.exception("Failed to load history DB for guild %s", guild_id)
             return False
 
-    def _upsert_chunks_to_db(self, guild_id: int, chunks: list[dict]):
+    def _upsert_chunks_to_db(self, guild_id: int, chunks: list[dict], embeddings: list | None = None):
         if not chunks:
             return
         path = self._db_path()
@@ -453,8 +450,8 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
         con = sqlite3.connect(path, timeout=30)
         try:
             rows = []
-            for c in chunks:
-                emb = c.get("embedding")
+            for i, c in enumerate(chunks):
+                emb = embeddings[i] if embeddings is not None else c.get("embedding")
                 if emb is None:
                     continue
                 if isinstance(emb, np.ndarray):
@@ -841,20 +838,22 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
             logger.exception("Failed backfill channel %s", cid)
 
     def _append_chunks(self, gid: int, chunks: list[dict], embeddings: list):
-        new_embs = []
-        for ch, emb in zip(chunks, embeddings):
-            ch["embedding"] = np.asarray(emb, dtype=np.float32)
+        if not chunks or not embeddings:
+            return
+        stacked = np.asarray(embeddings, dtype=np.float32)
+        if stacked.ndim != 2 or stacked.shape[0] != len(chunks):
+            logger.warning(
+                "Embedding batch mismatch guild %s: %s embeddings for %s chunks",
+                gid, stacked.shape, len(chunks),
+            )
+            return
+        mat = self._matrices.get(gid)
+        self._matrices[gid] = (
+            stacked if mat is None or mat.shape[0] == 0 else np.vstack([mat, stacked])
+        )
+        for ch in chunks:
             self._chunks[gid].append(ch)
             self._msg_index[gid][int(ch["msg_id"])] = len(self._chunks[gid]) - 1
-            new_embs.append(ch["embedding"])
-        if not new_embs:
-            return
-        stacked = np.stack(new_embs)
-        mat = self._matrices.get(gid)
-        if mat is None or mat.shape[0] == 0:
-            self._matrices[gid] = stacked
-        else:
-            self._matrices[gid] = np.vstack([mat, stacked])
 
     async def _index_batch(self, guild: discord.Guild, channel: discord.abc.Messageable, msgs: list[discord.Message]):
         if not msgs:
@@ -913,7 +912,7 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
         try:
             batch_ids = [str(c['msg_id']) for c in chunks]
             already_stored = await asyncio.to_thread(self._existing_msg_ids, gid, batch_ids)
-            await asyncio.to_thread(self._upsert_chunks_to_db, gid, chunks)
+            await asyncio.to_thread(self._upsert_chunks_to_db, gid, chunks, embeddings)
             await asyncio.to_thread(
                 self._upsert_authors, gid, chunks,
                 count_msg_ids=set(batch_ids) - already_stored,
@@ -955,10 +954,9 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
             chunk["content"] = new_content
             chunk["window_line"] = format_message_line(after)
             chunk["chunk_text"] = "\n".join(chunk.get("window_lines", []) + [chunk["window_line"]])
-            emb = (await self._embed_batch([chunk["chunk_text"]]))[0]
-            chunk["embedding"] = np.array(emb, dtype=np.float32)
-            self._matrices[gid][idx] = chunk["embedding"]
-            await asyncio.to_thread(self._upsert_chunks_to_db, gid, [chunk])
+            emb = np.asarray((await self._embed_batch([chunk["chunk_text"]]))[0], dtype=np.float32)
+            self._matrices[gid][idx] = emb
+            await asyncio.to_thread(self._upsert_chunks_to_db, gid, [chunk], [emb])
             await asyncio.to_thread(self._upsert_authors, gid, [chunk], count_msg_ids=set())
         except Exception:
             logger.exception("Failed to update edited message %s", after.id)
@@ -976,7 +974,7 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
             chunks.pop(idx)
             self._msg_index[gid] = {int(c["msg_id"]): i for i, c in enumerate(chunks)}
             if chunks:
-                self._matrices[gid] = np.array([c["embedding"] for c in chunks], dtype=np.float32)
+                self._matrices[gid] = np.delete(self._matrices[gid], idx, axis=0)
                 await asyncio.to_thread(self._delete_chunk_from_db, gid, str(message.id))
                 await asyncio.to_thread(
                     self._adjust_author_count, gid,
