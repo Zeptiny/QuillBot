@@ -475,6 +475,10 @@ class _ConfirmView(discord.ui.View):
 # Cog
 # ---------------------------------------------------------------------------
 
+class SchedulerError(Exception):
+    """User-facing scheduler error."""
+
+
 def _is_admin(interaction: discord.Interaction) -> bool:
     return interaction.user.guild_permissions.administrator if interaction.guild else False
 
@@ -945,6 +949,148 @@ class Scheduler(commands.Cog, name='Scheduler'):
         await asyncio.to_thread(self.store.update, interaction.guild.id, id, status='deleted')
         await interaction.followup.send(f'🗑️ Tarefa **#{id}** deletada.', ephemeral=True)
 
+    # --- Agent tool execution (LLM tool-calling) ---
+
+    async def exec_tool(
+        self,
+        name: str,
+        args: dict,
+        *,
+        guild: discord.Guild,
+        actor_name: str = 'bot',
+        requester=None,
+        channel=None,
+    ) -> tuple[str, list[dict]]:
+        """Execute a scheduler tool call from the LLM tool loop.
+
+        Returns ``(result_text, sources)`` — sources is always empty for
+        scheduler operations.  Mirrors ``Memory.exec_tool``'s signature.
+        """
+        try:
+            if name == 'schedule_create':
+                return await self._exec_create(
+                    args, guild=guild, actor_name=actor_name,
+                    requester=requester, channel=channel,
+                )
+            if name == 'schedule_list':
+                return await self._exec_list(args, guild=guild)
+            if name == 'schedule_delete':
+                return await self._exec_delete(args, guild=guild, requester=requester)
+        except SchedulerError as e:
+            return f'⚠️ Agendador: {e}', []
+        except Exception:
+            logger.exception('[scheduler] unexpected error in %s', name)
+            return '⚠️ Erro interno no agendador.', []
+        return f'Ferramenta desconhecida: {name}', []
+
+    async def _exec_create(
+        self, args: dict, *, guild: discord.Guild, actor_name: str,
+        requester, channel,
+    ) -> tuple[str, list[dict]]:
+        prompt = (args.get('prompt') or '').strip()
+        if not prompt:
+            raise SchedulerError('prompt é obrigatório.')
+        if len(prompt) > SCHEDULER_MAX_PROMPT:
+            raise SchedulerError(f'prompt excede {SCHEDULER_MAX_PROMPT} caracteres.')
+
+        job_type = (args.get('type') or 'once').strip().lower()
+        if job_type not in ('once', 'cron'):
+            raise SchedulerError('type deve ser "once" ou "cron".')
+
+        delay = args.get('delay')
+        cron_expr = args.get('cron')
+        channel_id = getattr(channel, 'id', None) if channel else None
+        if not channel_id:
+            raise SchedulerError('requer estar em um canal de texto.')
+
+        count = await asyncio.to_thread(self.store.count_active, guild.id)
+        if count >= SCHEDULER_MAX_JOBS_PER_GUILD:
+            raise SchedulerError(f'limite de {SCHEDULER_MAX_JOBS_PER_GUILD} tarefas ativas por servidor.')
+
+        try:
+            if job_type == 'once':
+                if not delay:
+                    raise SchedulerError(
+                        'tarefas "once" precisam de delay. Ex: "5m", "2h", "2026-09-04 14:30".'
+                    )
+                fire_dt = _parse_delay(str(delay))
+                if fire_dt <= _now():
+                    raise SchedulerError('a data/hora deve estar no futuro.')
+                cron_expr_store = None
+                next_fire = fire_dt.isoformat()
+            else:
+                if not cron_expr:
+                    raise SchedulerError(
+                        'tarefas "cron" precisam de uma expressão cron. Ex: "0 2 * * *".'
+                    )
+                parsed = _parse_cron(str(cron_expr))
+                fire_dt = _next_fire(parsed, _now())
+                cron_expr_store = str(cron_expr)
+                next_fire = fire_dt.isoformat()
+        except ValueError as e:
+            raise SchedulerError(str(e))
+
+        actor_id = str(getattr(requester, 'id', '')) or '0'
+        actor_display = getattr(requester, 'display_name', None) or actor_name
+
+        job = await asyncio.to_thread(
+            self.store.create,
+            guild_id=guild.id,
+            channel_id=channel_id,
+            job_type=job_type,
+            cron_expr=cron_expr_store,
+            next_fire=next_fire,
+            prompt=prompt,
+            created_by=int(actor_id) if actor_id.isdigit() else 0,
+            created_by_name=actor_display,
+        )
+
+        return (
+            f'✅ Tarefa #{job["id"]} criada! Dispara em {_fmt_brt(fire_dt)} '
+            f'({job_type}). Prompt: {_snippet(prompt, 80)}.',
+            [],
+        )
+
+    async def _exec_list(self, args: dict, *, guild: discord.Guild) -> tuple[str, list[dict]]:
+        entries = await asyncio.to_thread(self.store.list_active, guild.id)
+        if not entries:
+            return 'Nenhuma tarefa agendada ativa.', []
+        lines = []
+        for e in entries:
+            fire_dt = _parse_iso(e['next_fire'])
+            icon = '▶️' if e['status'] == 'active' else '⏸️'
+            lines.append(
+                f'{icon} #{e["id"]} — {e["type"]} — {_fmt_brt(fire_dt)} '
+                f'— <#{e["channel_id"]}> — {_snippet(e["prompt"], 60)}'
+            )
+        return f'**Tarefas agendadas ({len(entries)}):**\n' + '\n'.join(lines), []
+
+    async def _exec_delete(
+        self, args: dict, *, guild: discord.Guild, requester,
+    ) -> tuple[str, list[dict]]:
+        job_id = args.get('id')
+        if not job_id:
+            raise SchedulerError('id é obrigatório.')
+        try:
+            job_id_int = int(job_id)
+        except (TypeError, ValueError):
+            raise SchedulerError('id deve ser um número.')
+
+        job = await asyncio.to_thread(self.store.get, guild.id, job_id_int)
+        if job is None:
+            raise SchedulerError(f'tarefa #{job_id_int} não encontrada.')
+
+        is_admin = (
+            getattr(getattr(requester, 'guild_permissions', None), 'administrator', False)
+            if requester else False
+        )
+        requester_id = str(getattr(requester, 'id', ''))
+        if not is_admin and str(job['created_by']) != requester_id:
+            raise SchedulerError('você só pode deletar suas próprias tarefas.')
+
+        await asyncio.to_thread(self.store.update, guild.id, job_id_int, status='deleted')
+        return f'✅ Tarefa #{job_id_int} deletada.', []
+
     # --- Helpers ---
 
     def _build_job_embed(self, job: dict, guild: discord.Guild) -> discord.Embed:
@@ -977,6 +1123,89 @@ class Scheduler(commands.Cog, name='Scheduler'):
 def _snippet(text: str, n: int = 350) -> str:
     text = (text or '').strip()
     return text if len(text) <= n else text[:n] + '…'
+
+
+# ---------------------------------------------------------------------------
+# Agent tool schemas (for LLM tool-calling)
+# ---------------------------------------------------------------------------
+
+SCHEDULE_CREATE_TOOL = {
+    'type': 'function',
+    'function': {
+        'name': 'schedule_create',
+        'description': (
+            'Cria uma tarefa agendada que dispara automaticamente no futuro. '
+            'O bot executa o prompt via LLM no horário marcado e posta a resposta no canal. '
+            'Use para lembretes, verificações periódicas, ou tarefas que devem correr sem intervenção humana. '
+            'Tipos: "once" (dispara uma vez e é removido) ou "cron" (recorrente). '
+            'Para once, forneça delay ("5m", "2h", "1d") ou datetime ("2026-09-04 14:30"). '
+            'Para cron, forneça uma expressão cron de 5 campos: minuto hora dia mês dia-da-semana. '
+            'Ex: "0 2 * * *" = todo dia às 2 AM; "*/30 * * * *" = a cada 30 min; "0 9 * * 1-5" = 9 AM de seg a sex.'
+        ),
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'prompt': {
+                    'type': 'string',
+                    'description': 'Instrução do que o bot deve fazer quando a tarefa disparar. Ex: "Avise os usuários que o servidor reinicia em 5 minutos".',
+                },
+                'type': {
+                    'type': 'string',
+                    'enum': ['once', 'cron'],
+                    'description': 'once: dispara uma vez e é removido; cron: recorrente.',
+                },
+                'delay': {
+                    'type': 'string',
+                    'description': 'Para once: "5m", "2h", "1d", ou datetime "2026-09-04 14:30".',
+                },
+                'cron': {
+                    'type': 'string',
+                    'description': 'Para cron: 5 campos "min hora dia mês dia-semana". Ex: "0 2 * * *".',
+                },
+            },
+            'required': ['prompt', 'type'],
+        },
+    },
+}
+
+SCHEDULE_LIST_TOOL = {
+    'type': 'function',
+    'function': {
+        'name': 'schedule_list',
+        'description': (
+            'Lista as tarefas agendadas ativas do servidor. Retorna ID, tipo, próximo disparo, '
+            'canal e um resumo do prompt. Use quando o usuário perguntar sobre tarefas existentes.'
+        ),
+        'parameters': {
+            'type': 'object',
+            'properties': {},
+            'required': [],
+        },
+    },
+}
+
+SCHEDULE_DELETE_TOOL = {
+    'type': 'function',
+    'function': {
+        'name': 'schedule_delete',
+        'description': (
+            'Remove (deleta) uma tarefa agendada pelo ID. Use quando o usuário pedir para '
+            'cancelar ou remover um agendamento. Não pode ser desfeito.'
+        ),
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'id': {
+                    'type': 'integer',
+                    'description': 'ID da tarefa a deletar.',
+                },
+            },
+            'required': ['id'],
+        },
+    },
+}
+
+SCHEDULER_TOOLS = [SCHEDULE_CREATE_TOOL, SCHEDULE_LIST_TOOL, SCHEDULE_DELETE_TOOL]
 
 
 async def setup(bot: commands.Bot):

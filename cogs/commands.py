@@ -23,6 +23,7 @@ from cogs.conversation_store import (
     make_turn,
 )
 from cogs.memory import MEMORY_ABOUT_TOOL, MEMORY_SEARCH_TOOL, MEMORY_WRITE_TOOL
+from cogs.scheduler import SCHEDULER_TOOLS
 from cogs.tavily_tools import TOOLS as TAVILY_TOOLS
 from cogs.tavily_tools import exec_tool as tavily_exec_tool
 from cogs.tavily_tools import status_label as tavily_status_label
@@ -64,6 +65,7 @@ from config import (
     MEMORY_ENABLED,
     OPENAI_API_KEY,
     OPENAI_BASE_URL,
+    SCHEDULER_ENABLED,
     TAVILY_AVAILABLE,
 )
 
@@ -105,6 +107,16 @@ _WEB_SEARCH_INSTRUCTIONS = (
     "- Quando citar resultados da web, inclua o título e o link da fonte.\n"
 )
 
+_SCHEDULER_INSTRUCTIONS = (
+    "- Você pode criar tarefas agendadas (lembretes, verificações periódicas, etc.) "
+    "usando as ferramentas do agendador.\n"
+    "  - Use `schedule_create` para criar uma tarefa. Para uma vez, use type='once' "
+    "e delay (ex: '5m', '2h', '2026-09-04 14:30'). Para recorrente, use type='cron' "
+    "e uma expressão cron de 5 campos (ex: '0 2 * * *' = todo dia às 2 AM).\n"
+    "  - Use `schedule_list` para ver tarefas existentes.\n"
+    "  - Use `schedule_delete` para cancelar uma tarefa pelo ID.\n"
+) if SCHEDULER_ENABLED else ""
+
 _DISCORD_FORMAT = (
     "A resposta será exibida no Discord (embed description) — use APENAS sintaxe que o Discord renderiza:\n"
     "- Permitido: **negrito**, *itálico*, __sublinhado__, ~~tachado~~, `código inline`, "
@@ -124,7 +136,8 @@ GENERAL_SYSTEM_PROMPT = (
     "<instructions>\n"
     "- Responda perguntas gerais com base no seu conhecimento.\n"
     + _MEMORY_INSTRUCTIONS
-    + (_WEB_SEARCH_INSTRUCTIONS if TAVILY_AVAILABLE else '') +
+    + (_WEB_SEARCH_INSTRUCTIONS if TAVILY_AVAILABLE else '')
+    + _SCHEDULER_INSTRUCTIONS +
     "- Seja honesto quando não souber a resposta — não invente informações.\n"
     "</instructions>\n\n"
     "<response_format>\n"
@@ -747,6 +760,8 @@ class Commands(commands.Cog):
             base_tools.append(SQL_HISTORY_TOOL)
         if MEMORY_ENABLED:
             base_tools.extend([MEMORY_SEARCH_TOOL, MEMORY_WRITE_TOOL, MEMORY_ABOUT_TOOL])
+        if SCHEDULER_ENABLED:
+            base_tools.extend(SCHEDULER_TOOLS)
         active_tools = base_tools if base_tools else None
         fallback_channel = channel or (interaction.channel if interaction else None)
         fallback_guild = guild or (interaction.guild if interaction else None)
@@ -767,6 +782,18 @@ class Commands(commands.Cog):
                     requester=user, channel=channel, origin=origin,
                     participant_ids=participant_ids,
                 )
+            if name in ('schedule_create', 'schedule_list', 'schedule_delete'):
+                sched_cog = self.bot.get_cog('Scheduler')
+                if not sched_cog:
+                    return 'Agendador não disponível.', []
+                g = fallback_guild
+                if not g:
+                    return 'Agendador requer estar em um servidor.', []
+                actor_name = f'bot (via {user.display_name})' if user is not None else 'bot'
+                return await sched_cog.exec_tool(
+                    name, args, guild=g, actor_name=actor_name,
+                    requester=user, channel=fallback_channel,
+                )
             result = await exec_history_tool(name, args, bot=self.bot, guild=fallback_guild, channel=fallback_channel)
             if result is not None:
                 return result
@@ -783,6 +810,12 @@ class Commands(commands.Cog):
                 return f'🧠 Memória — {act}: *{tgt}*'
             if name == 'memory_about':
                 return f"🧠 Relembrando {args.get('user', 'quem pergunta')}…"
+            if name == 'schedule_create':
+                return f"⏰ Agendando: *{args.get('prompt', '')[:40]}*"
+            if name == 'schedule_list':
+                return '⏰ Listando tarefas agendadas…'
+            if name == 'schedule_delete':
+                return f'⏰ Removendo tarefa #{args.get("id", "?")}'
             label = history_tool_status(name, args)
             if label is not None:
                 return label
