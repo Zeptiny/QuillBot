@@ -3,6 +3,8 @@
 import datetime
 import json
 import logging
+import re
+import unicodedata
 from collections.abc import Awaitable, Callable
 from typing import Any, Final
 from zoneinfo import ZoneInfo
@@ -20,6 +22,87 @@ from config import (
 logger = logging.getLogger(__name__)
 
 BR_TZ = ZoneInfo("America/Sao_Paulo")
+
+# ---------------------------------------------------------------------------
+# Ping-safe user mention extraction
+# ---------------------------------------------------------------------------
+
+_MENTION_USER_RE = re.compile(r'<@!?(\d{15,25})>')
+# '@' not preceded by a word char or another '@' (skips emails, @@) — single
+# token; multi-word display names are resolved by extending the match.
+_AT_MENTION_RE = re.compile(r'(?<![\w@])@([\w][\w.\-]{0,31})')
+# Never pingable as @tokens: Discord pings and PT-BR "everyone" shorthand.
+_PING_BLACKLIST = {'here', 'everyone', 'all', 'todos', 'todo'}
+
+
+def _norm_name(text: str) -> str:
+    text = unicodedata.normalize('NFKD', text or '')
+    text = ''.join(c for c in text if not unicodedata.combining(c))
+    return re.sub(r'\s+', ' ', text).strip().lower()
+
+
+def extract_pingable_mentions(text: str, guild: discord.Guild | None, *, limit: int = 10) -> str:
+    """Collect ping-safe user mentions from LLM output as a content string.
+
+    Discord only notifies for mentions in the message *content* — mentions
+    inside embeds render but never ping.  This helper gathers the users the
+    model referenced and returns them as ``'<@id> <@id>'`` for use as
+    ``content=`` alongside the embed.
+
+    Accepts both ``<@user_id>`` mentions and ``@username`` / ``@display name``
+    tokens (resolved against guild members, accent/case-insensitive, extending
+    up to 3 words for names with spaces).  Only real human members ping:
+    roles, ``@here``/``@everyone``, bots (including this bot — prevents
+    self-ping loops) and unresolvable names are silently dropped.
+    """
+    if not text or guild is None:
+        return ''
+    picked: list[str] = []
+
+    def _add(member: discord.Member | None) -> None:
+        if member is None or member.bot:
+            return
+        sid = str(member.id)
+        if sid not in picked:
+            picked.append(sid)
+
+    def _resolve(name: str) -> discord.Member | None:
+        member = guild.get_member_named(name)
+        if member is not None:
+            return member
+        target = _norm_name(name)
+        return next(
+            (
+                m for m in guild.members
+                if not m.bot and target in (_norm_name(m.display_name), _norm_name(m.name))
+            ),
+            None,
+        )
+
+    for uid in _MENTION_USER_RE.findall(text):
+        _add(guild.get_member(int(uid)))
+        if len(picked) >= limit:
+            return ' '.join(f'<@{i}>' for i in picked)
+
+    for match in _AT_MENTION_RE.finditer(text):
+        if len(picked) >= limit:
+            break
+        raw = match.group(1)
+        if raw.lower() in _PING_BLACKLIST:
+            continue
+        member = _resolve(raw)
+        if member is None:
+            # Multi-word display name: greedily extend with following words,
+            # stripping trailing punctuation ("@John Doe," -> "John Doe").
+            extended = raw
+            for word in text[match.end():].lstrip().split()[:2]:
+                extended = f'{extended} {word.rstrip(".,;:!?…")}'
+                member = _resolve(extended)
+                if member is not None:
+                    break
+        _add(member)
+    return ' '.join(f'<@{i}>' for i in picked)
+
 
 CHANNEL_HISTORY_TOOL = {
     'type': 'function',

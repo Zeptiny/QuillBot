@@ -115,6 +115,11 @@ _SCHEDULER_INSTRUCTIONS = (
     "e uma expressão cron de 5 campos (ex: '0 2 * * *' = todo dia às 2 AM).\n"
     "  - Use `schedule_list` para ver tarefas existentes.\n"
     "  - Use `schedule_delete` para cancelar uma tarefa pelo ID.\n"
+    "  - Para NOTIFICAR alguém na resposta, use a menção real no formato "
+    "<@user_id> (os IDs aparecem como author_id nas mensagens do canal e em "
+    "memory_about). Menções dentro de embed não notificam — o agendador as "
+    "converte em ping real fora do embed. Nunca use @everyone, @here ou menções "
+    "de cargo.\n"
 ) if SCHEDULER_ENABLED else ""
 
 _DISCORD_FORMAT = (

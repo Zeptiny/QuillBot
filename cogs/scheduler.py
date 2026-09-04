@@ -29,7 +29,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from cogs.utils import BR_TZ, PaginatedEmbedView
+from cogs.utils import BR_TZ, PaginatedEmbedView, extract_pingable_mentions
 from config import (
     SCHEDULER_DB_PATH,
     SCHEDULER_ENABLED,
@@ -594,12 +594,26 @@ class Scheduler(commands.Cog, name='Scheduler'):
                     created_at=datetime.datetime.now(BR_TZ),
                 )
             if embeds:
-                if len(embeds) == 1:
-                    await channel.send(embed=embeds[0])
-                else:
-                    await channel.send(embed=embeds[0], view=PaginatedEmbedView(embeds))
+                # Mentions in embeds never notify — extracted user pings ride
+                # as message content.  everyone/roles stay unparsable so a
+                # cron job can never ping @everyone.
+                mentions = extract_pingable_mentions(answer, guild)
+                send_kwargs: dict = {'embed': embeds[0]}
+                if len(embeds) > 1:
+                    send_kwargs['view'] = PaginatedEmbedView(embeds)
+                if mentions:
+                    send_kwargs['content'] = mentions
+                send_kwargs['allowed_mentions'] = discord.AllowedMentions(
+                    users=True, roles=False, everyone=False,
+                )
+                await channel.send(**send_kwargs)
             elif answer:
-                await channel.send(answer[:2000])
+                await channel.send(
+                    answer[:2000],
+                    allowed_mentions=discord.AllowedMentions(
+                        users=True, roles=False, everyone=False,
+                    ),
+                )
         except Exception:
             logger.exception("[scheduler] LLM execution failed for job %s", job['id'])
             try:
