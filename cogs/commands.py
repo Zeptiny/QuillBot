@@ -46,6 +46,7 @@ from cogs.utils import (
     fetch_recent_channel_context,
     fetch_turn_gap,
     history_tool_status,
+    ping_send_kwargs,
     run_tool_loop,
     split_response,
 )
@@ -117,9 +118,8 @@ _SCHEDULER_INSTRUCTIONS = (
     "  - Use `schedule_delete` para cancelar uma tarefa pelo ID.\n"
     "  - Para NOTIFICAR alguém na resposta, use a menção real no formato "
     "<@user_id> (os IDs aparecem como author_id nas mensagens do canal e em "
-    "memory_about). Menções dentro de embed não notificam — o agendador as "
-    "converte em ping real fora do embed. Nunca use @everyone, @here ou menções "
-    "de cargo.\n"
+    "memory_about). Menções dentro de embed não notificam — o bot as converte "
+    "em ping real fora do embed. Nunca use @everyone, @here ou menções de cargo.\n"
 ) if SCHEDULER_ENABLED else ""
 
 _DISCORD_FORMAT = (
@@ -584,11 +584,12 @@ class Commands(commands.Cog):
                 await interaction.edit_original_response(content=None)
             except discord.HTTPException:
                 pass
+            ping_kwargs = ping_send_kwargs(answer, interaction.guild)
             if len(embeds) == 1:
-                msg = await interaction.followup.send(embed=embeds[0], wait=True)
+                msg = await interaction.followup.send(wait=True, **ping_kwargs, embed=embeds[0])
             else:
                 msg = await interaction.followup.send(
-                    embed=embeds[0], view=PaginatedEmbedView(embeds), wait=True
+                    wait=True, **ping_kwargs, embed=embeds[0], view=PaginatedEmbedView(embeds)
                 )
             await self._store_new_conversation(
                 msg, question, answer, sources,
@@ -941,10 +942,13 @@ class Commands(commands.Cog):
                             prior_context=prior_context,
                         )
                         if len(embeds) == 1:
-                            reply = await message.reply(embed=embeds[0])
+                            reply = await message.reply(
+                                **ping_send_kwargs(answer, message.guild), embed=embeds[0]
+                            )
                         else:
                             reply = await message.reply(
-                                embed=embeds[0], view=PaginatedEmbedView(embeds)
+                                **ping_send_kwargs(answer, message.guild),
+                                embed=embeds[0], view=PaginatedEmbedView(embeds),
                             )
                         turn = make_turn(
                             follow_up_question, answer,
@@ -1087,9 +1091,14 @@ class Commands(commands.Cog):
                     context_message=message,
                 )
                 if len(embeds) == 1:
-                    reply = await message.reply(embed=embeds[0], mention_author=False)
+                    reply = await message.reply(
+                        mention_author=False, **ping_send_kwargs(answer, message.guild), embed=embeds[0]
+                    )
                 else:
-                    reply = await message.reply(embed=embeds[0], view=PaginatedEmbedView(embeds), mention_author=False)
+                    reply = await message.reply(
+                        mention_author=False, **ping_send_kwargs(answer, message.guild),
+                        embed=embeds[0], view=PaginatedEmbedView(embeds),
+                    )
                 await self._store_new_conversation(
                     reply, clean_question, answer, sources,
                     user=message.author,

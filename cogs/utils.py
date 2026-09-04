@@ -104,6 +104,24 @@ def extract_pingable_mentions(text: str, guild: discord.Guild | None, *, limit: 
     return ' '.join(f'<@{i}>' for i in picked)
 
 
+def ping_send_kwargs(text: str, guild: discord.Guild | None) -> dict:
+    """Send kwargs that turn mentions in LLM output *text* into real pings.
+
+    Mentions inside embeds never notify (Discord platform behavior) — the
+    extracted user pings ride as message ``content``.  everyone/roles stay
+    unparsable so no code path using this can ever ping @everyone.
+    """
+    kwargs: dict = {
+        'allowed_mentions': discord.AllowedMentions(
+            users=True, roles=False, everyone=False,
+        ),
+    }
+    mentions = extract_pingable_mentions(text, guild)
+    if mentions:
+        kwargs['content'] = mentions
+    return kwargs
+
+
 CHANNEL_HISTORY_TOOL = {
     'type': 'function',
     'function': {
