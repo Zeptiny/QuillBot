@@ -129,6 +129,13 @@ MEMORY_DEDUPE_THRESHOLD: Final[float] = float(os.getenv('MEMORY_DEDUPE_THRESHOLD
 # Legacy lore encyclopedia — kept only as the one-time migration source for memory.db
 LORE_DB_PATH: Final[str] = os.getenv('LORE_DB_PATH', 'data/lore.db')
 
+# --- Scheduler (cron / one-shot delayed tasks) ---
+SCHEDULER_ENABLED: Final[bool] = os.getenv('SCHEDULER_ENABLED', 'true').strip().lower() in ('1', 'true', 'yes')
+SCHEDULER_DB_PATH: Final[str] = os.getenv('SCHEDULER_DB_PATH', 'data/scheduler.db')
+SCHEDULER_LOOP_INTERVAL: Final[int] = int(os.getenv('SCHEDULER_LOOP_INTERVAL', '15'))
+SCHEDULER_MAX_JOBS_PER_GUILD: Final[int] = int(os.getenv('SCHEDULER_MAX_JOBS_PER_GUILD', '50'))
+SCHEDULER_MAX_PROMPT: Final[int] = int(os.getenv('SCHEDULER_MAX_PROMPT', '500'))
+
 # --- Rate Limiting (per-user) ---
 COOLDOWN_RATE: Final[int] = int(os.getenv('COOLDOWN_RATE', '1'))
 COOLDOWN_PER: Final[float] = float(os.getenv('COOLDOWN_PER', '30'))
