@@ -546,26 +546,24 @@ class Scheduler(commands.Cog, name='Scheduler'):
                 return
 
         is_once = job['type'] == 'once'
+        next_fire = None
+        if not is_once:
+            try:
+                cron = _parse_cron(job['cron_expr'])
+                next_fire = _next_fire(cron, _now())
+            except Exception:
+                logger.exception("[scheduler] failed to compute next_fire for job %s", job['id'])
+                return
+
         await asyncio.to_thread(
             self.store.mark_fired, job['guild_id'], job['id'],
-            next_fire=None, delete=is_once,
+            next_fire=next_fire.isoformat() if next_fire else None, delete=is_once,
         )
 
         try:
             await self._run_scheduled_prompt(job, guild, channel)
         except Exception:
             logger.exception("[scheduler] failed to fire job %s", job['id'])
-
-        if not is_once:
-            try:
-                cron = _parse_cron(job['cron_expr'])
-                nxt = _next_fire(cron, _now())
-                await asyncio.to_thread(
-                    self.store.update, job['guild_id'], job['id'],
-                    next_fire=nxt.isoformat(),
-                )
-            except Exception:
-                logger.exception("[scheduler] failed to recompute next_fire for job %s", job['id'])
 
     async def _run_scheduled_prompt(self, job: dict, guild: discord.Guild, channel):
         """Run the LLM on the job's prompt and post the result to the channel."""
