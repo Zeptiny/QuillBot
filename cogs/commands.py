@@ -13,14 +13,16 @@ from openai import AsyncOpenAI, RateLimitError
 from cogs import image_store
 from cogs.conversation_store import (
     ConversationStore,
-    add_participant,
+    add_participants,
     apply_cache_control,
     author_info,
     build_conversation_block,
     build_current_message,
     build_history_messages,
     cap_turns,
+    conversation_participant_ids,
     make_turn,
+    message_participant_infos,
 )
 from cogs.memory import MEMORY_ABOUT_TOOL, MEMORY_SEARCH_TOOL, MEMORY_WRITE_TOOL
 from cogs.scheduler import SCHEDULER_TOOLS
@@ -72,19 +74,6 @@ from config import (
 
 logger = logging.getLogger(__name__)
 
-
-def _conversation_participants(message: discord.Message) -> set[str]:
-    """User ids relevant to a message: author, mentions and reply target."""
-    ids = {str(message.author.id)}
-    for u in getattr(message, 'mentions', []):
-        if not u.bot:
-            ids.add(str(u.id))
-    ref = getattr(message, 'reference', None)
-    ref_msg = getattr(ref, 'resolved', None)
-    ref_author = getattr(ref_msg, 'author', None)
-    if ref_author is not None and not ref_author.bot:
-        ids.add(str(ref_author.id))
-    return ids
 
 _MEMORY_INSTRUCTIONS = (
     "- Você tem uma memória persistente: um bloco <memory> com lembranças "
@@ -634,6 +623,7 @@ class Commands(commands.Cog):
         message_id: str | int | None = None,
         reply_to: str | int | None = None,
         capture: dict | None = None,
+        participant_infos: list[dict] | None = None,
     ) -> None:
         """Persist a brand-new conversation anchored on the bot's reply message."""
         author = author_info(user)
@@ -656,13 +646,15 @@ class Commands(commands.Cog):
             'guild_id': str(getattr(guild, 'id', '') or ''),
             'guild_name': getattr(guild, 'name', '') or '',
         }
+        participants = [author] if author.get('id') else []
+        add_participants(participants, participant_infos or [])
         await self.store.create(
             str(reply_msg.id),
             guild_id=origin['guild_id'] or None,
             channel_id=origin['channel_id'] or None,
             data={
                 'turns': [turn],
-                'participants': [author] if author.get('id') else [],
+                'participants': participants,
                 'origin': origin,
                 'started_ts': ts,
             },
@@ -926,6 +918,10 @@ class Commands(commands.Cog):
                         if fresh:
                             conv = fresh
                         history = conv['data'].get('turns', []).copy()
+                        participant_infos = await message_participant_infos(message)
+                        participant_ids = conversation_participant_ids(
+                            conv['data'], participant_infos,
+                        )
                         prior_context = await fetch_turn_gap(message, history)
                         answer, embeds, sources, capture = await self._run_chat(
                             follow_up_question,
@@ -936,7 +932,7 @@ class Commands(commands.Cog):
                             channel=message.channel,
                             created_at=message.created_at,
                             reply_to=str(ref_id),
-                            participant_ids=_conversation_participants(message),
+                            participant_ids=participant_ids,
                             origin=message.jump_url,
                             context_message=message,
                             prior_context=prior_context,
@@ -966,7 +962,7 @@ class Commands(commands.Cog):
                         )
                         data = conv['data']
                         data['turns'] = cap_turns(history + [turn], CONVERSATIONS_MAX_TURNS)
-                        add_participant(data.setdefault('participants', []), author_info(message.author))
+                        add_participants(data.setdefault('participants', []), participant_infos)
                         await self.store.update(
                             conv['conv_id'], data, new_handle_msg_id=reply.id,
                         )
@@ -1076,6 +1072,7 @@ class Commands(commands.Cog):
         if not clean_question and all_image_urls:
             clean_question = 'Analise esta imagem.'
         self._followup_cd[user_id] = True
+        participant_infos = await message_participant_infos(message)
         logger.info("Processing @mention chat user=%s guild=%s question=%r ref=%s images=%d", message.author.id, message.guild.id if message.guild else None, clean_question[:80], bool(ref_context), len(all_image_urls))
         async with message.channel.typing():
             try:
@@ -1086,7 +1083,7 @@ class Commands(commands.Cog):
                     guild=message.guild,
                     channel=message.channel,
                     created_at=message.created_at,
-                    participant_ids=_conversation_participants(message),
+                    participant_ids={p['id'] for p in participant_infos if p.get('id')},
                     origin=message.jump_url,
                     context_message=message,
                 )
@@ -1108,6 +1105,7 @@ class Commands(commands.Cog):
                     images=all_image_urls,
                     message_id=message.id,
                     capture=capture,
+                    participant_infos=participant_infos,
                 )
             except RateLimitError:
                 await message.reply('⏳ Limite de requisições atingido. Tente novamente em alguns minutos.', mention_author=False)

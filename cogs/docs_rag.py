@@ -18,14 +18,16 @@ from openai import AsyncOpenAI, RateLimitError
 from cogs import image_store as _image_store
 from cogs.conversation_store import (
     ConversationStore as _ConversationStore,
-    add_participant as _add_participant,
+    add_participants as _add_participants,
     apply_cache_control as _apply_cache_control,
     author_info as _author_info,
     build_conversation_block as _build_conversation_block,
     build_current_message as _build_current_message,
     build_history_messages as _build_history_messages,
     cap_turns as _cap_turns,
+    conversation_participant_ids as _conversation_participant_ids,
     make_turn as _make_turn,
+    message_participant_infos as _message_participant_infos,
 )
 from cogs.memory import MEMORY_ABOUT_TOOL, MEMORY_SEARCH_TOOL, MEMORY_WRITE_TOOL
 from cogs.plugin_apis import HTTP_HEADERS as _HTTP_HEADERS
@@ -86,19 +88,6 @@ logger = logging.getLogger(__name__)
 
 MAX_TOOL_ROUNDS = 6  # Safety cap on tool-calling iterations
 
-
-def _conversation_participants(message: discord.Message) -> set[str]:
-    """User ids relevant to a message: author, mentions and reply target."""
-    ids = {str(message.author.id)}
-    for u in getattr(message, 'mentions', []):
-        if not u.bot:
-            ids.add(str(u.id))
-    ref = getattr(message, 'reference', None)
-    ref_msg = getattr(ref, 'resolved', None)
-    ref_author = getattr(ref_msg, 'author', None)
-    if ref_author is not None and not ref_author.bot:
-        ids.add(str(ref_author.id))
-    return ids
 
 _MEMORY_INSTRUCTIONS = (
     "- Você tem uma memória persistente: um bloco <memory> com lembranças relevantes é "
@@ -1466,6 +1455,7 @@ class DocsRAG(commands.Cog):
         spark_report: SparkReport | None = None,
         interaction: discord.Interaction | None = None,
         capture: dict | None = None,
+        participant_infos: list[dict] | None = None,
     ) -> None:
         """Persist a conversation exchange for follow-up replies."""
         user = interaction.user if interaction is not None else None
@@ -1490,13 +1480,15 @@ class DocsRAG(commands.Cog):
             'guild_id': str(getattr(guild, 'id', '') or ''),
             'guild_name': getattr(guild, 'name', '') or '',
         }
+        participants = [author] if author.get('id') else []
+        _add_participants(participants, participant_infos or [])
         await self.store.create(
             str(message.id),
             guild_id=origin['guild_id'] or None,
             channel_id=origin['channel_id'] or None,
             data={
                 'turns': [turn],
-                'participants': [author] if author.get('id') else [],
+                'participants': participants,
                 'origin': origin,
                 'started_ts': ts,
             },
@@ -1552,6 +1544,10 @@ class DocsRAG(commands.Cog):
                 if fresh:
                     conv = fresh
                 history = conv['data'].get('turns', []).copy()
+                participant_infos = await _message_participant_infos(message)
+                participant_ids = _conversation_participant_ids(
+                    conv['data'], participant_infos,
+                )
                 prior_context = await _fetch_turn_gap(message, history)
 
                 answer, embeds, sources, capture = await self._run_agent(
@@ -1564,7 +1560,7 @@ class DocsRAG(commands.Cog):
                     channel=message.channel,
                     created_at=message.created_at,
                     reply_to=str(ref_id),
-                    participant_ids=_conversation_participants(message),
+                    participant_ids=participant_ids,
                     origin=message.jump_url,
                     context_message=message,
                     prior_context=prior_context,
@@ -1592,7 +1588,7 @@ class DocsRAG(commands.Cog):
                 )
                 data = conv['data']
                 data['turns'] = _cap_turns(history + [turn], CONVERSATIONS_MAX_TURNS)
-                _add_participant(data.setdefault('participants', []), _author_info(message.author))
+                _add_participants(data.setdefault('participants', []), participant_infos)
                 await self.store.update(
                     conv['conv_id'], data, new_handle_msg_id=reply.id,
                 )

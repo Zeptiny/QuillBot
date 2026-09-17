@@ -202,6 +202,57 @@ def author_info(user: Any) -> dict:
     return {'id': str(getattr(user, 'id', '')), 'name': name, 'display': display}
 
 
+async def message_participant_infos(message: Any) -> list[dict]:
+    """Return the human users explicitly involved in a Discord message.
+
+    A reply target is fetched when Discord did not resolve it in the gateway
+    payload.  That makes memory scope independent of the message cache.
+    """
+    users = [getattr(message, 'author', None), *getattr(message, 'mentions', [])]
+    ref = getattr(message, 'reference', None)
+    ref_msg = getattr(ref, 'resolved', None)
+    ref_id = getattr(ref, 'message_id', None)
+    if ref_msg is None and ref_id:
+        fetch_message = getattr(getattr(message, 'channel', None), 'fetch_message', None)
+        if fetch_message is not None:
+            try:
+                ref_msg = await fetch_message(ref_id)
+            except Exception:
+                logger.debug('[conversation] could not resolve reply target %s', ref_id, exc_info=True)
+    if ref_msg is not None:
+        users.append(getattr(ref_msg, 'author', None))
+
+    infos: list[dict] = []
+    for user in users:
+        if user is None or getattr(user, 'bot', False):
+            continue
+        add_participant(infos, author_info(user))
+    return infos
+
+
+def conversation_participant_ids(data: dict | None, incoming: list[dict] | None = None) -> set[str]:
+    """Return the canonical participant ids for a shared conversation.
+
+    Older persisted conversations may not have a complete ``participants``
+    list, so derive author ids from their stored turns as a backwards-compatible
+    fallback.
+    """
+    data = data or {}
+    ids = {
+        str(p.get('id'))
+        for p in data.get('participants', [])
+        if isinstance(p, dict) and p.get('id')
+    }
+    for turn in data.get('turns', []):
+        author = turn.get('author') if isinstance(turn, dict) else None
+        if isinstance(author, dict) and author.get('id'):
+            ids.add(str(author['id']))
+    for info in incoming or []:
+        if isinstance(info, dict) and info.get('id'):
+            ids.add(str(info['id']))
+    return ids
+
+
 def make_turn(
     question: str,
     answer: str,
@@ -285,6 +336,12 @@ def add_participant(participants: list[dict], info: dict) -> None:
         'name': info.get('name', ''),
         'display': info.get('display', ''),
     })
+
+
+def add_participants(participants: list[dict], infos: list[dict]) -> None:
+    """Add all supplied users to a conversation's persisted participant list."""
+    for info in infos:
+        add_participant(participants, info)
 
 
 def _fmt_ts(ts: float | None) -> str:
