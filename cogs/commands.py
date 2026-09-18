@@ -23,6 +23,7 @@ from cogs.conversation_store import (
     conversation_participant_ids,
     make_turn,
     message_participant_infos,
+    select_image_refs,
 )
 from cogs.memory import MEMORY_ABOUT_TOOL, MEMORY_SEARCH_TOOL, MEMORY_WRITE_TOOL
 from cogs.scheduler import SCHEDULER_TOOLS
@@ -586,7 +587,7 @@ class Commands(commands.Cog):
                 guild=interaction.guild,
                 channel=interaction.channel,
                 created_at=interaction.created_at,
-                images=[image_url] if image_url else [],
+                images=capture.get('image_urls', [image_url] if image_url else []),
                 capture=capture,
             )
 
@@ -676,6 +677,7 @@ class Commands(commands.Cog):
         origin: str | None = None,
         context_message: discord.Message | None = None,
         prior_context: list[str] | None = None,
+        context_image_urls: list[str] | None = None,
     ) -> tuple[str, list[discord.Embed], list[dict], dict]:
         # Message layout is ordered for provider prefix caching: the system
         # prompt and replayed history stay byte-identical across follow-ups of
@@ -690,6 +692,7 @@ class Commands(commands.Cog):
             # past the window and bust the prefix cache.
             system_content += '\n\n' + build_conversation_block(history)
         context_blocks: list[str] = []
+        context_images = [u for u in (context_image_urls or []) if u]
         if user or guild or channel:
             try:
                 context_block = build_full_context_block(user or (interaction.user if interaction else None), guild or (interaction.guild if interaction else None), channel or (interaction.channel if interaction else None), created_at or (interaction.created_at if interaction else None))
@@ -718,7 +721,8 @@ class Commands(commands.Cog):
                     before=context_message,
                 )
                 if chan_ctx:
-                    context_blocks.append(chan_ctx)
+                    context_blocks.append(chan_ctx.text)
+                    context_images.extend(chan_ctx.images)
             except Exception:
                 logger.exception('Failed to build recent channel context')
         # Content-array format with an explicit cache_control breakpoint
@@ -749,6 +753,7 @@ class Commands(commands.Cog):
             prior_context=prior_context,
             channel_id=getattr(channel, 'id', None),
             context_blocks='\n\n'.join(context_blocks) or None,
+            context_image_urls=context_images,
         )
         messages.append(current_message)
 
@@ -866,9 +871,11 @@ class Commands(commands.Cog):
                 )
             )
 
+        current_image_refs, _ = select_image_refs(urls, context_images)
         return answer, embeds, sources, {
             'user_message': current_message,
             'trajectory': trajectory,
+            'image_urls': current_image_refs,
         }
 
     async def cog_app_command_error(
@@ -922,7 +929,9 @@ class Commands(commands.Cog):
                         participant_ids = conversation_participant_ids(
                             conv['data'], participant_infos,
                         )
-                        prior_context = await fetch_turn_gap(message, history)
+                        prior_context_result = await fetch_turn_gap(message, history)
+                        prior_context = prior_context_result.lines
+                        prior_context_images = prior_context_result.images
                         answer, embeds, sources, capture = await self._run_chat(
                             follow_up_question,
                             history=history,
@@ -936,6 +945,7 @@ class Commands(commands.Cog):
                             origin=message.jump_url,
                             context_message=message,
                             prior_context=prior_context,
+                            context_image_urls=prior_context_images,
                         )
                         if len(embeds) == 1:
                             reply = await message.reply(
@@ -953,7 +963,7 @@ class Commands(commands.Cog):
                             message_id=message.id,
                             channel_id=message.channel.id,
                             channel_name=getattr(message.channel, 'name', None),
-                            images=image_urls,
+                            images=capture.get('image_urls', image_urls),
                             sources=sources,
                             reply_to=ref_id,
                             prior_context=prior_context,
@@ -1102,7 +1112,7 @@ class Commands(commands.Cog):
                     guild=message.guild,
                     channel=message.channel,
                     created_at=message.created_at,
-                    images=all_image_urls,
+                    images=capture.get('image_urls', all_image_urls),
                     message_id=message.id,
                     capture=capture,
                     participant_infos=participant_infos,

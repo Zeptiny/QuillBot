@@ -28,6 +28,7 @@ from cogs.conversation_store import (
     conversation_participant_ids as _conversation_participant_ids,
     make_turn as _make_turn,
     message_participant_infos as _message_participant_infos,
+    select_image_refs as _select_image_refs,
 )
 from cogs.memory import MEMORY_ABOUT_TOOL, MEMORY_SEARCH_TOOL, MEMORY_WRITE_TOOL
 from cogs.plugin_apis import HTTP_HEADERS as _HTTP_HEADERS
@@ -1221,6 +1222,7 @@ class DocsRAG(commands.Cog):
         origin: str | None = None,
         context_message: discord.Message | None = None,
         prior_context: list[str] | None = None,
+        context_image_urls: list[str] | None = None,
     ) -> tuple[str, list[discord.Embed], list[dict], dict]:
         """Run the LLM with tool-calling in a loop until it produces a final answer.
 
@@ -1263,6 +1265,7 @@ class DocsRAG(commands.Cog):
         # replayed history byte-identical across follow-ups, making provider
         # prefix caching effective.
         context_blocks: list[str] = []
+        context_images = [u for u in (context_image_urls or []) if u]
         if MEMORY_ENABLED and guild is not None:
             mem_cog = self.bot.get_cog('Memory')
             if mem_cog is not None:
@@ -1285,7 +1288,8 @@ class DocsRAG(commands.Cog):
                     self.bot, channel, before=context_message,
                 )
                 if chan_ctx:
-                    context_blocks.append(chan_ctx)
+                    context_blocks.append(chan_ctx.text)
+                    context_images.extend(chan_ctx.images)
             except Exception:
                 logger.exception('Failed to build recent channel context for _run_agent')
 
@@ -1370,6 +1374,7 @@ class DocsRAG(commands.Cog):
             prior_context=prior_context,
             channel_id=getattr(channel, 'id', None),
             context_blocks='\n\n'.join(context_blocks) or None,
+            context_image_urls=context_images,
         )
         messages.append(current_message)
 
@@ -1441,9 +1446,11 @@ class DocsRAG(commands.Cog):
                 )
             )
 
+        current_image_refs, _ = _select_image_refs(urls, context_images)
         return answer, embeds, sources, {
             'user_message': current_message,
             'trajectory': trajectory,
+            'image_urls': current_image_refs,
         }
 
     async def _store_conversation(
@@ -1469,7 +1476,7 @@ class DocsRAG(commands.Cog):
             author=author, ts=ts,
             channel_id=getattr(channel, 'id', None),
             channel_name=getattr(channel, 'name', None),
-            images=[],
+            images=(capture or {}).get('image_urls', []),
             sources=sources,
             user_message=(capture or {}).get('user_message'),
             trajectory=(capture or {}).get('trajectory'),
@@ -1548,7 +1555,9 @@ class DocsRAG(commands.Cog):
                 participant_ids = _conversation_participant_ids(
                     conv['data'], participant_infos,
                 )
-                prior_context = await _fetch_turn_gap(message, history)
+                prior_context_result = await _fetch_turn_gap(message, history)
+                prior_context = prior_context_result.lines
+                prior_context_images = prior_context_result.images
 
                 answer, embeds, sources, capture = await self._run_agent(
                     follow_up_question,
@@ -1564,6 +1573,7 @@ class DocsRAG(commands.Cog):
                     origin=message.jump_url,
                     context_message=message,
                     prior_context=prior_context,
+                    context_image_urls=prior_context_images,
                 )
                 if len(embeds) == 1:
                     reply = await message.reply(embed=embeds[0])
@@ -1579,7 +1589,7 @@ class DocsRAG(commands.Cog):
                     message_id=message.id,
                     channel_id=message.channel.id,
                     channel_name=getattr(message.channel, 'name', None),
-                    images=image_urls,
+                    images=capture.get('image_urls', image_urls),
                     sources=sources,
                     reply_to=ref_id,
                     prior_context=prior_context,

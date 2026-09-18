@@ -6,12 +6,14 @@ import logging
 import re
 import unicodedata
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
 from typing import Any, Final
 from zoneinfo import ZoneInfo
 
 import discord
 from openai import AsyncOpenAI
 
+from cogs import image_store
 from config import (
     CHANNEL_CONTEXT_MESSAGES,
     CONVERSATIONS_GAP_MESSAGES,
@@ -402,6 +404,19 @@ def _fmt_dt_line(dt: datetime.datetime | None) -> str:
 # ---------------------------------------------------------------------------
 
 MESSAGE_LINE_MAX_CONTENT: Final[int] = 800
+CHANNEL_CONTEXT_MAX_IMAGES: Final[int] = 4
+
+
+@dataclass
+class ChannelContext:
+    """Textual channel context plus persisted images available to the model."""
+
+    text: str = ''
+    lines: list[str] = field(default_factory=list)
+    images: list[str] = field(default_factory=list)
+
+    def __bool__(self) -> bool:
+        return bool(self.text or self.lines or self.images)
 
 
 def _flatten(s: str) -> str:
@@ -598,7 +613,8 @@ async def fetch_channel_history(
     limit: int = 20,
     channel_id: str | None = None,
     before: discord.abc.Snowflake | None = None,
-) -> str:
+    include_images: bool = False,
+) -> str | ChannelContext:
     target = channel
     if channel_id:
         try:
@@ -615,22 +631,41 @@ async def fetch_channel_history(
         return "Histórico não disponível para este canal."
     limit = max(1, min(50, int(limit)))
     lines: list[str] = []
+    image_groups: list[list[str]] = []
+    stored_image_count = 0
     try:
         async for msg in target.history(limit=limit, before=before):
             lines.append(format_message_line(msg))
+            if include_images and stored_image_count < CHANNEL_CONTEXT_MAX_IMAGES:
+                attachments = [
+                    attachment for attachment in getattr(msg, 'attachments', [])
+                    if getattr(attachment, 'content_type', None)
+                    and attachment.content_type.startswith('image/')
+                ]
+                refs = await image_store.persist_images(
+                    attachments[:CHANNEL_CONTEXT_MAX_IMAGES - stored_image_count]
+                )
+                if refs:
+                    image_groups.append(refs)
+                    stored_image_count += len(refs)
     except discord.Forbidden:
         return "Sem permissão para ler histórico deste canal."
     except Exception as e:
         logger.exception("fetch_channel_history failed")
         return f"Erro ao buscar histórico: {e}"
     if not lines:
-        return "Nenhuma mensagem encontrada no histórico."
+        empty = "Nenhuma mensagem encontrada no histórico."
+        return ChannelContext(text=empty) if include_images else empty
     lines.reverse()
     header = (
         f"Histórico de #{getattr(target, 'name', target.id)} "
         f"(channel_id={target.id}) — últimas {len(lines)} mensagens, cronológica:\n"
     )
-    return header + "\n".join(lines)
+    text = header + "\n".join(lines)
+    if not include_images:
+        return text
+    images = [ref for group in reversed(image_groups) for ref in group]
+    return ChannelContext(text=text, lines=lines, images=images)
 
 
 async def fetch_recent_channel_context(
@@ -639,18 +674,27 @@ async def fetch_recent_channel_context(
     *,
     before: discord.abc.Snowflake | None = None,
     limit: int | None = None,
-) -> str | None:
+) -> ChannelContext | None:
     """Latest channel messages as auto-injected LLM context.
 
     Controlled by ``CHANNEL_CONTEXT_MESSAGES`` (0 disables). Returns ``None``
-    when disabled or without a readable channel. ``before`` excludes the
-    triggering message from the window (mention/follow-up flows).
+    when disabled or without a readable channel. Image attachments are
+    persisted and returned separately from the formatted text. ``before``
+    excludes the triggering message from the window (mention/follow-up flows).
     """
     n = CHANNEL_CONTEXT_MESSAGES if limit is None else limit
     if n <= 0 or channel is None:
         return None
-    text = await fetch_channel_history(bot, channel, limit=n, before=before)
-    return f"<mensagens_recentes_do_canal>\n{text}\n</mensagens_recentes_do_canal>"
+    context = await fetch_channel_history(
+        bot, channel, limit=n, before=before, include_images=True,
+    )
+    if not isinstance(context, ChannelContext):
+        context = ChannelContext(text=context)
+    return ChannelContext(
+        text=f"<mensagens_recentes_do_canal>\n{context.text}\n</mensagens_recentes_do_canal>",
+        lines=context.lines,
+        images=context.images,
+    )
 
 
 async def fetch_channel_gap(
@@ -660,7 +704,7 @@ async def fetch_channel_gap(
     before: discord.abc.Snowflake,
     skip_ids: set[str] | None = None,
     limit: int | None = None,
-) -> list[str]:
+) -> ChannelContext:
     """Human channel messages between a stored turn and a new follow-up.
 
     Anchors on the previous bot-directed turn's message id and returns the
@@ -669,19 +713,21 @@ async def fetch_channel_gap(
     ``before`` and stops at the anchor id, so nothing older than the previous
     turn leaks in; only human messages consume the budget, so truncation keeps
     the NEWEST chatter lines. Controlled by ``CONVERSATIONS_GAP_MESSAGES``
-    (0 disables). Returns [] on failure — the recent-channel window is then
-    the fallback.
+    (0 disables). Returns an empty context on failure — the recent-channel
+    window is then the fallback.
     """
     n = CONVERSATIONS_GAP_MESSAGES if limit is None else limit
     if n <= 0 or channel is None or not hasattr(channel, "history"):
-        return []
+        return ChannelContext()
     try:
         anchor = discord.Object(id=int(after_id))
     except (TypeError, ValueError):
-        return []
+        return ChannelContext()
     skip = {str(s) for s in (skip_ids or set()) if s}
     skip.add(str(after_id))
     lines: list[str] = []
+    image_groups: list[list[str]] = []
+    stored_image_count = 0
     try:
         async for msg in channel.history(limit=max(n * 3, 100), before=before):
             if msg.id <= anchor.id:
@@ -691,23 +737,36 @@ async def fetch_channel_gap(
             if not msg.content and not msg.attachments and not msg.embeds:
                 continue
             lines.append(format_message_line(msg))
+            if stored_image_count < CHANNEL_CONTEXT_MAX_IMAGES:
+                attachments = [
+                    attachment for attachment in getattr(msg, 'attachments', [])
+                    if getattr(attachment, 'content_type', None)
+                    and attachment.content_type.startswith('image/')
+                ]
+                refs = await image_store.persist_images(
+                    attachments[:CHANNEL_CONTEXT_MAX_IMAGES - stored_image_count]
+                )
+                if refs:
+                    image_groups.append(refs)
+                    stored_image_count += len(refs)
             if len(lines) >= n:
                 break
     except Exception:
         logger.exception("fetch_channel_gap failed")
-        return []
+        return ChannelContext()
     lines.reverse()
-    return lines
+    images = [ref for group in reversed(image_groups) for ref in group]
+    return ChannelContext(text="\n".join(lines), lines=lines, images=images)
 
 
-async def fetch_turn_gap(message: discord.Message, history: list[dict]) -> list[str]:
+async def fetch_turn_gap(message: discord.Message, history: list[dict]) -> ChannelContext:
     """Channel chatter since the previous bot-directed turn (same channel only)."""
     last_turn = history[-1] if history else None
     anchor_id = (last_turn or {}).get('message_id')
     if not anchor_id:
-        return []
+        return ChannelContext()
     if last_turn.get('channel_id') and str(last_turn['channel_id']) != str(message.channel.id):
-        return []
+        return ChannelContext()
     return await fetch_channel_gap(
         message.channel,
         after_id=anchor_id,

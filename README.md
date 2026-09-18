@@ -219,7 +219,7 @@ Replay windows advance in `CONVERSATIONS_TRAJECTORY_STEP`-turn steps (hysteresis
 ### Context Injection
 Every AI call receives a `<contexto>` block with user (display name, account age, join date, roles), guild (name, member count, channels, roles), channel, and temporal (BRT + UTC) context.
 
-When `CHANNEL_CONTEXT_MESSAGES` > 0 (default `10`), `/ask`, `/chat`, @mention and reply follow-ups also receive a `<mensagens_recentes_do_canal>` block — the latest N channel messages in chronological order, same format as the `get_channel_history` tool. The triggering message is excluded; set `0` to disable. Reply follow-ups use the captured gap block (`prior_context`, see `CONVERSATIONS_GAP_MESSAGES`) instead of this recent-channel window whenever a gap was captured.
+When `CHANNEL_CONTEXT_MESSAGES` > 0 (default `10`), `/ask`, `/chat`, @mention and reply follow-ups also receive a `<mensagens_recentes_do_canal>` block — the latest N channel messages in chronological order, same format as the `get_channel_history` tool. Image attachments in that context are persisted and sent as vision parts, up to the four-image per-message budget (current-message images take priority); filenames remain visible in the text context. The triggering message is excluded; set `0` to disable. Reply follow-ups use the captured gap block (`prior_context`, see `CONVERSATIONS_GAP_MESSAGES`) instead of this recent-channel window whenever a gap was captured, including images from those gap messages.
 
 ### Prefix-Cache-Friendly Message Layout
 The LLM message list is ordered so conversation follow-ups reuse a cached prefix: `[system (persona + static conversation summary)] → [replayed history turns] → [current message]`. All per-request blocks — `<contexto>` (clock), the semantically-selected memory block, and the recent channel window — ride on the **final user message** instead of the system prompt, so the system prompt + history stay byte-identical across turns and providers can prefix-cache them (typically 80–95% input-token savings on cached prefixes).
@@ -342,7 +342,7 @@ cp .env.example .env   # if available, otherwise create .env manually
 | `WEB_SEARCH_ENABLED` | `true` | Enable Tavily web search |
 | `TAVILY_API_KEY` | — | Required when web search is enabled |
 | `CHAT_MENTION_ENABLED` | `true` | Enable @mention chat mode |
-| `CHANNEL_CONTEXT_MESSAGES` | `10` | Latest channel messages auto-injected as context into `/ask`, `/chat`, @mention and reply follow-ups (`0` disables) |
+| `CHANNEL_CONTEXT_MESSAGES` | `10` | Latest channel messages auto-injected as text and vision context into `/ask`, `/chat`, @mention and reply follow-ups (`0` disables) |
 | `HISTORY_ENABLED` | `true` | Enable server history RAG |
 | `MEMORY_ENABLED` | `true` | Enable persistent memory (cog not loaded when false) |
 | `LOG_LEVEL` | `INFO` | Python logging level |
@@ -415,7 +415,7 @@ cp .env.example .env   # if available, otherwise create .env manually
 | `CONVERSATIONS_MAX_STORED` | `200` | Max conversations kept per flow (chat/ask) |
 | `CONVERSATIONS_MAX_TURNS` | `24` | Max turns stored per conversation |
 | `CONVERSATIONS_HISTORY_TURNS` | `16` | Turns replayed to the LLM per request |
-| `CONVERSATIONS_GAP_MESSAGES` | `20` | Max channel messages captured between two bot-directed turns as `prior_context` (`0` disables) |
+| `CONVERSATIONS_GAP_MESSAGES` | `20` | Max channel messages captured between two bot-directed turns as text and vision `prior_context` (`0` disables) |
 | `CONVERSATIONS_TRAJECTORY_ENABLED` | `true` | Capture and replay the internal LLM trajectory (tool calls/results + exact user message) per turn |
 | `CONVERSATIONS_TRAJECTORY_TURNS` | `6` | Most recent N turns replayed **verbatim** with their trajectory (older turns use the compact Q/A rendering) |
 | `CONVERSATIONS_TRAJECTORY_STEP` | `3` | Window advances in steps of N turns — prefix-cache hysteresis so the replayed prefix only changes at deliberate boundaries |

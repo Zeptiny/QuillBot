@@ -398,6 +398,23 @@ def _append_image_marker(text: str, count: int) -> str:
     return f'{text}\n\n{marker}' if text else marker
 
 
+def select_image_refs(
+    image_urls: list[str] | None = None,
+    context_image_urls: list[str] | None = None,
+) -> tuple[list[str], int]:
+    """Select current images first, then context images, within the turn budget."""
+    current_images = [u for u in (image_urls or []) if u]
+    context_images = [u for u in (context_image_urls or []) if u]
+    selected = current_images[:4]
+    context_capacity = max(0, 4 - len(selected))
+    selected.extend(context_images[:context_capacity])
+    dropped = (
+        max(0, len(current_images) - 4)
+        + max(0, len(context_images) - context_capacity)
+    )
+    return selected, dropped
+
+
 def _replay_verbatim_turn(turn: dict, image_budget: int) -> tuple[list[dict], int] | None:
     """Rebuild the exact messages of a captured turn, or ``None`` to fall back.
 
@@ -544,15 +561,18 @@ def build_current_message(
     prior_context: list[str] | None = None,
     channel_id: str | int | None = None,
     context_blocks: str | None = None,
+    context_image_urls: list[str] | None = None,
 ) -> dict:
     """Build the current user message, attributed when part of a conversation.
 
     ``context_blocks`` carries per-request context (current time/place, memory
-    selection, recent channel window). Keeping it in the *tail* message —
+    selection, recent channel window), while ``context_image_urls`` carries
+    persisted images from that context. Keeping both in the *tail* message —
     instead of the system prompt — leaves the history prefix byte-identical
     across follow-ups, which makes provider prefix caching effective.
     """
-    images = [u for u in (image_urls or []) if u][:4]
+    images, dropped = select_image_refs(image_urls, context_image_urls)
+    inline: list[dict] = []
     parts: list[dict] | None = None
     head = (f"{context_blocks}\n\n" if context_blocks else '') + _prior_context_head(
         [l for l in (prior_context or []) if l], channel_id
@@ -569,11 +589,12 @@ def build_current_message(
     elif head:
         text = f"{head}{question}"
     if images:
-        inline, dropped = _split_images(images)
-        if dropped:
-            text = _append_image_marker(text, dropped)
-        if inline:
-            parts = [{'type': 'text', 'text': text}, *inline]
+        inline, missing = _split_images(images)
+        dropped += missing
+    if dropped:
+        text = _append_image_marker(text, dropped)
+    if inline:
+        parts = [{'type': 'text', 'text': text}, *inline]
     if parts is not None:
         return {'role': 'user', 'content': parts}
     return {'role': 'user', 'content': text}
