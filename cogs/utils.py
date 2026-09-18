@@ -353,7 +353,7 @@ SQL_HISTORY_TOOL = {
             'por mês: GROUP BY substr(c.ts,1,7); por hora: GROUP BY substr(c.ts,12,2); '
             "FTS5: MATCH '\"frase exata\" AND (a OR b) NOT c', prefixo 'palavra*'; "
             'REGEXP(padrão, texto) e REGEXP sempre com re.IGNORECASE; '
-            'data: compare c.ts como texto ISO ou use datetime(c.ts). Sempre termine com LIMIT.'
+            'data: compare c.ts como texto ISO ou use datetime(c.ts).'
         ),
         'parameters': {
             'type': 'object',

@@ -275,6 +275,7 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
         self._msg_index: dict[int, dict[int, int]] = {}
         self._queue: asyncio.Queue = asyncio.Queue()
         self._worker_task: asyncio.Task | None = None
+        self._fts_health_checked = False
 
     def _get_local_model(self):
         if self._local_model is not None:
@@ -314,6 +315,67 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
 
     def _db_path(self) -> str:
         return HISTORY_DB_PATH
+
+    @staticmethod
+    def _create_fts_schema(con: sqlite3.Connection) -> bool:
+        """Create the derived FTS5 table and its chunk-delete trigger."""
+        try:
+            con.execute("""
+            CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+                msg_id UNINDEXED, guild_id UNINDEXED, chunk_text, content, tokenize='porter unicode61'
+            )""")
+            con.execute("CREATE TRIGGER IF NOT EXISTS chunks_fts_delete AFTER DELETE ON chunks BEGIN DELETE FROM chunks_fts WHERE msg_id=old.msg_id; END;")
+            return True
+        except sqlite3.Error:
+            logger.warning("FTS5 not available, keyword search will fallback to substring", exc_info=True)
+            return False
+
+    def _rebuild_fts_index(self, con: sqlite3.Connection) -> bool:
+        """Recreate the derived FTS index from canonical ``chunks`` rows."""
+        con.execute("SAVEPOINT rebuild_chunks_fts")
+        try:
+            con.execute("DROP TRIGGER IF EXISTS chunks_fts_delete")
+            try:
+                con.execute("DROP TABLE IF EXISTS chunks_fts")
+            except sqlite3.Error:
+                # A malformed FTS shadow table can prevent xDestroy from
+                # opening the virtual table. Remove its physical shadow tables
+                # and stale sqlite_master entry, then recreate it cleanly.
+                for shadow in (
+                    "chunks_fts_config",
+                    "chunks_fts_content",
+                    "chunks_fts_data",
+                    "chunks_fts_docsize",
+                    "chunks_fts_idx",
+                ):
+                    try:
+                        con.execute(f"DROP TABLE IF EXISTS {shadow}")
+                    except sqlite3.Error:
+                        pass
+                schema_version = con.execute("PRAGMA schema_version").fetchone()[0]
+                con.execute("PRAGMA writable_schema=ON")
+                try:
+                    con.execute("DELETE FROM sqlite_master WHERE type='table' AND name='chunks_fts'")
+                finally:
+                    con.execute("PRAGMA writable_schema=OFF")
+                con.execute(f"PRAGMA schema_version={schema_version + 1}")
+            if not self._create_fts_schema(con):
+                raise sqlite3.OperationalError("FTS5 is unavailable")
+            con.execute("""
+                INSERT INTO chunks_fts (msg_id, guild_id, chunk_text, content)
+                SELECT msg_id, guild_id, chunk_text, content FROM chunks
+            """)
+            con.execute("RELEASE rebuild_chunks_fts")
+            logger.warning("Rebuilt FTS5 index from chunks after an FTS health-check failure")
+            return True
+        except sqlite3.Error:
+            try:
+                con.execute("ROLLBACK TO rebuild_chunks_fts")
+                con.execute("RELEASE rebuild_chunks_fts")
+            except sqlite3.Error:
+                pass
+            logger.exception("Failed rebuilding FTS5 index")
+            return False
 
     def _ensure_db(self):
         path = self._db_path()
@@ -359,14 +421,15 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
             # indexed message-context window queries (else both full-scan the guild).
             con.execute("CREATE INDEX IF NOT EXISTS idx_guild_author_chan ON chunks(guild_id, author_id, channel_name)")
             con.execute("CREATE INDEX IF NOT EXISTS idx_guild_chan_ts ON chunks(guild_id, channel_id, ts)")
-            try:
-                con.execute("""
-                CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
-                    msg_id UNINDEXED, guild_id UNINDEXED, chunk_text, content, tokenize='porter unicode61'
-                )""")
-                con.execute("CREATE TRIGGER IF NOT EXISTS chunks_fts_delete AFTER DELETE ON chunks BEGIN DELETE FROM chunks_fts WHERE msg_id=old.msg_id; END;")
-            except Exception:
-                logger.warning("FTS5 not available, keyword search will fallback to substring")
+            if self._create_fts_schema(con) and not self._fts_health_checked:
+                try:
+                    # Opening the virtual table catches malformed FTS shadow data
+                    # that CREATE ... IF NOT EXISTS does not validate.
+                    con.execute("SELECT 1 FROM chunks_fts LIMIT 1").fetchone()
+                    self._fts_health_checked = True
+                except sqlite3.Error:
+                    logger.warning("FTS5 health check failed; rebuilding the derived index", exc_info=True)
+                    self._fts_health_checked = self._rebuild_fts_index(con)
             con.execute("""
             CREATE TABLE IF NOT EXISTS authors (
                 guild_id INTEGER NOT NULL,

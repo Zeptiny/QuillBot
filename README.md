@@ -371,7 +371,7 @@ cp .env.example .env   # if available, otherwise create .env manually
 | `HISTORY_HYBRID_WEIGHT_KEYWORD` | `0.35` | Keyword (FTS5) weight of the hybrid blend |
 | `HISTORY_RRF_K` | `60` | Reciprocal-rank-fusion constant |
 | `HISTORY_SQL_TOOL_ENABLED` | `true` | Enable the read-only `sql_history` LLM tool |
-| `HISTORY_SQL_TIMEOUT_SECONDS` | `5` | Query timeout enforced by the SQLite progress handler |
+| `HISTORY_SQL_TIMEOUT_SECONDS` | `30` | Query timeout enforced by the SQLite progress handler |
 | `HISTORY_SQL_MAX_ROWS` | `200` | Max rows returned / shown to the LLM |
 
 ### Vision Images
