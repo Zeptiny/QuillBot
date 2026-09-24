@@ -88,6 +88,7 @@ from config import (
 logger = logging.getLogger(__name__)
 
 MAX_TOOL_ROUNDS = 6  # Safety cap on tool-calling iterations
+_SPARK_REPORT_CACHE_SIZE = 32  # Parsed Spark reports kept for follow-ups
 
 
 _MEMORY_INSTRUCTIONS = (
@@ -459,8 +460,12 @@ class DocsRAG(commands.Cog):
             ttl_seconds=CONVERSATIONS_TTL_SECONDS,
             max_stored=CONVERSATIONS_MAX_STORED,
         )
-        # Spark reports are too heavy to persist — kept in memory per conversation
-        self._spark_by_conv: dict[str, SparkReport] = {}
+        # Spark reports are too heavy to persist — kept in memory per conversation.
+        # Bounded and expiring with the conversation TTL (each follow-up re-sets
+        # the entry, refreshing it) so parsed reports never pile up in RAM.
+        self._spark_by_conv: TTLCache = TTLCache(
+            maxsize=_SPARK_REPORT_CACHE_SIZE, ttl=CONVERSATIONS_TTL_SECONDS,
+        )
         # Per-user follow-up cooldown (same period as slash commands)
         self._followup_cd: TTLCache = TTLCache(maxsize=500, ttl=COOLDOWN_PER)
 
@@ -831,7 +836,8 @@ class DocsRAG(commands.Cog):
             self._indexing = False
 
     async def _index_docs_inner(self, sources: list[dict] | None = None):
-        sources_to_index = sources if sources is not None else DOC_SOURCES
+        partial = sources is not None
+        sources_to_index = sources if partial else DOC_SOURCES
         logger.info(
             "Indexing %d documentation source(s)...",
             len(sources_to_index),
@@ -843,17 +849,19 @@ class DocsRAG(commands.Cog):
         source_results = await asyncio.gather(*source_tasks, return_exceptions=True)
 
         all_chunks = []
-        indexed_labels: list[str] = []
+        failed_labels: set[str] = set()
         for src, result in zip(sources_to_index, source_results, strict=True):
-            if isinstance(result, Exception):
+            if isinstance(result, BaseException):
                 logger.error("Error indexing source '%s': %s", src['label'], result)
+                failed_labels.add(src['label'])
+            elif not result:
+                # Nothing fetched (GitHub outage, rate limit): treat as a
+                # failure so the source keeps its previous chunks.
+                failed_labels.add(src['label'])
             else:
                 all_chunks.extend(result)
-                indexed_labels.append(src['label'])
 
         logger.info("Total chunks before embedding: %d", len(all_chunks))
-        if not all_chunks:
-            return
 
         # Generate embeddings in batches
         batch_size = 20
@@ -862,50 +870,76 @@ class DocsRAG(commands.Cog):
             texts = [c['content'] for c in batch]
             try:
                 embeddings = await self._embed_batch(texts)
+                if len(embeddings) != len(batch):
+                    raise ValueError(f'{len(embeddings)} embeddings for {len(batch)} chunks')
                 for chunk, emb in zip(batch, embeddings):
                     chunk['embedding'] = emb
             except Exception:
                 logger.exception("Failed to embed batch %d", i // batch_size)
+                failed_labels.update(c['source'] for c in batch)
 
-        self.chunks = [c for c in all_chunks if 'embedding' in c]
-        logger.info("Documentation indexed: %d chunks with embeddings", len(self.chunks))
+        # A source is replaced only when every one of its chunks embedded;
+        # otherwise its previous chunks stay, so a flaky run (or a single-source
+        # /reindex) never shrinks the rest of the index.
+        replaced = {src['label'] for src in sources_to_index} - failed_labels
+        if failed_labels:
+            logger.warning(
+                "Doc source(s) failed to index, keeping their previous chunks: %s",
+                ', '.join(sorted(failed_labels)),
+            )
+        new_chunks = [c for c in all_chunks if c['source'] in replaced]
+        if not new_chunks:
+            logger.warning("Reindex produced no usable chunks; existing index left untouched")
+            return
         # The float32 matrix is the single source of truth for embeddings:
         # pop() the per-chunk copies (Python-float lists cost ~8x the matrix).
-        self._emb_matrix = np.array(
-            [c.pop('embedding') for c in self.chunks], dtype=np.float32
+        new_matrix = np.array([c.pop('embedding') for c in new_chunks], dtype=np.float32)
+
+        # Carry over every chunk whose source was not replaced — except, on a
+        # full reindex, sources that were removed from DOC_SOURCES.
+        configured = {src['label'] for src in DOC_SOURCES}
+        keep_idx = [
+            i for i, c in enumerate(self.chunks)
+            if c.get('source') not in replaced and (partial or c.get('source') in configured)
+        ]
+        kept_chunks = [self.chunks[i] for i in keep_idx]
+        kept_matrix: np.ndarray | None = None
+        if keep_idx and self._emb_matrix is not None:
+            kept_matrix = self._emb_matrix[np.array(keep_idx)]
+            if kept_matrix.ndim != 2 or kept_matrix.shape[1] != new_matrix.shape[1]:
+                logger.warning(
+                    "Dropping %d carried-over chunks: embedding width changed (%s -> %s)",
+                    len(kept_chunks), kept_matrix.shape, new_matrix.shape,
+                )
+                kept_chunks, kept_matrix = [], None
+        self.chunks = kept_chunks + new_chunks
+        self._emb_matrix = new_matrix if kept_matrix is None else np.vstack([kept_matrix, new_matrix])
+        logger.info(
+            "Documentation indexed: %d new chunks (%s), %d carried over, %d total",
+            len(new_chunks), ', '.join(sorted(replaced)), len(kept_chunks), len(self.chunks),
         )
 
-        # Track per-source SHAs and timestamps
-        if sources is not None:
-            # Partial reindex: update only the requested sources
-            for src in sources_to_index:
-                label = src['label']
-                url = f'https://api.github.com/repos/{src["repo"]}/commits/{src["branch"]}'
-                try:
-                    async with self.session.get(url) as resp:
-                        if resp.status == 200:
-                            data = await resp.json()
-                            self._source_shas[label] = data.get('sha', '')
-                except Exception:
-                    logger.exception("Failed to fetch commit SHA for %s", label)
-                self._source_last_index[label] = __import__('time').monotonic()
-        else:
-            # Full reindex: update all sources and composite SHA
-            self._last_commit_sha = await self._get_composite_sha()
-            for src in DOC_SOURCES:
-                label = src['label']
-                sha = self._source_shas.get(label, '')
-                if not sha:
-                    url = f'https://api.github.com/repos/{src["repo"]}/commits/{src["branch"]}'
-                    try:
-                        async with self.session.get(url) as resp:
-                            if resp.status == 200:
-                                data = await resp.json()
-                                sha = data.get('sha', '')
-                                self._source_shas[label] = sha
-                    except Exception:
-                        logger.exception("Failed to fetch commit SHA for %s", label)
-                self._source_last_index[label] = __import__('time').monotonic()
+        # Track per-source SHAs and wall-clock index times (shown by /health)
+        now = time.time()
+        for src in sources_to_index:
+            label = src['label']
+            if label not in replaced:
+                continue
+            url = f'https://api.github.com/repos/{src["repo"]}/commits/{src["branch"]}'
+            try:
+                async with self.session.get(url) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        self._source_shas[label] = data.get('sha', '')
+            except Exception:
+                logger.exception("Failed to fetch commit SHA for %s", label)
+            self._source_last_index[label] = now
+        if not partial:
+            if failed_labels:
+                # Leave the composite SHA stale so the periodic check retries.
+                logger.warning("Composite SHA not advanced: failed sources will be retried")
+            else:
+                self._last_commit_sha = await self._get_composite_sha()
 
         await asyncio.to_thread(self._save_vectors)
 
@@ -1446,11 +1480,12 @@ class DocsRAG(commands.Cog):
                 )
             )
 
-        current_image_refs, _ = _select_image_refs(urls, context_images)
+        image_refs, context_image_refs, _ = _select_image_refs(urls, context_images)
         return answer, embeds, sources, {
             'user_message': current_message,
             'trajectory': trajectory,
-            'image_urls': current_image_refs,
+            'image_urls': image_refs,
+            'context_image_urls': context_image_refs,
         }
 
     async def _store_conversation(
@@ -1480,6 +1515,7 @@ class DocsRAG(commands.Cog):
             sources=sources,
             user_message=(capture or {}).get('user_message'),
             trajectory=(capture or {}).get('trajectory'),
+            context_images=(capture or {}).get('context_image_urls'),
         )
         origin = {
             'channel_id': str(getattr(channel, 'id', '') or ''),
@@ -1595,6 +1631,7 @@ class DocsRAG(commands.Cog):
                     prior_context=prior_context,
                     user_message=capture.get('user_message'),
                     trajectory=capture.get('trajectory'),
+                    context_images=capture.get('context_image_urls'),
                 )
                 data = conv['data']
                 data['turns'] = _cap_turns(history + [turn], CONVERSATIONS_MAX_TURNS)

@@ -268,8 +268,13 @@ def make_turn(
     prior_context: list[str] | None = None,
     user_message: dict | None = None,
     trajectory: list[dict] | None = None,
+    context_images: list[str] | None = None,
 ) -> dict:
     """Build a single conversation turn record.
+
+    ``images`` are the user's own images; ``context_images`` are channel images
+    that were inlined alongside them. They are stored apart so verbatim replay
+    re-sends both, while only the user's are ever described as shared by them.
 
     ``user_message`` is the exact message dict sent to the LLM for this turn
     (only its text is kept — images are re-inlined from their stored refs, so
@@ -298,6 +303,9 @@ def make_turn(
         'reply_to': str(reply_to) if reply_to else None,
         'prior_context': [l for l in (prior_context or []) if l][:max(30, CONVERSATIONS_GAP_MESSAGES)],
     }
+    context_refs = [u for u in (context_images or []) if u][:image_store.MAX_IMAGES_PER_TURN]
+    if context_refs:
+        turn['context_images'] = context_refs
     captured_text = message_text(user_message)
     if captured_text:
         turn['user_message'] = captured_text
@@ -398,21 +406,35 @@ def _append_image_marker(text: str, count: int) -> str:
     return f'{text}\n\n{marker}' if text else marker
 
 
+def _newest(images: list[str], count: int) -> list[str]:
+    """The last *count* items of a chronological list (``[]`` when count <= 0)."""
+    return images[max(0, len(images) - count):] if count > 0 else []
+
+
 def select_image_refs(
     image_urls: list[str] | None = None,
     context_image_urls: list[str] | None = None,
-) -> tuple[list[str], int]:
-    """Select current images first, then context images, within the turn budget."""
+) -> tuple[list[str], list[str], int]:
+    """Select current images first, then context images, within the turn budget.
+
+    Returns ``(current, context, current_dropped)``. Context images are
+    chronological, so the newest ones are kept — the image right above the
+    question is the one most likely being asked about. Only the user's own
+    images count as dropped: channel images over budget are simply omitted
+    (the context text still lists them as ``[anexo:…]``), so the model is never
+    told the user shared images they did not.
+    """
+    limit = image_store.MAX_IMAGES_PER_TURN
     current_images = [u for u in (image_urls or []) if u]
     context_images = [u for u in (context_image_urls or []) if u]
-    selected = current_images[:4]
-    context_capacity = max(0, 4 - len(selected))
-    selected.extend(context_images[:context_capacity])
-    dropped = (
-        max(0, len(current_images) - 4)
-        + max(0, len(context_images) - context_capacity)
-    )
-    return selected, dropped
+    current = current_images[:limit]
+    context = _newest(context_images, limit - len(current))
+    return current, context, max(0, len(current_images) - limit)
+
+
+def _ref_list(raw: Any) -> list[str]:
+    """Non-empty string refs from a stored image list (tolerates corrupt data)."""
+    return [u for u in raw if isinstance(u, str) and u] if isinstance(raw, list) else []
 
 
 def _replay_verbatim_turn(turn: dict, image_budget: int) -> tuple[list[dict], int] | None:
@@ -429,12 +451,16 @@ def _replay_verbatim_turn(turn: dict, image_budget: int) -> tuple[list[dict], in
     text = turn.get('user_message')
     if not isinstance(text, str) or not text.strip():
         return None
-    raw_images = turn.get('images')
-    images = [u for u in raw_images if isinstance(u, str) and u] if isinstance(raw_images, list) else []
-    inline, _ = _split_images(images[:max(0, image_budget)])
-    dropped = len(images) - len(inline)
-    if dropped:
-        text = _append_image_marker(text, dropped)
+    images = _ref_list(turn.get('images'))
+    context_images = _ref_list(turn.get('context_images'))
+    budget = max(0, image_budget)
+    user_inline, _ = _split_images(images[:budget])
+    context_inline, _ = _split_images(_newest(context_images, budget - len(user_inline)))
+    inline = user_inline + context_inline
+    if len(images) > len(user_inline):
+        text = _append_image_marker(text, len(images) - len(user_inline))
+    if len(context_images) > len(context_inline):
+        text = f'{text}\n\n{image_store.context_image_marker(len(context_images) - len(context_inline))}'
     if inline:
         user_msg: dict = {'role': 'user', 'content': [{'type': 'text', 'text': text}, *inline]}
     else:
@@ -571,7 +597,7 @@ def build_current_message(
     instead of the system prompt — leaves the history prefix byte-identical
     across follow-ups, which makes provider prefix caching effective.
     """
-    images, dropped = select_image_refs(image_urls, context_image_urls)
+    current_images, context_images, dropped = select_image_refs(image_urls, context_image_urls)
     inline: list[dict] = []
     parts: list[dict] | None = None
     head = (f"{context_blocks}\n\n" if context_blocks else '') + _prior_context_head(
@@ -588,9 +614,18 @@ def build_current_message(
         text = f"{head}[{' • '.join(meta)}]\n{question}"
     elif head:
         text = f"{head}{question}"
-    if images:
-        inline, missing = _split_images(images)
-        dropped += missing
+    if current_images or context_images:
+        current_inline, current_missing = _split_images(current_images)
+        # Context images missing on disk are just omitted: the note below only
+        # announces the ones actually attached, and they are not the user's.
+        context_inline, _ = _split_images(context_images)
+        inline = current_inline + context_inline
+        dropped += current_missing
+        if context_inline:
+            note = image_store.context_image_note(
+                len(context_inline), after_user_images=bool(current_inline),
+            )
+            text = f'{text}\n\n{note}' if text else note
     if dropped:
         text = _append_image_marker(text, dropped)
     if inline:

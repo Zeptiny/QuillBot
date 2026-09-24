@@ -71,6 +71,7 @@ from config import (
     OPENAI_BASE_URL,
     SCHEDULER_ENABLED,
     TAVILY_AVAILABLE,
+    WEB_SEARCH_ENABLED,
 )
 
 logger = logging.getLogger(__name__)
@@ -427,7 +428,12 @@ class Commands(commands.Cog):
             checks = await self._check_apis(session)
 
         # Web search status
-        tavily_status = '🟢 Ativa' if TAVILY_AVAILABLE else ('🔴 Desativada' if not TAVILY_API_KEY else '🟡 Sem API key')
+        if TAVILY_AVAILABLE:
+            tavily_status = '🟢 Ativa'
+        elif not WEB_SEARCH_ENABLED:
+            tavily_status = '🔴 Desativada'
+        else:
+            tavily_status = '🟡 Sem API key'
 
         # Vector store stats
         docs_rag = self.bot.cogs.get('DocsRAG')
@@ -640,6 +646,7 @@ class Commands(commands.Cog):
             reply_to=reply_to,
             user_message=(capture or {}).get('user_message'),
             trajectory=(capture or {}).get('trajectory'),
+            context_images=(capture or {}).get('context_image_urls'),
         )
         origin = {
             'channel_id': str(getattr(channel, 'id', '') or ''),
@@ -871,11 +878,12 @@ class Commands(commands.Cog):
                 )
             )
 
-        current_image_refs, _ = select_image_refs(urls, context_images)
+        image_refs, context_image_refs, _ = select_image_refs(urls, context_images)
         return answer, embeds, sources, {
             'user_message': current_message,
             'trajectory': trajectory,
-            'image_urls': current_image_refs,
+            'image_urls': image_refs,
+            'context_image_urls': context_image_refs,
         }
 
     async def cog_app_command_error(
@@ -969,6 +977,7 @@ class Commands(commands.Cog):
                             prior_context=prior_context,
                             user_message=capture.get('user_message'),
                             trajectory=capture.get('trajectory'),
+                            context_images=capture.get('context_image_urls'),
                         )
                         data = conv['data']
                         data['turns'] = cap_turns(history + [turn], CONVERSATIONS_MAX_TURNS)
@@ -1075,6 +1084,7 @@ class Commands(commands.Cog):
                 await message.reply(
                     f'Olá {message.author.mention}! Me mencione com uma pergunta. Ex: @{self.bot.user.display_name} como otimizar meu servidor?',
                     mention_author=False,
+                    allowed_mentions=discord.AllowedMentions(users=[message.author]),
                 )
             except discord.HTTPException:
                 pass

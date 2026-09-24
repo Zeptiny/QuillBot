@@ -77,6 +77,12 @@ CHAT_MENTION_ENABLED: Final[bool] = os.getenv('CHAT_MENTION_ENABLED', 'true').st
 # --- Channel context (recent messages auto-injected into /ask, /chat, @mention and follow-ups) ---
 # Number of latest channel messages sent to the LLM as conversation context; 0 disables.
 CHANNEL_CONTEXT_MESSAGES: Final[int] = int(os.getenv('CHANNEL_CONTEXT_MESSAGES', '10'))
+# Also send images attached to those channel messages (and to follow-up gaps) to
+# the model. Disable for text-only CHAT_MODELs or to keep other users' images
+# away from the provider.
+CHANNEL_CONTEXT_IMAGES_ENABLED: Final[bool] = os.getenv('CHANNEL_CONTEXT_IMAGES_ENABLED', 'true').strip().lower() in ('1', 'true', 'yes')
+# Only channel images posted within this many minutes are sent; 0 = no age limit.
+CHANNEL_CONTEXT_IMAGE_MAX_AGE_MINUTES: Final[int] = int(os.getenv('CHANNEL_CONTEXT_IMAGE_MAX_AGE_MINUTES', '60'))
 
 # --- Conversations (multi-turn chat memory) ---
 CONVERSATIONS_DB_PATH: Final[str] = os.getenv('CONVERSATIONS_DB_PATH', 'data/conversations.db')

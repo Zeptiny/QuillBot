@@ -1,5 +1,6 @@
 """Shared text utilities used across multiple cogs."""
 
+import asyncio
 import datetime
 import json
 import logging
@@ -15,6 +16,8 @@ from openai import AsyncOpenAI
 
 from cogs import image_store
 from config import (
+    CHANNEL_CONTEXT_IMAGE_MAX_AGE_MINUTES,
+    CHANNEL_CONTEXT_IMAGES_ENABLED,
     CHANNEL_CONTEXT_MESSAGES,
     CONVERSATIONS_GAP_MESSAGES,
     HISTORY_SQL_TOOL_ENABLED,
@@ -607,6 +610,49 @@ def build_full_context_block(
     return "\n".join(parts)
 
 
+def _context_image_attachments(msg: discord.Message, now: datetime.datetime) -> list[Any]:
+    """Image attachments of a context message eligible to be shown to the model.
+
+    Empty when channel-context images are disabled or the message is older than
+    ``CHANNEL_CONTEXT_IMAGE_MAX_AGE_MINUTES`` (stale images are rarely what a
+    question is about, and every one sent costs tokens).
+    """
+    if not CHANNEL_CONTEXT_IMAGES_ENABLED:
+        return []
+    created = getattr(msg, 'created_at', None)
+    if (
+        CHANNEL_CONTEXT_IMAGE_MAX_AGE_MINUTES > 0
+        and created is not None
+        and now - created > datetime.timedelta(minutes=CHANNEL_CONTEXT_IMAGE_MAX_AGE_MINUTES)
+    ):
+        return []
+    return [
+        attachment for attachment in getattr(msg, 'attachments', [])
+        if (getattr(attachment, 'content_type', None) or '').startswith('image/')
+    ]
+
+
+async def _persist_context_images(groups: list[list[Any]]) -> list[str]:
+    """Persist per-message attachment groups concurrently.
+
+    *groups* come newest-first (history walk order); the refs are returned in
+    chronological order, matching the rendered context lines.
+    """
+    if not groups:
+        return []
+    results = await asyncio.gather(
+        *(image_store.persist_images(group) for group in groups),
+        return_exceptions=True,
+    )
+    refs: list[str] = []
+    for result in reversed(results):
+        if isinstance(result, BaseException):
+            logger.warning('Failed to persist channel-context images: %s', result)
+            continue
+        refs.extend(result)
+    return refs
+
+
 async def fetch_channel_history(
     bot: discord.Client,
     channel: discord.abc.Messageable | None,
@@ -631,23 +677,17 @@ async def fetch_channel_history(
         return "Histórico não disponível para este canal."
     limit = max(1, min(50, int(limit)))
     lines: list[str] = []
-    image_groups: list[list[str]] = []
-    stored_image_count = 0
+    image_groups: list[list[Any]] = []
+    image_slots = CHANNEL_CONTEXT_MAX_IMAGES
+    now = datetime.datetime.now(datetime.timezone.utc)
     try:
         async for msg in target.history(limit=limit, before=before):
             lines.append(format_message_line(msg))
-            if include_images and stored_image_count < CHANNEL_CONTEXT_MAX_IMAGES:
-                attachments = [
-                    attachment for attachment in getattr(msg, 'attachments', [])
-                    if getattr(attachment, 'content_type', None)
-                    and attachment.content_type.startswith('image/')
-                ]
-                refs = await image_store.persist_images(
-                    attachments[:CHANNEL_CONTEXT_MAX_IMAGES - stored_image_count]
-                )
-                if refs:
-                    image_groups.append(refs)
-                    stored_image_count += len(refs)
+            if include_images and image_slots > 0:
+                attachments = _context_image_attachments(msg, now)[:image_slots]
+                if attachments:
+                    image_groups.append(attachments)
+                    image_slots -= len(attachments)
     except discord.Forbidden:
         return "Sem permissão para ler histórico deste canal."
     except Exception as e:
@@ -664,7 +704,7 @@ async def fetch_channel_history(
     text = header + "\n".join(lines)
     if not include_images:
         return text
-    images = [ref for group in reversed(image_groups) for ref in group]
+    images = await _persist_context_images(image_groups)
     return ChannelContext(text=text, lines=lines, images=images)
 
 
@@ -690,6 +730,10 @@ async def fetch_recent_channel_context(
     )
     if not isinstance(context, ChannelContext):
         context = ChannelContext(text=context)
+    logger.info(
+        "Recent channel context channel=%s messages=%d images=%d",
+        getattr(channel, 'id', None), len(context.lines), len(context.images),
+    )
     return ChannelContext(
         text=f"<mensagens_recentes_do_canal>\n{context.text}\n</mensagens_recentes_do_canal>",
         lines=context.lines,
@@ -726,8 +770,9 @@ async def fetch_channel_gap(
     skip = {str(s) for s in (skip_ids or set()) if s}
     skip.add(str(after_id))
     lines: list[str] = []
-    image_groups: list[list[str]] = []
-    stored_image_count = 0
+    image_groups: list[list[Any]] = []
+    image_slots = CHANNEL_CONTEXT_MAX_IMAGES
+    now = datetime.datetime.now(datetime.timezone.utc)
     try:
         async for msg in channel.history(limit=max(n * 3, 100), before=before):
             if msg.id <= anchor.id:
@@ -737,25 +782,18 @@ async def fetch_channel_gap(
             if not msg.content and not msg.attachments and not msg.embeds:
                 continue
             lines.append(format_message_line(msg))
-            if stored_image_count < CHANNEL_CONTEXT_MAX_IMAGES:
-                attachments = [
-                    attachment for attachment in getattr(msg, 'attachments', [])
-                    if getattr(attachment, 'content_type', None)
-                    and attachment.content_type.startswith('image/')
-                ]
-                refs = await image_store.persist_images(
-                    attachments[:CHANNEL_CONTEXT_MAX_IMAGES - stored_image_count]
-                )
-                if refs:
-                    image_groups.append(refs)
-                    stored_image_count += len(refs)
+            if image_slots > 0:
+                attachments = _context_image_attachments(msg, now)[:image_slots]
+                if attachments:
+                    image_groups.append(attachments)
+                    image_slots -= len(attachments)
             if len(lines) >= n:
                 break
+        images = await _persist_context_images(image_groups)
     except Exception:
         logger.exception("fetch_channel_gap failed")
         return ChannelContext()
     lines.reverse()
-    images = [ref for group in reversed(image_groups) for ref in group]
     return ChannelContext(text="\n".join(lines), lines=lines, images=images)
 
 
@@ -1234,7 +1272,22 @@ async def run_tool_loop(
                 except discord.HTTPException:
                     pass
 
-            result_text, sources = await exec_tool(tc.function.name, args)
+            try:
+                result_text, sources = await exec_tool(tc.function.name, args)
+            except Exception as e:
+                # One failing tool (bad model-supplied args, API hiccup) must
+                # not abort the whole answer: report it back to the model,
+                # which can retry with other arguments or answer without it.
+                logger.exception(
+                    "Tool %s failed (model=%s args=%r)",
+                    tc.function.name, model, str(args)[:200],
+                )
+                result_text = (
+                    f'Erro ao executar a ferramenta {tc.function.name}: '
+                    f'{type(e).__name__}: {str(e)[:200]}. '
+                    'Corrija os argumentos ou responda sem esta ferramenta.'
+                )
+                sources = []
 
             if sources:
                 if dedup_key is not None:

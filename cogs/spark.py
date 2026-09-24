@@ -19,6 +19,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from cogs.spark_parser import SPARK_URL_PATTERN, SparkReport, fetch_report
+from config import COOLDOWN_PER, COOLDOWN_RATE
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +36,7 @@ class SparkAnalyzeView(discord.ui.View):
         self.cog = cog
         self.code = code
         self.message: discord.Message | None = None
+        self._used = False
 
     @discord.ui.button(
         label='Analisar com IA',
@@ -44,6 +46,14 @@ class SparkAnalyzeView(discord.ui.View):
     async def analyze(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
+        # Set before the first await: concurrent clicks must not each start
+        # an expensive SPARK_MODEL analysis before the button is disabled.
+        if self._used:
+            await interaction.response.send_message(
+                'Esta análise já foi solicitada.', ephemeral=True
+            )
+            return
+        self._used = True
         button.disabled = True
         await interaction.response.edit_message(view=self)
         await self.cog._do_spark_analysis(interaction, self.code, followup=True)
@@ -85,6 +95,7 @@ class SparkAnalyzer(commands.Cog, name='SparkAnalyzer'):
         name='spark',
         description='Analisa um relatório do Spark Profiler com IA',
     )
+    @app_commands.checks.cooldown(COOLDOWN_RATE, COOLDOWN_PER)
     @app_commands.describe(
         url='URL ou código do relatório (ex: https://spark.lucko.me/ABC ou apenas ABC)',
     )

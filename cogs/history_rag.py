@@ -272,6 +272,9 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
         self._locks: dict[int, asyncio.Lock] = {}
         self._recent: dict[int, collections.deque] = {}
         self._backfilling: set[int] = set()
+        # channel_id -> newest msg id already indexed when the bot started; the
+        # startup backfill resumes after it instead of re-walking all history.
+        self._backfill_after: dict[int, int] = {}
         self._msg_index: dict[int, dict[int, int]] = {}
         self._queue: asyncio.Queue = asyncio.Queue()
         self._worker_task: asyncio.Task | None = None
@@ -718,6 +721,19 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
                 recent.append(format_chunk_line(ch))
             self._recent[cid] = recent
 
+    def _indexed_watermarks(self) -> dict[int, int]:
+        """Newest indexed message id per channel across all loaded guilds."""
+        marks: dict[int, int] = {}
+        for chunks in self._chunks.values():
+            for c in chunks:
+                try:
+                    cid, mid = int(c["channel_id"]), int(c["msg_id"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if mid > marks.get(cid, 0):
+                    marks[cid] = mid
+        return marks
+
     def _lock(self, guild_id: int) -> asyncio.Lock:
         if guild_id not in self._locks:
             self._locks[guild_id] = asyncio.Lock()
@@ -751,6 +767,10 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
             await asyncio.to_thread(self._load_all_guilds)
         except Exception:
             logger.exception("Failed to scan history store")
+        # Snapshot before any live message is ingested: a live message indexed
+        # ahead of the backfill must not move the resume point past the gap
+        # left while the bot was offline.
+        self._backfill_after = self._indexed_watermarks()
         try:
             await asyncio.to_thread(self._rebuild_authors_from_chunks)
         except Exception:
@@ -828,42 +848,44 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
             return
         self._backfilling.add(guild.id)
         try:
-            lock = self._lock(guild.id)
-            async with lock:
+            # The lock only guards the per-guild setup: holding it through the
+            # whole (possibly long) channel walk would stall message deletes,
+            # and _index_batch takes it per batch anyway.
+            async with self._lock(guild.id):
                 if guild.id not in self._chunks:
                     self._chunks[guild.id] = []
                     self._matrices[guild.id] = None
                     self._msg_index[guild.id] = {}
-                channels: list[discord.abc.Messageable] = []
-                for ch in guild.channels:
-                    if isinstance(ch, (discord.TextChannel, discord.Thread, discord.VoiceChannel)):
-                        if isinstance(ch, discord.VoiceChannel):
-                            continue
-                        perms = ch.permissions_for(guild.me)
-                        if perms.read_message_history and perms.view_channel:
-                            channels.append(ch)
-                    elif isinstance(ch, discord.ForumChannel):
-                        for thread in ch.threads:
-                            if thread.permissions_for(guild.me).read_message_history:
+            channels: list[discord.abc.Messageable] = []
+            for ch in guild.channels:
+                if isinstance(ch, (discord.TextChannel, discord.Thread, discord.VoiceChannel)):
+                    if isinstance(ch, discord.VoiceChannel):
+                        continue
+                    perms = ch.permissions_for(guild.me)
+                    if perms.read_message_history and perms.view_channel:
+                        channels.append(ch)
+                elif isinstance(ch, discord.ForumChannel):
+                    for thread in ch.threads:
+                        if thread.permissions_for(guild.me).read_message_history:
+                            channels.append(thread)
+                    try:
+                        async for thread in ch.archived_threads(limit=None):
+                            if thread.permissions_for(guild.me).read_message_history and thread.permissions_for(guild.me).view_channel:
                                 channels.append(thread)
-                        try:
-                            async for thread in ch.archived_threads(limit=None):
-                                if thread.permissions_for(guild.me).read_message_history and thread.permissions_for(guild.me).view_channel:
-                                    channels.append(thread)
-                                await asyncio.sleep(0)
-                        except Exception:
-                            pass
-                for cat in guild.channels:
-                    if isinstance(cat, discord.CategoryChannel):
-                        for ch in cat.channels:
-                            if isinstance(ch, discord.Thread):
-                                perms = ch.permissions_for(guild.me)
-                                if perms.read_message_history and perms.view_channel and ch not in channels:
-                                    channels.append(ch)
-                channels = list(dict.fromkeys(channels))
-                logger.info("History backfill guild %s (%s) %d channels", guild.name, guild.id, len(channels))
-                for channel in channels:
-                    await self._backfill_channel(guild, channel)
+                            await asyncio.sleep(0)
+                    except Exception:
+                        pass
+            for cat in guild.channels:
+                if isinstance(cat, discord.CategoryChannel):
+                    for ch in cat.channels:
+                        if isinstance(ch, discord.Thread):
+                            perms = ch.permissions_for(guild.me)
+                            if perms.read_message_history and perms.view_channel and ch not in channels:
+                                channels.append(ch)
+            channels = list(dict.fromkeys(channels))
+            logger.info("History backfill guild %s (%s) %d channels", guild.name, guild.id, len(channels))
+            for channel in channels:
+                await self._backfill_channel(guild, channel)
         except Exception:
             logger.exception("Backfill failed for guild %s", guild.id)
         finally:
@@ -878,8 +900,15 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
             recent = collections.deque(maxlen=HISTORY_WINDOW_SIZE)
             self._recent[cid] = recent
         to_index: list[discord.Message] = []
+        # Resume after the newest message indexed before this run: everything
+        # older is already stored, so only the offline gap is fetched. The
+        # sliding window (recent) was seeded from the DB on load.
+        after_id = self._backfill_after.pop(cid, None)
+        after = discord.Object(id=after_id) if after_id else None
+        if after is not None:
+            logger.debug("History backfill channel %s resuming after msg %s", cid, after_id)
         try:
-            async for msg in channel.history(limit=HISTORY_BACKFILL_LIMIT, oldest_first=True):
+            async for msg in channel.history(limit=HISTORY_BACKFILL_LIMIT, after=after, oldest_first=True):
                 if msg.id in existing:
                     line = format_message_line(msg)
                     recent.append(line)
@@ -910,6 +939,15 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
                 gid, stacked.shape, len(chunks),
             )
             return False
+        # Backfill and live ingestion can both pick up a message near the
+        # resume point; keep the first copy so the index never holds duplicates.
+        index = self._msg_index.setdefault(gid, {})
+        fresh = [i for i, ch in enumerate(chunks) if int(ch["msg_id"]) not in index]
+        if not fresh:
+            return False
+        if len(fresh) < len(chunks):
+            chunks = [chunks[i] for i in fresh]
+            stacked = stacked[fresh]
         mat = self._matrices.get(gid)
         if mat is not None and mat.shape[0] and (
             mat.ndim != 2 or mat.shape[1] != stacked.shape[1]

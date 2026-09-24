@@ -219,7 +219,7 @@ Replay windows advance in `CONVERSATIONS_TRAJECTORY_STEP`-turn steps (hysteresis
 ### Context Injection
 Every AI call receives a `<contexto>` block with user (display name, account age, join date, roles), guild (name, member count, channels, roles), channel, and temporal (BRT + UTC) context.
 
-When `CHANNEL_CONTEXT_MESSAGES` > 0 (default `10`), `/ask`, `/chat`, @mention and reply follow-ups also receive a `<mensagens_recentes_do_canal>` block — the latest N channel messages in chronological order, same format as the `get_channel_history` tool. Image attachments in that context are persisted and sent as vision parts, up to the four-image per-message budget (current-message images take priority); filenames remain visible in the text context. The triggering message is excluded; set `0` to disable. Reply follow-ups use the captured gap block (`prior_context`, see `CONVERSATIONS_GAP_MESSAGES`) instead of this recent-channel window whenever a gap was captured, including images from those gap messages.
+When `CHANNEL_CONTEXT_MESSAGES` > 0 (default `10`), `/ask`, `/chat`, @mention and reply follow-ups also receive a `<mensagens_recentes_do_canal>` block — the latest N channel messages in chronological order, same format as the `get_channel_history` tool. Image attachments in that context are persisted and sent as vision parts, up to the four-image per-message budget (current-message images take priority, then the newest channel images); filenames remain visible in the text context. Only images posted within `CHANNEL_CONTEXT_IMAGE_MAX_AGE_MINUTES` (default `60`) are sent, and `CHANNEL_CONTEXT_IMAGES_ENABLED=false` turns channel images off entirely (use it with text-only `CHAT_MODEL`s). Attachments are downloaded once and reused by attachment id. The triggering message is excluded; set `0` to disable. Reply follow-ups use the captured gap block (`prior_context`, see `CONVERSATIONS_GAP_MESSAGES`) instead of this recent-channel window whenever a gap was captured, including images from those gap messages.
 
 ### Prefix-Cache-Friendly Message Layout
 The LLM message list is ordered so conversation follow-ups reuse a cached prefix: `[system (persona + static conversation summary)] → [replayed history turns] → [current message]`. All per-request blocks — `<contexto>` (clock), the semantically-selected memory block, and the recent channel window — ride on the **final user message** instead of the system prompt, so the system prompt + history stay byte-identical across turns and providers can prefix-cache them (typically 80–95% input-token savings on cached prefixes).
@@ -343,6 +343,8 @@ cp .env.example .env   # if available, otherwise create .env manually
 | `TAVILY_API_KEY` | — | Required when web search is enabled |
 | `CHAT_MENTION_ENABLED` | `true` | Enable @mention chat mode |
 | `CHANNEL_CONTEXT_MESSAGES` | `10` | Latest channel messages auto-injected as text and vision context into `/ask`, `/chat`, @mention and reply follow-ups (`0` disables) |
+| `CHANNEL_CONTEXT_IMAGES_ENABLED` | `true` | Send images attached to channel-context and follow-up gap messages as vision parts (`false` for text-only models) |
+| `CHANNEL_CONTEXT_IMAGE_MAX_AGE_MINUTES` | `60` | Only channel-context images newer than this are sent (`0` = no age limit) |
 | `HISTORY_ENABLED` | `true` | Enable server history RAG |
 | `MEMORY_ENABLED` | `true` | Enable persistent memory (cog not loaded when false) |
 | `LOG_LEVEL` | `INFO` | Python logging level |
@@ -355,7 +357,7 @@ cp .env.example .env   # if available, otherwise create .env manually
 | `HISTORY_DB_PATH` | `data/history/history.db` | SQLite history DB (defaults to `<HISTORY_VECTOR_STORE_DIR>/history.db`) |
 | `HISTORY_WINDOW_SIZE` | `5` | Sliding window of prior messages per chunk |
 | `HISTORY_WINDOW_OVERLAP` | `1` | Overlap between consecutive chunks |
-| `HISTORY_BACKFILL_LIMIT` | _(none)_ | Max messages to backfill per channel (unset = all) |
+| `HISTORY_BACKFILL_LIMIT` | _(none)_ | Max messages to backfill per channel per run (unset = all); restarts resume after the newest indexed message |
 | `HISTORY_MAX_MSG_LENGTH` | `800` | Max chars per message in history chunks |
 | `HISTORY_EXCLUDE_BOTS` | `true` | Exclude bot messages from history |
 | `HISTORY_INGEST_BATCH_SIZE` | `10` | Messages per embedding batch during live ingestion |
