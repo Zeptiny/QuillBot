@@ -5,9 +5,12 @@ import datetime
 import json
 import logging
 import re
+import sqlite3
 import unicodedata
+import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any, Final
 from zoneinfo import ZoneInfo
 
@@ -1003,6 +1006,11 @@ async def exec_history_tool(
             text = await hist.exec_sql(guild.id, sql)  # type: ignore
         except ValueError as e:
             return f'Consulta rejeitada: {e} Reescreva e tente de novo.', []
+        except sqlite3.OperationalError as e:
+            # Mistakes in model-written SQL (unknown column, syntax, timeout)
+            # are expected and fed back to the model: log the query, not a trace.
+            logger.warning('sql_history query failed: %s | sql=%s', e, ' '.join(sql.split())[:1000])
+            return f'Erro SQL: {e} Corrija a consulta (veja esquema na descrição da ferramenta).', []
         except Exception as e:
             logger.exception('sql_history failed')
             return f'Erro SQL: {e} Corrija a consulta (veja esquema na descrição da ferramenta).', []
@@ -1165,6 +1173,83 @@ def serialize_trajectory(messages: list[Any]) -> list[dict]:
     return out
 
 
+# Tool calls some providers hand back as raw text in ``content`` instead of
+# ``tool_calls``: always when the request carries no ``tools`` (the forced
+# final round), and whenever their parser misses the model's native format.
+# Bodies: GLM (``name<arg_key>k</arg_key><arg_value>v</arg_value>``),
+# Qwen3-Coder (``<function=name><parameter=k>v</parameter></function>``) and
+# Hermes/Qwen JSON (``{"name": ..., "arguments": {...}}``).  An unterminated
+# block (output cut at max_tokens) runs to the end of the text and is only
+# stripped: its arguments are incomplete.
+_TEXT_TOOL_CALL_RE = re.compile(r'<tool_call>(.*?)(</tool_call>|\Z)', re.S)
+_GLM_ARG_RE = re.compile(r'<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>', re.S)
+_XML_FUNCTION_RE = re.compile(r'<function=([^>\s]+)>(.*?)(?:</function>|\Z)', re.S)
+_XML_PARAM_RE = re.compile(r'<parameter=([^>\s]+)>(.*?)</parameter>', re.S)
+
+
+def _parse_text_tool_call(body: str, schemas: dict[str, dict]) -> tuple[str, dict] | None:
+    body = body.strip()
+    if body.startswith('{'):
+        try:
+            obj = json.loads(body)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(obj, dict):
+            return None
+        name = obj.get('name')
+        args = obj.get('arguments', obj.get('parameters', {}))
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except json.JSONDecodeError:
+                return None
+        if name not in schemas or not isinstance(args, dict):
+            return None
+        return name, args
+    fn = _XML_FUNCTION_RE.search(body)
+    if fn:
+        name, pairs = fn.group(1).strip(), _XML_PARAM_RE.findall(fn.group(2))
+    else:
+        name, pairs = body.split('<', 1)[0].strip(), _GLM_ARG_RE.findall(body)
+    if name not in schemas:
+        return None
+    args: dict[str, Any] = {}
+    for key, value in pairs:
+        key, value = key.strip(), value.strip()
+        if schemas[name].get(key, {}).get('type', 'string') != 'string':
+            try:
+                value = json.loads(value)
+            except json.JSONDecodeError:
+                pass
+        args[key] = value
+    return name, args
+
+
+def extract_text_tool_calls(
+    content: str | None, tools: list[dict] | None = None,
+) -> tuple[str, list[tuple[str, dict]], bool]:
+    """Split raw-text tool-call markup out of an assistant *content*.
+
+    Returns ``(text_without_markup, calls, had_markup)``.  *calls* holds the
+    ``(name, args)`` of blocks that parse as a call to one of *tools*; every
+    ``<tool_call>`` block is removed from the text either way, so the markup
+    never reaches the user.
+    """
+    if not content or '<tool_call>' not in content:
+        return content or '', [], False
+    schemas: dict[str, dict] = {}
+    for tool in tools or []:
+        fn = tool.get('function') or {}
+        if fn.get('name'):
+            schemas[fn['name']] = (fn.get('parameters') or {}).get('properties') or {}
+    calls = [
+        parsed
+        for m in _TEXT_TOOL_CALL_RE.finditer(content)
+        if m.group(2) and (parsed := _parse_text_tool_call(m.group(1), schemas))
+    ]
+    return _TEXT_TOOL_CALL_RE.sub('', content).strip(), calls, True
+
+
 async def run_tool_loop(
     client: AsyncOpenAI,
     model: str,
@@ -1247,12 +1332,41 @@ async def run_tool_loop(
             _usage_summary(response),
         )
 
-        if not choice.message.tool_calls:
+        tool_calls = list(choice.message.tool_calls or [])
+        assistant_msg: Any = choice.message
+        if not tool_calls and tools:
+            text, parsed, _ = extract_text_tool_calls(choice.message.content, tools)
+            if parsed:
+                logger.warning(
+                    "Recovered %d tool call(s) returned as text (model=%s finish_reason=%s): %s",
+                    len(parsed), model, finish_reason, [name for name, _ in parsed],
+                )
+                tool_calls = [
+                    SimpleNamespace(
+                        id=f'call_{uuid.uuid4().hex[:24]}',
+                        type='function',
+                        function=SimpleNamespace(name=name, arguments=json.dumps(args, ensure_ascii=False)),
+                    )
+                    for name, args in parsed
+                ]
+                assistant_msg = {
+                    'role': 'assistant',
+                    'content': text or None,
+                    'tool_calls': [
+                        {
+                            'id': tc.id,
+                            'type': 'function',
+                            'function': {'name': tc.function.name, 'arguments': tc.function.arguments},
+                        }
+                        for tc in tool_calls
+                    ],
+                }
+        if not tool_calls:
             break
 
-        messages.append(choice.message)
+        messages.append(assistant_msg)
 
-        for tc in choice.message.tool_calls:
+        for tc in tool_calls:
             try:
                 args = json.loads(tc.function.arguments)
             except (json.JSONDecodeError, TypeError):
@@ -1335,11 +1449,15 @@ async def run_tool_loop(
         _accumulate_usage(usage_totals, response)
 
     final_choice = response.choices[0]
-    answer = final_choice.message.content or ''
-    if not answer.strip():
+    # A reply that still tries to call a tool (as text: no tools were sent, or
+    # none of its calls parsed) is not an answer — only its preamble would be
+    # left once the markup is stripped, so it gets the same retry as an empty one.
+    answer, _, had_markup = extract_text_tool_calls(final_choice.message.content)
+    if not answer.strip() or had_markup:
         logger.warning(
-            "LLM returned an empty answer (finish_reason=%s usage=[%s]); "
+            "LLM returned %s (finish_reason=%s usage=[%s]); "
             "retrying once without tools and with a conciseness nudge",
+            'a tool call as text instead of an answer' if had_markup else 'an empty answer',
             getattr(final_choice, 'finish_reason', None),
             _usage_summary(response),
         )
@@ -1360,7 +1478,7 @@ async def run_tool_loop(
         )
         _accumulate_usage(usage_totals, response)
         final_choice = response.choices[0]
-        answer = final_choice.message.content or ''
+        answer, _, _ = extract_text_tool_calls(final_choice.message.content)
     if not answer.strip():
         logger.warning(
             "LLM returned an empty answer (user got the fallback message): "
