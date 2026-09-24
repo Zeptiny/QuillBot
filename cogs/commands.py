@@ -27,6 +27,7 @@ from cogs.conversation_store import (
 )
 from cogs.memory import MEMORY_ABOUT_TOOL, MEMORY_SEARCH_TOOL, MEMORY_WRITE_TOOL
 from cogs.scheduler import SCHEDULER_TOOLS
+from cogs.summary import SUMMARIZE_CHANNEL_TOOL, summary_tool_status
 from cogs.tavily_tools import TOOLS as TAVILY_TOOLS
 from cogs.tavily_tools import exec_tool as tavily_exec_tool
 from cogs.tavily_tools import status_label as tavily_status_label
@@ -70,6 +71,7 @@ from config import (
     OPENAI_API_KEY,
     OPENAI_BASE_URL,
     SCHEDULER_ENABLED,
+    SUMMARY_ENABLED,
     TAVILY_AVAILABLE,
     WEB_SEARCH_ENABLED,
 )
@@ -113,6 +115,15 @@ _SCHEDULER_INSTRUCTIONS = (
     "em ping real fora do embed. Nunca use @everyone, @here ou menções de cargo.\n"
 ) if SCHEDULER_ENABLED else ""
 
+_SUMMARY_INSTRUCTIONS = (
+    "- Para pedidos de resumo (\"o que perdi?\", \"resume a conversa de hoje\", "
+    "\"do que falaram no #canal desde ontem?\"), use `summarize_channel` — "
+    "get_channel_history só traz as últimas 50 mensagens e não serve para períodos. "
+    "Converta \"hoje\", \"de manhã\", \"desde ontem\" em data/hora ISO usando o "
+    "horário de <contexto>. Entregue o resumo mantendo os links ↗ e cite pessoas "
+    "sem @ (um resumo não deve notificar ninguém).\n"
+) if SUMMARY_ENABLED else ""
+
 _DISCORD_FORMAT = (
     "A resposta será exibida no Discord (embed description) — use APENAS sintaxe que o Discord renderiza:\n"
     "- Permitido: **negrito**, *itálico*, __sublinhado__, ~~tachado~~, `código inline`, "
@@ -133,7 +144,8 @@ GENERAL_SYSTEM_PROMPT = (
     "- Responda perguntas gerais com base no seu conhecimento.\n"
     + _MEMORY_INSTRUCTIONS
     + (_WEB_SEARCH_INSTRUCTIONS if TAVILY_AVAILABLE else '')
-    + _SCHEDULER_INSTRUCTIONS +
+    + _SCHEDULER_INSTRUCTIONS
+    + _SUMMARY_INSTRUCTIONS +
     "- Seja honesto quando não souber a resposta — não invente informações.\n"
     "</instructions>\n\n"
     "<response_format>\n"
@@ -772,6 +784,8 @@ class Commands(commands.Cog):
             base_tools.extend([MEMORY_SEARCH_TOOL, MEMORY_WRITE_TOOL, MEMORY_ABOUT_TOOL])
         if SCHEDULER_ENABLED:
             base_tools.extend(SCHEDULER_TOOLS)
+        if SUMMARY_ENABLED:
+            base_tools.append(SUMMARIZE_CHANNEL_TOOL)
         active_tools = base_tools if base_tools else None
         fallback_channel = channel or (interaction.channel if interaction else None)
         fallback_guild = guild or (interaction.guild if interaction else None)
@@ -804,6 +818,16 @@ class Commands(commands.Cog):
                     name, args, guild=g, actor_name=actor_name,
                     requester=user, channel=fallback_channel,
                 )
+            if name == 'summarize_channel':
+                summary_cog = self.bot.get_cog('Summary')
+                if not summary_cog:
+                    return 'Resumo de canal não disponível.', []
+                # The triggering message bounds the range so the request
+                # itself is never summarized; permissions are the requester's.
+                return await summary_cog.exec_tool(
+                    args, guild=fallback_guild, channel=fallback_channel,
+                    requester=user, before=context_message,
+                )
             result = await exec_history_tool(name, args, bot=self.bot, guild=fallback_guild, channel=fallback_channel)
             if result is not None:
                 return result
@@ -826,6 +850,8 @@ class Commands(commands.Cog):
                 return '⏰ Listando tarefas agendadas…'
             if name == 'schedule_delete':
                 return f'⏰ Removendo tarefa #{args.get("id", "?")}'
+            if name == 'summarize_channel':
+                return summary_tool_status(args, fallback_guild)
             label = history_tool_status(name, args)
             if label is not None:
                 return label

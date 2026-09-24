@@ -142,6 +142,16 @@ SCHEDULER_LOOP_INTERVAL: Final[int] = int(os.getenv('SCHEDULER_LOOP_INTERVAL', '
 SCHEDULER_MAX_JOBS_PER_GUILD: Final[int] = int(os.getenv('SCHEDULER_MAX_JOBS_PER_GUILD', '50'))
 SCHEDULER_MAX_PROMPT: Final[int] = int(os.getenv('SCHEDULER_MAX_PROMPT', '500'))
 
+# --- Channel summaries (/resumo + summarize_channel tool) ---
+SUMMARY_ENABLED: Final[bool] = os.getenv('SUMMARY_ENABLED', 'true').strip().lower() in ('1', 'true', 'yes')
+# Model for the summary calls; a cheaper model is usually fine here.
+SUMMARY_MODEL: Final[str] = os.getenv('SUMMARY_MODEL') or CHAT_MODEL
+# Hard caps on what one summary reads: newest N messages, at most D days back.
+SUMMARY_MAX_MESSAGES: Final[int] = int(os.getenv('SUMMARY_MAX_MESSAGES', '1000'))
+SUMMARY_MAX_DAYS: Final[int] = int(os.getenv('SUMMARY_MAX_DAYS', '7'))
+# Rendered messages per LLM call; longer ranges are summarized map-reduce style.
+SUMMARY_SEGMENT_CHARS: Final[int] = int(os.getenv('SUMMARY_SEGMENT_CHARS', '24000'))
+
 # --- Rate Limiting (per-user) ---
 COOLDOWN_RATE: Final[int] = int(os.getenv('COOLDOWN_RATE', '1'))
 COOLDOWN_PER: Final[float] = float(os.getenv('COOLDOWN_PER', '30'))

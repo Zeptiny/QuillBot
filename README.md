@@ -32,6 +32,7 @@ Built with [discord.py](https://discordpy.readthedocs.io/) + RAG (Retrieval-Augm
 | **Spark Profiler** | Full report parsing, bottleneck diagnosis, platform-aware recommendations |
 | **Plugin Search** | Concurrent search across Modrinth, Hangar, SpigotMC |
 | **Server Tools** | JVM flags, server status checks, docs changelog |
+| **Channel Summaries** | `/resumo` and natural-language "o que perdi?" — map-reduce summaries of a channel or thread over any period, with jump links and permission checks |
 | **Persistent Memory** | The bot remembers: atomic facts about the server and its members, auto-injected into every conversation, with inline LLM writes, pinning, dedupe, full audit history and admin control |
 
 All AI responses are in **Brazilian Portuguese** and formatted for Discord embeds.
@@ -53,10 +54,26 @@ Ask any Minecraft server administration question. Uses an agentic RAG loop — t
 #### `/chat <question> [image]`
 General-purpose assistant (same agentic loop as `/ask` but with web search).
 
-- **Tools:** `web_search`, `web_extract` (via Tavily), plus the same context/history tools as `/ask`
+- **Tools:** `web_search`, `web_extract` (via Tavily), plus the same context/history tools as `/ask`, the scheduler tools and `summarize_channel` (see `/resumo`)
 - **Web search:** Supports `search_depth` (basic/advanced), `time_range`, domain filtering
 - **Reply follow-up** and **@mention mode:** Mention the bot (`@QuillBot <question>`) to chat without a slash command — same rate-limit and conversation handling as `/chat`
 - Set `CHAT_MENTION_ENABLED=false` to disable mention mode
+
+#### `/resumo [canal] [periodo] [foco]`
+Summarize what happened in a channel or thread while you were away.
+
+- **`canal`** — text/voice channel or thread (default: the current one). Archived threads work too
+- **`periodo`** — default *since your last message* in that channel (your own messages from the last 10 minutes don't count, so "voltei!" + `/resumo` still covers the gap); also `30m`/`6h`/`2d`, `hoje`, `ontem` or a date like `24/09/2026 08:00` (Brasília time). Autocompletes common presets
+- **`foco`** — optional topic to focus on ("backup", "o lag do servidor")
+- **Output:** ephemeral embed with **Tópicos**, **Decisões e soluções** and **Pendências**, each item linked (↗) to the message it came from, plus a private **🔔 Mencionaram você** list (messages that mentioned or replied to you). **📢 Publicar no canal** posts it publicly (without your mentions); replying to the published summary continues it as a `/chat` conversation
+- **How it works (`cogs/summary.py`):**
+  - Messages are read straight from Discord, newest first, until the period start, `SUMMARY_MAX_MESSAGES` or `SUMMARY_MAX_DAYS`. Bot answers are included, since in support channels they're often the fix
+  - Ranges that fit `SUMMARY_SEGMENT_CHARS` take one LLM call. Longer ones are split at conversation gaps (≥20 min of silence), each part is summarized in parallel, and the notes are merged
+  - The model cites messages as `[msg_id=…]`; code turns them into jump links and drops any ID that wasn't in the fetched range
+  - Mentions are rewritten as plain names, so summaries never ping anyone
+- **Permissions:** only channels that *you* can view and read the history of (private threads also require membership or Manage Threads), in the current server
+- **Natural language:** the same engine is the `summarize_channel` tool in `/chat`, @mention, reply follow-ups and scheduled tasks. For example `@QuillBot o que perdi?`, `resume o que rolou no #suporte desde ontem` or a daily scheduled "resumo do #geral". The chat model turns "hoje"/"desde ontem" into timestamps using its clock context and receives a finished summary, not raw messages, so the 6000-char tool-result cap and conversation replay stay small
+- Set `SUMMARY_ENABLED=false` to remove the command and the tool
 
 #### `/analyze [log_link] [log_file] [image]`
 AI-powered log/crash-report analysis.
@@ -268,6 +285,7 @@ QuillBot/
 │   ├── log_analyzer.py   # Passive log detection, pattern matching, /analyze, file upload to mclo.gs
 │   ├── memory.py         # Persistent memory — auto-injection, LLM write tools, admin commands, audit history, log channel, lore migration
 │   ├── plugins.py        # /plugin, /status, /changelog — plugin search & server status
+│   ├── summary.py        # /resumo + summarize_channel tool — period parsing, fetch, map-reduce summary, permission checks
 │   ├── spark.py          # /spark command + passive spark.lucko.me detection
 │   ├── spark_parser.py   # Spark JSON parsing, summary/detail builders, call-tree rendering
 │   ├── plugin_apis.py    # Shared Modrinth/Hangar/SpigotMC API helpers
@@ -400,6 +418,16 @@ cp .env.example .env   # if available, otherwise create .env manually
 | `MEMORY_SEMANTIC_MIN_SCORE` | `0.35` | Min cosine for semantic search/injection hits |
 | `MEMORY_DEDUPE_THRESHOLD` | `0.85` | Cosine above which a create is refused as duplicate |
 | `LORE_DB_PATH` | `data/lore.db` | Legacy lore DB — one-time migration source for memory.db |
+
+### Channel Summaries
+
+| Variable | Default | Description |
+|---|---|---|
+| `SUMMARY_ENABLED` | `true` | Enable `/resumo` and the `summarize_channel` tool (cog not loaded when false) |
+| `SUMMARY_MODEL` | `CHAT_MODEL` | Model for the summary calls; a cheaper model is usually fine |
+| `SUMMARY_MAX_MESSAGES` | `1000` | Max messages read per summary (the newest are kept) |
+| `SUMMARY_MAX_DAYS` | `7` | Max lookback in days |
+| `SUMMARY_SEGMENT_CHARS` | `24000` | Rendered message chars per LLM call; longer ranges are summarized map-reduce style |
 
 ### Docs / RAG Indexing
 
