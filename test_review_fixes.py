@@ -216,6 +216,7 @@ def _history():
     rag = HistoryRAG.__new__(HistoryRAG)
     rag._chunks = {}
     rag._matrices = {}
+    rag._mat_bufs = {}
     rag._msg_index = {}
     rag._recent = {}
     rag._locks = {}

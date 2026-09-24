@@ -30,6 +30,7 @@ from cogs.conversation_store import (
     message_participant_infos as _message_participant_infos,
     select_image_refs as _select_image_refs,
 )
+from cogs.local_inference import run_local_model
 from cogs.memory import MEMORY_ABOUT_TOOL, MEMORY_SEARCH_TOOL, MEMORY_WRITE_TOOL
 from cogs.plugin_apis import HTTP_HEADERS as _HTTP_HEADERS
 from cogs.plugin_apis import search_all as _search_plugins_all
@@ -495,7 +496,7 @@ class DocsRAG(commands.Cog):
         )
         if EMBEDDING_PROVIDER == 'local':
             try:
-                await asyncio.to_thread(self._get_local_model)
+                await run_local_model(self._get_local_model)
             except Exception:
                 logger.warning("Falling back to remote embeddings due to local model load failure")
         loaded = await asyncio.to_thread(self._load_vectors)
@@ -723,8 +724,9 @@ class DocsRAG(commands.Cog):
 
     async def _embed_batch(self, texts: list[str]) -> list[list[float]]:
         if EMBEDDING_PROVIDER == 'local':
-            model = self._get_local_model()
-            embeddings = await asyncio.to_thread(model.encode, texts, normalize_embeddings=True, show_progress_bar=False)
+            embeddings = await run_local_model(
+                lambda: self._get_local_model().encode(texts, normalize_embeddings=True, show_progress_bar=False)
+            )
             if hasattr(embeddings, 'tolist'):
                 return embeddings.tolist()
             return [list(e) for e in embeddings]
