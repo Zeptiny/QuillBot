@@ -89,6 +89,8 @@ CHANNEL_CONTEXT_IMAGE_MAX_AGE_MINUTES: Final[int] = int(os.getenv('CHANNEL_CONTE
 # (cached while the count is unchanged); 0 shows counts only.
 CHANNEL_CONTEXT_REACTIONS_ENABLED: Final[bool] = os.getenv('CHANNEL_CONTEXT_REACTIONS_ENABLED', 'true').strip().lower() in ('1', 'true', 'yes')
 REACTION_USERS_LIMIT: Final[int] = int(os.getenv('REACTION_USERS_LIMIT', '5'))
+# Give the chat model an add_reaction tool (current channel only, a few per answer).
+REACTION_TOOL_ENABLED: Final[bool] = os.getenv('REACTION_TOOL_ENABLED', 'true').strip().lower() in ('1', 'true', 'yes')
 
 # --- Conversations (multi-turn chat memory) ---
 CONVERSATIONS_DB_PATH: Final[str] = os.getenv('CONVERSATIONS_DB_PATH', 'data/conversations.db')

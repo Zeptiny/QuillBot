@@ -9,7 +9,8 @@ unless they are rendered. This module turns them into
   ``[gif: cat dance]``, ``:kek:`` instead of ``<:kek:123>``);
 - image sources :func:`cogs.image_store.persist_images` can store, each with
   an ``id`` (download cache key) and ``async read()``;
-- a reactions suffix listing each reaction with its count and who reacted.
+- a reactions suffix listing each reaction with its count and who reacted;
+- the ``add_reaction`` tool, so the model can react in the current channel.
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ from dataclasses import dataclass
 from typing import Any, Iterable
 from urllib.parse import urlparse
 
+import discord
 from cachetools import LRUCache
 
 from cogs import image_store
@@ -44,6 +46,8 @@ REACTION_FETCH_BUDGET = 20
 REACTION_FETCH_TIMEOUT = 5.0
 # (message id, emoji key, count) -> first reactor names
 _reactors: LRUCache = LRUCache(maxsize=2048)
+# add_reaction calls allowed per answer
+REACTION_TOOL_MAX_PER_ANSWER = 3
 
 
 def _flatten(s: str) -> str:
@@ -314,3 +318,121 @@ async def reaction_summaries(messages: Iterable[Any]) -> dict[Any, str]:
                 continue
             names[key] = _reactors[key] = task.result()
     return {msg.id: _format_reactions(msg, names) for msg in messages}
+
+
+# ---------------------------------------------------------------------------
+# add_reaction tool
+# ---------------------------------------------------------------------------
+
+ADD_REACTION_TOOL = {
+    'type': 'function',
+    'function': {
+        'name': 'add_reaction',
+        'description': (
+            'Adiciona uma reação (emoji) a uma mensagem do canal atual. Sem message_id, reage à '
+            'mensagem que acionou você. Aceita emoji Unicode (ex: 👍) ou emoji personalizado do '
+            'servidor como :nome:. Use quando pedirem ou quando uma reação combinar com o momento, '
+            f'no máximo {REACTION_TOOL_MAX_PER_ANSWER} por resposta; ela não substitui a resposta em texto.'
+        ),
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'emoji': {
+                    'type': 'string',
+                    'description': 'Emoji Unicode (👍) ou :nome: de um emoji personalizado do servidor.',
+                },
+                'message_id': {
+                    'type': 'string',
+                    'description': 'msg_id da mensagem (do canal atual). Omita para a mensagem que acionou você.',
+                },
+            },
+            'required': ['emoji'],
+        },
+    },
+}
+
+_EMOJI_NAME_RE = re.compile(r':?([A-Za-z0-9_~]{2,32}):?')
+
+
+def _resolve_emoji(raw: str, guild: Any) -> Any:
+    """A reaction-ready emoji for *raw*, or ``None`` when it names no known emoji.
+
+    ``<:name:id>`` markup is used as is; ``:name:`` / ``name`` must be a
+    usable custom emoji of *guild* (exact name first, then case-insensitive);
+    anything else is passed through as a Unicode emoji for Discord to validate.
+    """
+    raw = (raw or '').strip()
+    if not raw:
+        return None
+    m = CUSTOM_EMOJI_RE.fullmatch(raw)
+    if m:
+        return discord.PartialEmoji(name=m.group(2), id=int(m.group(3)), animated=bool(m.group(1)))
+    m = _EMOJI_NAME_RE.fullmatch(raw)
+    if not m:
+        return raw
+    name = m.group(1)
+    emojis = [e for e in (getattr(guild, 'emojis', None) or []) if getattr(e, 'available', True)]
+    exact = [e for e in emojis if e.name == name]
+    loose = [e for e in emojis if e.name.lower() == name.lower()]
+    return (exact or loose or [None])[0]
+
+
+def reaction_tool_status(args: dict) -> str:
+    return f"😀 Reagindo com {str(args.get('emoji') or '')[:40]}"
+
+
+class ReactionTool:
+    """Per-answer executor for ``add_reaction``.
+
+    Only messages of *channel* can be reacted to (they are fetched from it),
+    and at most ``limit`` reactions are added per answer.
+    """
+
+    def __init__(self, channel: Any, *, guild: Any = None, default_message: Any = None,
+                 limit: int = REACTION_TOOL_MAX_PER_ANSWER):
+        self.channel = channel
+        self.guild = guild if guild is not None else getattr(channel, 'guild', None)
+        self.default_message = default_message
+        self.left = limit
+
+    async def _target(self, message_id: Any) -> Any:
+        if not message_id:
+            return self.default_message
+        default = self.default_message
+        if default is not None and str(getattr(default, 'id', '')) == str(message_id).strip():
+            return default
+        return await self.channel.fetch_message(int(str(message_id).strip()))
+
+    async def __call__(self, args: dict) -> str:
+        if self.channel is None or not hasattr(self.channel, 'fetch_message'):
+            return 'Não há canal atual onde reagir.'
+        if self.left <= 0:
+            return 'Limite de reações desta resposta atingido; não reaja mais.'
+        raw = str(args.get('emoji') or '')
+        emoji = _resolve_emoji(raw, self.guild)
+        if emoji is None:
+            return (
+                f'Emoji desconhecido: {raw or "(vazio)"}. Use um emoji Unicode (ex: 👍) '
+                'ou :nome: de um emoji personalizado deste servidor.'
+            )
+        message_id = args.get('message_id')
+        try:
+            target = await self._target(message_id)
+        except (TypeError, ValueError):
+            return f'message_id inválido: {message_id}'
+        except discord.NotFound:
+            return f'Mensagem {message_id} não encontrada no canal atual (só é possível reagir aqui).'
+        except discord.Forbidden:
+            return 'Sem permissão para ler mensagens deste canal.'
+        except discord.HTTPException as e:
+            return f'Não foi possível buscar a mensagem: {e.text or e}'
+        if target is None:
+            return 'Informe message_id: não há mensagem que acionou esta resposta.'
+        try:
+            await target.add_reaction(emoji)
+        except discord.Forbidden:
+            return 'Sem permissão para adicionar reações neste canal.'
+        except discord.HTTPException as e:
+            return f'Não foi possível reagir com {raw}: {e.text or e}'
+        self.left -= 1
+        return f'Reação {reaction_label(emoji)} adicionada à mensagem {target.id}.'

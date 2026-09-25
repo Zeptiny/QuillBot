@@ -70,6 +70,7 @@ from config import (
     MEMORY_ENABLED,
     OPENAI_API_KEY,
     OPENAI_BASE_URL,
+    REACTION_TOOL_ENABLED,
     SCHEDULER_ENABLED,
     SUMMARY_ENABLED,
     TAVILY_AVAILABLE,
@@ -786,9 +787,14 @@ class Commands(commands.Cog):
             base_tools.extend(SCHEDULER_TOOLS)
         if SUMMARY_ENABLED:
             base_tools.append(SUMMARIZE_CHANNEL_TOOL)
+        if REACTION_TOOL_ENABLED:
+            base_tools.append(message_media.ADD_REACTION_TOOL)
         active_tools = base_tools if base_tools else None
         fallback_channel = channel or (interaction.channel if interaction else None)
         fallback_guild = guild or (interaction.guild if interaction else None)
+        reaction_tool = message_media.ReactionTool(
+            fallback_channel, guild=fallback_guild, default_message=context_message,
+        )
 
         async def _exec(name: str, args: dict) -> tuple[str, list[dict]]:
             if name in ('web_search', 'web_extract'):
@@ -828,6 +834,8 @@ class Commands(commands.Cog):
                     args, guild=fallback_guild, channel=fallback_channel,
                     requester=user, before=context_message,
                 )
+            if name == 'add_reaction':
+                return await reaction_tool(args), []
             result = await exec_history_tool(name, args, bot=self.bot, guild=fallback_guild, channel=fallback_channel)
             if result is not None:
                 return result
@@ -852,6 +860,8 @@ class Commands(commands.Cog):
                 return f'⏰ Removendo tarefa #{args.get("id", "?")}'
             if name == 'summarize_channel':
                 return summary_tool_status(args, fallback_guild)
+            if name == 'add_reaction':
+                return message_media.reaction_tool_status(args)
             label = history_tool_status(name, args)
             if label is not None:
                 return label

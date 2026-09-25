@@ -266,6 +266,69 @@ def test_question_with_media():
     assert mm.question_with_media('', fake_message(2)) == ''
 
 
+class ReactChannel:
+    def __init__(self, messages, guild=None):
+        self._messages = {m.id: m for m in messages}
+        self.guild = guild
+        self.fetched = []
+
+    async def fetch_message(self, message_id):
+        import discord
+        self.fetched.append(message_id)
+        if message_id not in self._messages:
+            raise discord.NotFound(SimpleNamespace(status=404, reason='Not Found'), 'Unknown Message')
+        return self._messages[message_id]
+
+
+def reactable(message_id):
+    msg = fake_message(message_id, 'oi')
+    msg.added = []
+
+    async def add_reaction(emoji):
+        msg.added.append(emoji)
+
+    msg.add_reaction = add_reaction
+    return msg
+
+
+def test_reaction_tool_targets_and_emojis():
+    kek = SimpleNamespace(name='KEK', id=42, available=True)
+    gone = SimpleNamespace(name='gone', id=43, available=False)
+    guild = SimpleNamespace(emojis=[kek, gone])
+    trigger, other = reactable(10), reactable(11)
+    channel = ReactChannel([trigger, other], guild)
+    tool = mm.ReactionTool(channel, default_message=trigger, limit=5)
+
+    assert asyncio.run(tool({'emoji': '👍'})) == 'Reação 👍 adicionada à mensagem 10.'
+    assert trigger.added == ['👍'] and channel.fetched == []  # default: triggering message
+
+    assert asyncio.run(tool({'emoji': ':kek:', 'message_id': '11'})) == 'Reação :KEK: adicionada à mensagem 11.'
+    assert other.added == [kek] and channel.fetched == [11]
+
+    out = asyncio.run(tool({'emoji': '<a:party:223456789012345678>', 'message_id': 10}))
+    assert out == 'Reação :party: adicionada à mensagem 10.'
+    assert trigger.added[-1].id == 223456789012345678 and trigger.added[-1].animated
+
+    assert asyncio.run(tool({'emoji': ':gone:'})).startswith('Emoji desconhecido: :gone:')
+    assert asyncio.run(tool({'emoji': 'thumbsup'})).startswith('Emoji desconhecido')
+    assert asyncio.run(tool({'emoji': '👍', 'message_id': '999'})).startswith('Mensagem 999 não encontrada no canal atual')
+    assert asyncio.run(tool({'emoji': '👍', 'message_id': 'abc'})) == 'message_id inválido: abc'
+    assert tool.left == 2  # only successful reactions count
+
+
+def test_reaction_tool_limit_and_no_target():
+    trigger = reactable(10)
+    tool = mm.ReactionTool(ReactChannel([trigger]), default_message=trigger, limit=2)
+    for emoji in ('1️⃣', '2️⃣'):
+        asyncio.run(tool({'emoji': emoji}))
+    assert asyncio.run(tool({'emoji': '3️⃣'})).startswith('Limite de reações')
+    assert trigger.added == ['1️⃣', '2️⃣']
+
+    slash = mm.ReactionTool(ReactChannel([]))  # /chat: no triggering message
+    assert asyncio.run(slash({'emoji': '👍'})).startswith('Informe message_id')
+    assert asyncio.run(mm.ReactionTool(None)({'emoji': '👍'})) == 'Não há canal atual onde reagir.'
+
+
 if __name__ == '__main__':
     test_content_text_markers()
     test_media_sources_order_and_lottie()
@@ -277,4 +340,6 @@ if __name__ == '__main__':
     test_channel_history_lines_carry_reactions()
     test_encode_animation_sheet_and_transparency()
     test_question_with_media()
+    test_reaction_tool_targets_and_emojis()
+    test_reaction_tool_limit_and_no_target()
     print('ok')

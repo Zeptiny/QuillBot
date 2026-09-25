@@ -47,7 +47,7 @@ All AI responses are in **Brazilian Portuguese** and formatted for Discord embed
 Ask any Minecraft server administration question. Uses an agentic RAG loop — the LLM automatically calls `search_docs`, `search_plugins`, `memory_search`, `search_history`, and context tools to ground its answer in real documentation.
 
 - **Model:** `CHAT_MODEL` (default: `qwen/qwen3.6-plus`)
-- **Tools available:** `search_docs`, `search_plugins`, `memory_search`, `memory_write`, `memory_about`, `get_channel_history`, `get_guild_info`, `search_history`, `get_message_context`, `find_user`, `sql_history`
+- **Tools available:** `search_docs`, `search_plugins`, `memory_search`, `memory_write`, `memory_about`, `get_channel_history`, `get_guild_info`, `search_history`, `get_message_context`, `find_user`, `sql_history`, `add_reaction`
 - **Features:** Image/screenshot analysis, 5-minute ephemeral prompt+report cache, paginated multi-embed output with source links, reply to continue conversation (30 min TTL, 200 conversations), cooldown per user
 - **Follow-up:** Reply to the bot's response to continue the conversation with full history
 
@@ -55,6 +55,7 @@ Ask any Minecraft server administration question. Uses an agentic RAG loop — t
 General-purpose assistant (same agentic loop as `/ask` but with web search).
 
 - **Tools:** `web_search`, `web_extract` (via Tavily), plus the same context/history tools as `/ask`, the scheduler tools and `summarize_channel` (see `/resumo`)
+- **Reactions:** `add_reaction` lets the model react with a Unicode emoji or a `:nome:` custom emoji of the server, only to messages in the current channel (the triggering message by default) and at most 3 per answer. `REACTION_TOOL_ENABLED=false` removes the tool
 - **Web search:** Supports `search_depth` (basic/advanced), `time_range`, domain filtering
 - **Reply follow-up** and **@mention mode:** Mention the bot (`@QuillBot <question>`) to chat without a slash command — same rate-limit and conversation handling as `/chat`
 - Set `CHAT_MENTION_ENABLED=false` to disable mention mode
@@ -364,6 +365,7 @@ cp .env.example .env   # if available, otherwise create .env manually
 | `CHANNEL_CONTEXT_IMAGES_ENABLED` | `true` | Send images attached to channel-context and follow-up gap messages as vision parts (`false` for text-only models) |
 | `CHANNEL_CONTEXT_IMAGE_MAX_AGE_MINUTES` | `60` | Only channel-context images newer than this are sent (`0` = no age limit) |
 | `CHANNEL_CONTEXT_REACTIONS_ENABLED` | `true` | Show reactions on channel-context lines (history tool, recent window, follow-up gaps, message context) |
+| `REACTION_TOOL_ENABLED` | `true` | Give the chat model the `add_reaction` tool (current channel only, 3 per answer) |
 | `REACTION_USERS_LIMIT` | `5` | Reactor names shown per reaction (one API call per reaction, cached while the count is unchanged; `0` = counts only) |
 | `HISTORY_ENABLED` | `true` | Enable server history RAG |
 | `MEMORY_ENABLED` | `true` | Enable persistent memory (cog not loaded when false) |
