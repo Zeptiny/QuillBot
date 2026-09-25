@@ -932,7 +932,7 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
                     continue
                 if HISTORY_EXCLUDE_BOTS and msg.author.bot:
                     continue
-                if not msg.content and not msg.attachments and not msg.embeds:
+                if not msg.content and not msg.attachments and not msg.embeds and not msg.stickers:
                     continue
                 to_index.append(msg)
                 if len(to_index) >= 200:
@@ -1084,7 +1084,7 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
             return
         if HISTORY_EXCLUDE_BOTS and message.author.bot:
             return
-        if not message.content and not message.attachments and not message.embeds:
+        if not message.content and not message.attachments and not message.embeds and not message.stickers:
             return
         gid = message.guild.id
         if gid not in self._chunks:

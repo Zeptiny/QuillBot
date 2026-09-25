@@ -17,7 +17,7 @@ from zoneinfo import ZoneInfo
 import discord
 from openai import AsyncOpenAI
 
-from cogs import image_store
+from cogs import image_store, message_media
 from config import (
     CHANNEL_CONTEXT_IMAGE_MAX_AGE_MINUTES,
     CHANNEL_CONTEXT_IMAGES_ENABLED,
@@ -434,10 +434,17 @@ def _clip(text: str, limit: int) -> str:
 
 
 def message_content_text(msg: discord.Message, *, max_length: int = MESSAGE_LINE_MAX_CONTENT) -> str:
-    """Flattened message content with attachment/embed markers, never empty."""
-    c = msg.content or ""
+    """Flattened message content with attachment/sticker/embed markers, never empty.
+
+    Custom emojis are shown as ``:name:`` (the raw ``<:name:id>`` markup is
+    noise to the model and to keyword search).
+    """
+    c = message_media.emoji_text(msg.content or "")
     if msg.attachments:
         c += " " + " ".join(f"[anexo:{a.filename}]" for a in msg.attachments)
+    markers = message_media.sticker_markers(msg) + message_media.embed_markers(msg)
+    if markers:
+        c += " " + " ".join(markers)
     if not c.strip() and msg.embeds:
         try:
             c = f"[embed: {msg.embeds[0].title or msg.embeds[0].description[:100]}]"
@@ -449,8 +456,12 @@ def message_content_text(msg: discord.Message, *, max_length: int = MESSAGE_LINE
     return _clip(c, max_length)
 
 
-def format_message_line(msg: discord.Message) -> str:
-    """Render a Discord message in the canonical line format."""
+def format_message_line(msg: discord.Message, *, reactions: str = '') -> str:
+    """Render a Discord message in the canonical line format.
+
+    *reactions* (from :func:`cogs.message_media.reaction_summaries`) goes right
+    before ``msg_id``, outside the clipped content.
+    """
     display = _flatten(getattr(msg.author, 'display_name', None) or str(msg.author))
     handle = _flatten(getattr(msg.author, 'name', None) or '')
     author = f"{display} (@{handle})" if handle else display
@@ -466,8 +477,16 @@ def format_message_line(msg: discord.Message) -> str:
             if rdisplay:
                 target = f" ({rdisplay})"
         line += f" ↩ reply_to={ref_id}{target}"
+    if reactions:
+        line += f" {reactions}"
     line += f" [msg_id={msg.id}]"
     return line
+
+
+async def format_message_lines(messages: list[discord.Message]) -> list[str]:
+    """Canonical lines for *messages* (same order), with their reactions."""
+    reactions = await message_media.reaction_summaries(messages)
+    return [format_message_line(m, reactions=reactions.get(m.id, '')) for m in messages]
 
 
 def format_chunk_line(ch: dict) -> str:
@@ -613,26 +632,58 @@ def build_full_context_block(
     return "\n".join(parts)
 
 
-def _context_image_attachments(msg: discord.Message, now: datetime.datetime) -> list[Any]:
-    """Image attachments of a context message eligible to be shown to the model.
+def _context_images_eligible(msg: discord.Message, now: datetime.datetime) -> bool:
+    """False when channel-context images are disabled or *msg* is too old.
 
-    Empty when channel-context images are disabled or the message is older than
-    ``CHANNEL_CONTEXT_IMAGE_MAX_AGE_MINUTES`` (stale images are rarely what a
-    question is about, and every one sent costs tokens).
+    Stale images are rarely what a question is about (see
+    ``CHANNEL_CONTEXT_IMAGE_MAX_AGE_MINUTES``), and every one sent costs tokens.
     """
     if not CHANNEL_CONTEXT_IMAGES_ENABLED:
-        return []
+        return False
     created = getattr(msg, 'created_at', None)
-    if (
+    return not (
         CHANNEL_CONTEXT_IMAGE_MAX_AGE_MINUTES > 0
         and created is not None
         and now - created > datetime.timedelta(minutes=CHANNEL_CONTEXT_IMAGE_MAX_AGE_MINUTES)
-    ):
+    )
+
+
+def _context_image_attachments(msg: discord.Message, now: datetime.datetime) -> list[Any]:
+    """Visual media of a context message eligible to be shown to the model.
+
+    Image attachments (GIFs included), stickers and GIF/image link embeds;
+    empty when :func:`_context_images_eligible` says no.
+    """
+    if not _context_images_eligible(msg, now):
         return []
-    return [
-        attachment for attachment in getattr(msg, 'attachments', [])
-        if (getattr(attachment, 'content_type', None) or '').startswith('image/')
-    ]
+    return message_media.media_sources(msg)
+
+
+def _context_image_groups(messages: list[discord.Message], now: datetime.datetime) -> list[list[Any]]:
+    """Per-message image sources for *messages* (newest first), within budget.
+
+    Media (attachments, stickers, GIFs) take the ``CHANNEL_CONTEXT_MAX_IMAGES``
+    slots first, newest messages first; custom-emoji sheets (one per message)
+    only fill the slots left over, since their names are already in the text.
+    Groups keep the newest-first order :func:`_persist_context_images` expects.
+    """
+    slots = CHANNEL_CONTEXT_MAX_IMAGES
+    by_index: dict[int, list[Any]] = {}
+    for index, msg in enumerate(messages):
+        if slots <= 0:
+            break
+        media = _context_image_attachments(msg, now)[:slots]
+        if media:
+            by_index[index] = media
+            slots -= len(media)
+    for index, msg in enumerate(messages):
+        if slots <= 0:
+            break
+        sheet = message_media.emoji_sheet(msg) if _context_images_eligible(msg, now) else None
+        if sheet is not None:
+            by_index.setdefault(index, []).append(sheet)
+            slots -= 1
+    return [by_index[i] for i in sorted(by_index)]
 
 
 async def _persist_context_images(groups: list[list[Any]]) -> list[str]:
@@ -679,18 +730,12 @@ async def fetch_channel_history(
     if target is None or not hasattr(target, "history"):
         return "Histórico não disponível para este canal."
     limit = max(1, min(50, int(limit)))
-    lines: list[str] = []
-    image_groups: list[list[Any]] = []
-    image_slots = CHANNEL_CONTEXT_MAX_IMAGES
+    messages: list[discord.Message] = []
     now = datetime.datetime.now(datetime.timezone.utc)
     try:
         async for msg in target.history(limit=limit, before=before):
-            lines.append(format_message_line(msg))
-            if include_images and image_slots > 0:
-                attachments = _context_image_attachments(msg, now)[:image_slots]
-                if attachments:
-                    image_groups.append(attachments)
-                    image_slots -= len(attachments)
+            messages.append(msg)
+        lines = await format_message_lines(messages)
     except discord.Forbidden:
         return "Sem permissão para ler histórico deste canal."
     except Exception as e:
@@ -707,7 +752,7 @@ async def fetch_channel_history(
     text = header + "\n".join(lines)
     if not include_images:
         return text
-    images = await _persist_context_images(image_groups)
+    images = await _persist_context_images(_context_image_groups(messages, now))
     return ChannelContext(text=text, lines=lines, images=images)
 
 
@@ -772,9 +817,7 @@ async def fetch_channel_gap(
         return ChannelContext()
     skip = {str(s) for s in (skip_ids or set()) if s}
     skip.add(str(after_id))
-    lines: list[str] = []
-    image_groups: list[list[Any]] = []
-    image_slots = CHANNEL_CONTEXT_MAX_IMAGES
+    messages: list[discord.Message] = []
     now = datetime.datetime.now(datetime.timezone.utc)
     try:
         async for msg in channel.history(limit=max(n * 3, 100), before=before):
@@ -782,17 +825,13 @@ async def fetch_channel_gap(
                 break
             if msg.author.bot or str(msg.id) in skip:
                 continue
-            if not msg.content and not msg.attachments and not msg.embeds:
+            if not msg.content and not msg.attachments and not msg.embeds and not message_media.stickers(msg):
                 continue
-            lines.append(format_message_line(msg))
-            if image_slots > 0:
-                attachments = _context_image_attachments(msg, now)[:image_slots]
-                if attachments:
-                    image_groups.append(attachments)
-                    image_slots -= len(attachments)
-            if len(lines) >= n:
+            messages.append(msg)
+            if len(messages) >= n:
                 break
-        images = await _persist_context_images(image_groups)
+        lines = await format_message_lines(messages)
+        images = await _persist_context_images(_context_image_groups(messages, now))
     except Exception:
         logger.exception("fetch_channel_gap failed")
         return ChannelContext()
@@ -869,15 +908,11 @@ async def fetch_message_context(
             after.append(m)
     except Exception:
         pass
-    def fmt(m: discord.Message, highlight: bool = False) -> str:
-        prefix = "▶ " if highlight else "  "
-        return prefix + format_message_line(m)
-    lines: list[str] = []
-    for m in before:
-        lines.append(fmt(m))
-    lines.append(fmt(target, True))
-    for m in after:
-        lines.append(fmt(m))
+    window_messages = [*before, target, *after]
+    lines = [
+        ("▶ " if m is target else "  ") + line
+        for m, line in zip(window_messages, await format_message_lines(window_messages))
+    ]
     header = (
         f"Contexto ao redor de {message_id} em #{getattr(channel, 'name', channel_id)} "
         f"(channel_id={channel.id}, ±{window}):\n"

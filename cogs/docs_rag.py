@@ -16,6 +16,7 @@ from discord.ext import commands, tasks
 from openai import AsyncOpenAI, RateLimitError
 
 from cogs import image_store as _image_store
+from cogs import message_media as _message_media
 from cogs.conversation_store import (
     ConversationStore as _ConversationStore,
     add_participants as _add_participants,
@@ -79,6 +80,7 @@ from config import (
     OPENAI_API_KEY,
     OPENAI_BASE_URL,
     OPENROUTER_API_KEY,
+    REACTION_TOOL_ENABLED,
     REINDEX_INTERVAL_HOURS,
     RERANK_AVAILABLE,
     RERANK_MODEL,
@@ -313,6 +315,8 @@ TOOLS.extend([
 ])
 if HISTORY_SQL_TOOL_ENABLED:
     TOOLS.append(_SQL_HISTORY_TOOL)
+if REACTION_TOOL_ENABLED:
+    TOOLS.append(_message_media.ADD_REACTION_TOOL)
 
 # Additional tools injected only when a Spark report is active in the session.
 _SPARK_SECTIONS_STR = ', '.join(f'"{s}"' for s in _SPARK_SECTIONS)
@@ -1115,8 +1119,13 @@ class DocsRAG(commands.Cog):
         user: discord.abc.User | discord.Member | None = None,
         origin: str | None = None,
         participant_ids: set[str] | None = None,
+        reaction_tool: _message_media.ReactionTool | None = None,
     ) -> tuple[str, list[dict]]:
         """Execute a tool call and return (result_text, source_chunks)."""
+        if name == 'add_reaction':
+            if reaction_tool is None:
+                return 'Reações não disponíveis aqui.', []
+            return await reaction_tool(args), []
         if name in ('memory_search', 'memory_write', 'memory_about'):
             mem_cog = self.bot.get_cog('Memory')
             if not mem_cog:
@@ -1208,6 +1217,8 @@ class DocsRAG(commands.Cog):
         label = _history_tool_status(tool_name, args)
         if label is not None:
             return label
+        if tool_name == 'add_reaction':
+            return _message_media.reaction_tool_status(args)
         if tool_name == 'memory_search':
             return f"🧠 Recordando: *{args.get('query', '')[:40]}*"
         if tool_name == 'memory_write':
@@ -1418,10 +1429,14 @@ class DocsRAG(commands.Cog):
         model = SPARK_MODEL if spark_report is not None else CHAT_MODEL
         active_tools = TOOLS + SPARK_TOOLS if spark_report is not None else TOOLS
 
+        reaction_tool = _message_media.ReactionTool(
+            channel, guild=guild, default_message=context_message,
+        )
         exec_tool = (
             lambda name, args: self._exec_tool(
                 name, args, spark_report=spark_report, bot=self.bot, channel=channel,
                 guild=guild, user=user, origin=origin, participant_ids=participant_ids,
+                reaction_tool=reaction_tool,
             )
         )
 
@@ -1572,9 +1587,9 @@ class DocsRAG(commands.Cog):
             return
 
         image_urls: list[str] = await _image_store.persist_images(
-            att for att in message.attachments
-            if att.content_type and att.content_type.startswith('image/')
+            _message_media.visual_sources(message)
         )
+        follow_up_question = _message_media.question_with_media(follow_up_question, message)
 
         if not follow_up_question:
             follow_up_question = 'Analise esta imagem.'
