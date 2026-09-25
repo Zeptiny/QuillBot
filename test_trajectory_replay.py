@@ -24,7 +24,7 @@ from cogs.conversation_store import (
     stepped_floor,
     validate_trajectory,
 )
-from cogs.utils import run_tool_loop, serialize_trajectory
+from cogs.utils import SQL_HISTORY_TOOL, extract_text_tool_calls, run_tool_loop, serialize_trajectory
 
 PASS = 0
 FAIL = 0
@@ -341,6 +341,109 @@ async def test_run_tool_loop_retry_capture():
     }, str(trajectory[-2:]))
 
 
+# Verbatim leak from a GLM model (no newline after the tool name).
+LEAKED_SQL = (
+    "WITH tot AS (\nSELECT author_id, COUNT() total FROM chunks WHERE guild_id = 1 GROUP BY author_id\n)\n"
+    "SELECT t.total FROM tot t WHERE t.total >= 50"
+)
+GLM_LEAK = f'<tool_call>sql_history<arg_key>sql</arg_key><arg_value>{LEAKED_SQL}</arg_value></tool_call>'
+SEARCH_TOOL = {'type': 'function', 'function': {'name': 'search_history', 'parameters': {
+    'type': 'object',
+    'properties': {'query': {'type': 'string'}, 'limit': {'type': 'integer'}},
+}}}
+
+
+def test_extract_text_tool_calls():
+    print('extract_text_tool_calls')
+    tools = [SQL_HISTORY_TOOL, SEARCH_TOOL]
+    text, calls, had = extract_text_tool_calls(GLM_LEAK, tools)
+    check('glm inline call parsed', calls == [('sql_history', {'sql': LEAKED_SQL})], str(calls))
+    check('glm markup stripped', text == '' and had)
+
+    glm_nl = (
+        'Vou buscar.\n<tool_call>search_history\n<arg_key>query</arg_key>\n<arg_value>2024</arg_value>\n'
+        '<arg_key>limit</arg_key>\n<arg_value>10</arg_value>\n</tool_call>'
+    )
+    text, calls, _ = extract_text_tool_calls(glm_nl, tools)
+    check('glm newline format; string kept, int decoded',
+          calls == [('search_history', {'query': '2024', 'limit': 10})], str(calls))
+    check('prose outside markup kept', text == 'Vou buscar.', repr(text))
+
+    hermes = '<tool_call>\n{"name": "search_history", "arguments": {"query": "lag", "limit": 5}}\n</tool_call>'
+    _, calls, _ = extract_text_tool_calls(hermes, tools)
+    check('hermes json parsed', calls == [('search_history', {'query': 'lag', 'limit': 5})], str(calls))
+
+    coder = (
+        '<tool_call>\n<function=sql_history>\n<parameter=sql>\nSELECT 1 WHERE guild_id=1\n</parameter>\n'
+        '</function>\n</tool_call>'
+    )
+    _, calls, _ = extract_text_tool_calls(coder, tools)
+    check('qwen3-coder xml parsed', calls == [('sql_history', {'sql': 'SELECT 1 WHERE guild_id=1'})], str(calls))
+
+    text, calls, had = extract_text_tool_calls(GLM_LEAK, [SEARCH_TOOL])
+    check('tool not offered: no call, still stripped', calls == [] and text == '' and had, str(calls))
+    text, calls, had = extract_text_tool_calls('Resposta. <tool_call>sql_history<arg_key>sql</arg_key><arg_val', tools)
+    check('truncated block stripped', text == 'Resposta.' and calls == [] and had, repr(text))
+    plain = 'Use `<b>` e compare com 5 < 6.'
+    check('plain text passthrough', extract_text_tool_calls(plain, tools) == (plain, [], False))
+
+
+async def test_run_tool_loop_recovers_text_tool_call():
+    print('run_tool_loop executes a tool call left in content')
+    client = _fake_client([
+        fake_response(fake_assistant(GLM_LEAK), 'stop'),
+        fake_response(fake_assistant('Ranking pronto.'), 'stop'),
+    ])
+    messages = [{'role': 'user', 'content': 'q'}]
+    seen = []
+
+    async def exec_tool(name, args):
+        seen.append((name, args))
+        return 'display_name | total', []
+
+    answer, _, trajectory = await run_tool_loop(client, 'model-x', messages, [SQL_HISTORY_TOOL], exec_tool)
+    check('recovered call executed', seen == [('sql_history', {'sql': LEAKED_SQL})], str(seen))
+    check('final answer returned', answer == 'Ranking pronto.', answer)
+    call = trajectory[0].get('tool_calls') or [{}]
+    check('capture holds structured call, not markup',
+          trajectory[0]['content'] is None and call[0].get('function', {}).get('name') == 'sql_history',
+          str(trajectory[0]))
+    check('tool result paired with synthetic id',
+          trajectory[1] == {'role': 'tool', 'tool_call_id': call[0].get('id'), 'content': 'display_name | total'},
+          str(trajectory[1]))
+    check('synthetic call sent structured on next round',
+          client.chat.completions.calls[1]['messages'][1]['tool_calls'][0]['id'] == call[0].get('id'))
+
+
+async def test_run_tool_loop_forced_round_markup_retried():
+    print('run_tool_loop never returns tool-call markup as the answer')
+    tc_msg = fake_assistant(tool_calls=[('sql_history', '{"sql": "SELECT 1"}')])
+    client = _fake_client([
+        fake_response(tc_msg, 'tool_calls'),
+        # max_rounds exhausted: forced completion without tools -> text call
+        fake_response(fake_assistant('Vou corrigir a consulta:\n' + GLM_LEAK), 'stop'),
+        fake_response(fake_assistant('Aqui está o ranking.'), 'stop'),
+    ])
+    messages = [{'role': 'user', 'content': 'q'}]
+
+    async def exec_tool(name, args):
+        return 'Erro SQL: no such column: t.total', []
+
+    answer, _, trajectory = await run_tool_loop(
+        client, 'model-x', messages, [SQL_HISTORY_TOOL], exec_tool, max_rounds=1,
+    )
+    check('forced round had no tools', 'tools' not in client.chat.completions.calls[1])
+    check('markup reply retried with nudge', answer == 'Aqui está o ranking.', answer)
+    check('no markup captured', all('<tool_call>' not in (m.get('content') or '') for m in trajectory))
+
+    client = _fake_client([
+        fake_response(fake_assistant(GLM_LEAK), 'stop'),
+        fake_response(fake_assistant(GLM_LEAK), 'stop'),
+    ])
+    answer, _, _ = await run_tool_loop(client, 'model-x', [{'role': 'user', 'content': 'q'}], None, exec_tool)
+    check('markup twice -> fallback message', answer == 'Não foi possível gerar uma resposta.', answer)
+
+
 async def test_store_roundtrip():
     print('ConversationStore persistence round-trip')
     tmp = tempfile.mkdtemp()
@@ -367,6 +470,9 @@ async def main():
     test_apply_cache_control()
     await test_run_tool_loop_capture()
     await test_run_tool_loop_retry_capture()
+    test_extract_text_tool_calls()
+    await test_run_tool_loop_recovers_text_tool_call()
+    await test_run_tool_loop_forced_round_markup_retried()
     await test_store_roundtrip()
     test_verbatim_image_budget()
     print(f'\n{PASS} passed, {FAIL} failed')

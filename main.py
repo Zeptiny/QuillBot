@@ -22,13 +22,24 @@ install_api_logging()
 
 intents = discord.Intents.default()
 intents.message_content = True
+intents.members = True
 
-bot = commands.Bot(command_prefix='!', intents=intents)
+# Nothing in message content pings by default: several replies echo user or
+# LLM text, which could otherwise smuggle in @everyone / role / user pings.
+# Code paths that should notify opt in per message (see ping_send_kwargs).
+# replied_user stays on so replies keep notifying their author.
+bot = commands.Bot(
+    command_prefix='!',
+    intents=intents,
+    allowed_mentions=discord.AllowedMentions(
+        everyone=False, users=False, roles=False, replied_user=True,
+    ),
+)
 
 # Load order matters: log_analyzer's on_message (pattern matching) runs before
 # docs_rag's on_message (follow-up replies). Do not reorder without reviewing
 # listener interactions.
-COGS = ['cogs.log_analyzer', 'cogs.history_rag', 'cogs.commands', 'cogs.plugins', 'cogs.spark', 'cogs.docs_rag', 'cogs.memory']
+COGS = ['cogs.log_analyzer', 'cogs.history_rag', 'cogs.commands', 'cogs.plugins', 'cogs.spark', 'cogs.docs_rag', 'cogs.memory', 'cogs.scheduler', 'cogs.summary']
 
 
 @bot.tree.error

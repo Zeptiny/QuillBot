@@ -32,6 +32,7 @@ Built with [discord.py](https://discordpy.readthedocs.io/) + RAG (Retrieval-Augm
 | **Spark Profiler** | Full report parsing, bottleneck diagnosis, platform-aware recommendations |
 | **Plugin Search** | Concurrent search across Modrinth, Hangar, SpigotMC |
 | **Server Tools** | JVM flags, server status checks, docs changelog |
+| **Channel Summaries** | `/resumo` and natural-language "o que perdi?" — map-reduce summaries of a channel or thread over any period, with jump links and permission checks |
 | **Persistent Memory** | The bot remembers: atomic facts about the server and its members, auto-injected into every conversation, with inline LLM writes, pinning, dedupe, full audit history and admin control |
 
 All AI responses are in **Brazilian Portuguese** and formatted for Discord embeds.
@@ -53,10 +54,26 @@ Ask any Minecraft server administration question. Uses an agentic RAG loop — t
 #### `/chat <question> [image]`
 General-purpose assistant (same agentic loop as `/ask` but with web search).
 
-- **Tools:** `web_search`, `web_extract` (via Tavily), plus the same context/history tools as `/ask`
+- **Tools:** `web_search`, `web_extract` (via Tavily), plus the same context/history tools as `/ask`, the scheduler tools and `summarize_channel` (see `/resumo`)
 - **Web search:** Supports `search_depth` (basic/advanced), `time_range`, domain filtering
 - **Reply follow-up** and **@mention mode:** Mention the bot (`@QuillBot <question>`) to chat without a slash command — same rate-limit and conversation handling as `/chat`
 - Set `CHAT_MENTION_ENABLED=false` to disable mention mode
+
+#### `/resumo [canal] [periodo] [foco]`
+Summarize what happened in a channel or thread while you were away.
+
+- **`canal`** — text/voice channel or thread (default: the current one). Archived threads work too
+- **`periodo`** — default *since your last message* in that channel (your own messages from the last 10 minutes don't count, so "voltei!" + `/resumo` still covers the gap); also `30m`/`6h`/`2d`, `hoje`, `ontem` or a date like `24/09/2026 08:00` (Brasília time). Autocompletes common presets
+- **`foco`** — optional topic to focus on ("backup", "o lag do servidor")
+- **Output:** ephemeral embed with **Tópicos**, **Decisões e soluções** and **Pendências**, each item linked (↗) to the message it came from, plus a private **🔔 Mencionaram você** list (messages that mentioned or replied to you). **📢 Publicar no canal** posts it publicly (without your mentions); replying to the published summary continues it as a `/chat` conversation
+- **How it works (`cogs/summary.py`):**
+  - Messages are read straight from Discord, newest first, until the period start, `SUMMARY_MAX_MESSAGES` or `SUMMARY_MAX_DAYS`. Bot answers are included, since in support channels they're often the fix
+  - Ranges that fit `SUMMARY_SEGMENT_CHARS` take one LLM call. Longer ones are split at conversation gaps (≥20 min of silence), each part is summarized in parallel, and the notes are merged
+  - The model cites messages as `[msg_id=…]`; code turns them into jump links and drops any ID that wasn't in the fetched range
+  - Mentions are rewritten as plain names, so summaries never ping anyone
+- **Permissions:** only channels that *you* can view and read the history of (private threads also require membership or Manage Threads), in the current server
+- **Natural language:** the same engine is the `summarize_channel` tool in `/chat`, @mention, reply follow-ups and scheduled tasks. For example `@QuillBot o que perdi?`, `resume o que rolou no #suporte desde ontem` or a daily scheduled "resumo do #geral". The chat model turns "hoje"/"desde ontem" into timestamps using its clock context and receives a finished summary, not raw messages, so the 6000-char tool-result cap and conversation replay stay small
+- Set `SUMMARY_ENABLED=false` to remove the command and the tool
 
 #### `/analyze [log_link] [log_file] [image]`
 AI-powered log/crash-report analysis.
@@ -219,7 +236,7 @@ Replay windows advance in `CONVERSATIONS_TRAJECTORY_STEP`-turn steps (hysteresis
 ### Context Injection
 Every AI call receives a `<contexto>` block with user (display name, account age, join date, roles), guild (name, member count, channels, roles), channel, and temporal (BRT + UTC) context.
 
-When `CHANNEL_CONTEXT_MESSAGES` > 0 (default `10`), `/ask`, `/chat`, @mention and reply follow-ups also receive a `<mensagens_recentes_do_canal>` block — the latest N channel messages in chronological order, same format as the `get_channel_history` tool. The triggering message is excluded; set `0` to disable. Reply follow-ups use the captured gap block (`prior_context`, see `CONVERSATIONS_GAP_MESSAGES`) instead of this recent-channel window whenever a gap was captured.
+When `CHANNEL_CONTEXT_MESSAGES` > 0 (default `10`), `/ask`, `/chat`, @mention and reply follow-ups also receive a `<mensagens_recentes_do_canal>` block — the latest N channel messages in chronological order, same format as the `get_channel_history` tool. Image attachments in that context are persisted and sent as vision parts, up to the four-image per-message budget (current-message images take priority, then the newest channel images); filenames remain visible in the text context. Only images posted within `CHANNEL_CONTEXT_IMAGE_MAX_AGE_MINUTES` (default `60`) are sent, and `CHANNEL_CONTEXT_IMAGES_ENABLED=false` turns channel images off entirely (use it with text-only `CHAT_MODEL`s). Attachments are downloaded once and reused by attachment id. The triggering message is excluded; set `0` to disable. Reply follow-ups use the captured gap block (`prior_context`, see `CONVERSATIONS_GAP_MESSAGES`) instead of this recent-channel window whenever a gap was captured, including images from those gap messages.
 
 ### Prefix-Cache-Friendly Message Layout
 The LLM message list is ordered so conversation follow-ups reuse a cached prefix: `[system (persona + static conversation summary)] → [replayed history turns] → [current message]`. All per-request blocks — `<contexto>` (clock), the semantically-selected memory block, and the recent channel window — ride on the **final user message** instead of the system prompt, so the system prompt + history stay byte-identical across turns and providers can prefix-cache them (typically 80–95% input-token savings on cached prefixes).
@@ -268,6 +285,7 @@ QuillBot/
 │   ├── log_analyzer.py   # Passive log detection, pattern matching, /analyze, file upload to mclo.gs
 │   ├── memory.py         # Persistent memory — auto-injection, LLM write tools, admin commands, audit history, log channel, lore migration
 │   ├── plugins.py        # /plugin, /status, /changelog — plugin search & server status
+│   ├── summary.py        # /resumo + summarize_channel tool — period parsing, fetch, map-reduce summary, permission checks
 │   ├── spark.py          # /spark command + passive spark.lucko.me detection
 │   ├── spark_parser.py   # Spark JSON parsing, summary/detail builders, call-tree rendering
 │   ├── plugin_apis.py    # Shared Modrinth/Hangar/SpigotMC API helpers
@@ -342,7 +360,9 @@ cp .env.example .env   # if available, otherwise create .env manually
 | `WEB_SEARCH_ENABLED` | `true` | Enable Tavily web search |
 | `TAVILY_API_KEY` | — | Required when web search is enabled |
 | `CHAT_MENTION_ENABLED` | `true` | Enable @mention chat mode |
-| `CHANNEL_CONTEXT_MESSAGES` | `10` | Latest channel messages auto-injected as context into `/ask`, `/chat`, @mention and reply follow-ups (`0` disables) |
+| `CHANNEL_CONTEXT_MESSAGES` | `10` | Latest channel messages auto-injected as text and vision context into `/ask`, `/chat`, @mention and reply follow-ups (`0` disables) |
+| `CHANNEL_CONTEXT_IMAGES_ENABLED` | `true` | Send images attached to channel-context and follow-up gap messages as vision parts (`false` for text-only models) |
+| `CHANNEL_CONTEXT_IMAGE_MAX_AGE_MINUTES` | `60` | Only channel-context images newer than this are sent (`0` = no age limit) |
 | `HISTORY_ENABLED` | `true` | Enable server history RAG |
 | `MEMORY_ENABLED` | `true` | Enable persistent memory (cog not loaded when false) |
 | `LOG_LEVEL` | `INFO` | Python logging level |
@@ -355,7 +375,7 @@ cp .env.example .env   # if available, otherwise create .env manually
 | `HISTORY_DB_PATH` | `data/history/history.db` | SQLite history DB (defaults to `<HISTORY_VECTOR_STORE_DIR>/history.db`) |
 | `HISTORY_WINDOW_SIZE` | `5` | Sliding window of prior messages per chunk |
 | `HISTORY_WINDOW_OVERLAP` | `1` | Overlap between consecutive chunks |
-| `HISTORY_BACKFILL_LIMIT` | _(none)_ | Max messages to backfill per channel (unset = all) |
+| `HISTORY_BACKFILL_LIMIT` | _(none)_ | Max messages to backfill per channel per run (unset = all); restarts resume after the newest indexed message |
 | `HISTORY_MAX_MSG_LENGTH` | `800` | Max chars per message in history chunks |
 | `HISTORY_EXCLUDE_BOTS` | `true` | Exclude bot messages from history |
 | `HISTORY_INGEST_BATCH_SIZE` | `10` | Messages per embedding batch during live ingestion |
@@ -371,7 +391,7 @@ cp .env.example .env   # if available, otherwise create .env manually
 | `HISTORY_HYBRID_WEIGHT_KEYWORD` | `0.35` | Keyword (FTS5) weight of the hybrid blend |
 | `HISTORY_RRF_K` | `60` | Reciprocal-rank-fusion constant |
 | `HISTORY_SQL_TOOL_ENABLED` | `true` | Enable the read-only `sql_history` LLM tool |
-| `HISTORY_SQL_TIMEOUT_SECONDS` | `5` | Query timeout enforced by the SQLite progress handler |
+| `HISTORY_SQL_TIMEOUT_SECONDS` | `30` | Query timeout enforced by the SQLite progress handler |
 | `HISTORY_SQL_MAX_ROWS` | `200` | Max rows returned / shown to the LLM |
 
 ### Vision Images
@@ -399,6 +419,16 @@ cp .env.example .env   # if available, otherwise create .env manually
 | `MEMORY_DEDUPE_THRESHOLD` | `0.85` | Cosine above which a create is refused as duplicate |
 | `LORE_DB_PATH` | `data/lore.db` | Legacy lore DB — one-time migration source for memory.db |
 
+### Channel Summaries
+
+| Variable | Default | Description |
+|---|---|---|
+| `SUMMARY_ENABLED` | `true` | Enable `/resumo` and the `summarize_channel` tool (cog not loaded when false) |
+| `SUMMARY_MODEL` | `CHAT_MODEL` | Model for the summary calls; a cheaper model is usually fine |
+| `SUMMARY_MAX_MESSAGES` | `1000` | Max messages read per summary (the newest are kept) |
+| `SUMMARY_MAX_DAYS` | `7` | Max lookback in days |
+| `SUMMARY_SEGMENT_CHARS` | `24000` | Rendered message chars per LLM call; longer ranges are summarized map-reduce style |
+
 ### Docs / RAG Indexing
 
 | Variable | Default | Description |
@@ -415,7 +445,7 @@ cp .env.example .env   # if available, otherwise create .env manually
 | `CONVERSATIONS_MAX_STORED` | `200` | Max conversations kept per flow (chat/ask) |
 | `CONVERSATIONS_MAX_TURNS` | `24` | Max turns stored per conversation |
 | `CONVERSATIONS_HISTORY_TURNS` | `16` | Turns replayed to the LLM per request |
-| `CONVERSATIONS_GAP_MESSAGES` | `20` | Max channel messages captured between two bot-directed turns as `prior_context` (`0` disables) |
+| `CONVERSATIONS_GAP_MESSAGES` | `20` | Max channel messages captured between two bot-directed turns as text and vision `prior_context` (`0` disables) |
 | `CONVERSATIONS_TRAJECTORY_ENABLED` | `true` | Capture and replay the internal LLM trajectory (tool calls/results + exact user message) per turn |
 | `CONVERSATIONS_TRAJECTORY_TURNS` | `6` | Most recent N turns replayed **verbatim** with their trajectory (older turns use the compact Q/A rendering) |
 | `CONVERSATIONS_TRAJECTORY_STEP` | `3` | Window advances in steps of N turns — prefix-cache hysteresis so the replayed prefix only changes at deliberate boundaries |

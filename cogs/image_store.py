@@ -20,6 +20,7 @@ import time
 from typing import Any, Iterable
 
 import aiohttp
+from cachetools import LRUCache
 from PIL import Image, ImageOps
 
 from config import (
@@ -37,6 +38,8 @@ MAX_IMAGES_PER_TURN = 4
 _SWEEP_INTERVAL = 600.0
 _last_sweep = 0.0
 _sweep_lock = asyncio.Lock()
+# attachment id -> stored ref (validated against the file on every hit)
+_attachment_refs: LRUCache = LRUCache(maxsize=1024)
 
 
 def is_image_ref(value: str) -> bool:
@@ -77,6 +80,9 @@ async def persist(data: bytes) -> str | None:
     def _write() -> None:
         os.makedirs(IMAGES_DIR, exist_ok=True)
         if os.path.exists(path):
+            # Re-referenced: refresh mtime so the retention sweep measures age
+            # from the latest use, not from the first download.
+            os.utime(path, None)
             return
         tmp = f'{path}.{os.getpid()}.tmp'
         with open(tmp, 'wb') as f:
@@ -92,14 +98,36 @@ async def persist(data: bytes) -> str | None:
     return ref
 
 
+def _touch(ref: str) -> bool:
+    """Refresh a stored image's mtime; False when the file is gone (swept)."""
+    try:
+        os.utime(image_path(ref), None)
+        return True
+    except OSError:
+        return False
+
+
 async def persist_attachment(attachment: Any) -> str | None:
-    """Download a discord.Attachment once and store it re-encoded."""
+    """Download a discord.Attachment once and store it re-encoded.
+
+    Attachments are immutable, so a known attachment id reuses its stored ref
+    instead of re-downloading — channel context re-reads the same recent
+    messages on every mention.
+    """
+    att_id = getattr(attachment, 'id', None)
+    if att_id is not None:
+        ref = _attachment_refs.get(att_id)
+        if ref and _touch(ref):
+            return ref
     try:
         data = await attachment.read()
     except Exception:
         logger.exception('Failed to read attachment %s', getattr(attachment, 'url', '?'))
         return None
-    return await persist(data)
+    ref = await persist(data)
+    if ref and att_id is not None:
+        _attachment_refs[att_id] = ref
+    return ref
 
 
 async def persist_url(url: str) -> str | None:
@@ -145,6 +173,31 @@ def image_marker(count: int = 1) -> str:
     """Text placeholder for images not being re-sent in the current request."""
     noun = 'uma imagem' if count == 1 else f'{count} imagens'
     return f'[o usuário compartilhou {noun} neste turno]'
+
+
+def context_image_marker(count: int = 1) -> str:
+    """Placeholder for channel-context images of a replayed turn not re-sent now."""
+    if count == 1:
+        return '[uma imagem do canal deste turno não foi reenviada]'
+    return f'[{count} imagens do canal deste turno não foram reenviadas]'
+
+
+def context_image_note(count: int, *, after_user_images: bool = False) -> str:
+    """Text note tying inlined channel-context images to their ``[anexo:…]`` lines.
+
+    Without it the image parts arrive unlabeled after a long context block, and
+    the model tends to read ``[anexo:x.png]`` as a bare filename it cannot see.
+    """
+    if count == 1:
+        note = 'a imagem mais recente anexada nas mensagens do canal acima está incluída nesta mensagem'
+    else:
+        note = (
+            f'as {count} imagens mais recentes anexadas nas mensagens do canal acima '
+            'estão incluídas nesta mensagem, em ordem cronológica'
+        )
+    if after_user_images:
+        note += ', depois das enviadas pelo usuário'
+    return f'[{note}]'
 
 
 async def _maybe_sweep() -> None:

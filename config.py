@@ -77,6 +77,12 @@ CHAT_MENTION_ENABLED: Final[bool] = os.getenv('CHAT_MENTION_ENABLED', 'true').st
 # --- Channel context (recent messages auto-injected into /ask, /chat, @mention and follow-ups) ---
 # Number of latest channel messages sent to the LLM as conversation context; 0 disables.
 CHANNEL_CONTEXT_MESSAGES: Final[int] = int(os.getenv('CHANNEL_CONTEXT_MESSAGES', '10'))
+# Also send images attached to those channel messages (and to follow-up gaps) to
+# the model. Disable for text-only CHAT_MODELs or to keep other users' images
+# away from the provider.
+CHANNEL_CONTEXT_IMAGES_ENABLED: Final[bool] = os.getenv('CHANNEL_CONTEXT_IMAGES_ENABLED', 'true').strip().lower() in ('1', 'true', 'yes')
+# Only channel images posted within this many minutes are sent; 0 = no age limit.
+CHANNEL_CONTEXT_IMAGE_MAX_AGE_MINUTES: Final[int] = int(os.getenv('CHANNEL_CONTEXT_IMAGE_MAX_AGE_MINUTES', '60'))
 
 # --- Conversations (multi-turn chat memory) ---
 CONVERSATIONS_DB_PATH: Final[str] = os.getenv('CONVERSATIONS_DB_PATH', 'data/conversations.db')
@@ -113,7 +119,7 @@ HISTORY_QUERY_CACHE_SIZE: Final[int] = int(os.getenv('HISTORY_QUERY_CACHE_SIZE',
 HISTORY_DEDUPE_WINDOW_MINUTES: Final[int] = int(os.getenv('HISTORY_DEDUPE_WINDOW_MINUTES', '10'))
 # Read-only SQL tool over the history DB (LLM-written analytical SELECTs).
 HISTORY_SQL_TOOL_ENABLED: Final[bool] = os.getenv('HISTORY_SQL_TOOL_ENABLED', 'true').strip().lower() in ('1', 'true', 'yes')
-HISTORY_SQL_TIMEOUT_SECONDS: Final[float] = float(os.getenv('HISTORY_SQL_TIMEOUT_SECONDS', '5'))
+HISTORY_SQL_TIMEOUT_SECONDS: Final[float] = float(os.getenv('HISTORY_SQL_TIMEOUT_SECONDS', '30'))
 HISTORY_SQL_MAX_ROWS: Final[int] = int(os.getenv('HISTORY_SQL_MAX_ROWS', '200'))
 
 # --- Memory (persistent bot memory, replaces the lore encyclopedia) ---
@@ -128,6 +134,23 @@ MEMORY_SEMANTIC_MIN_SCORE: Final[float] = float(os.getenv('MEMORY_SEMANTIC_MIN_S
 MEMORY_DEDUPE_THRESHOLD: Final[float] = float(os.getenv('MEMORY_DEDUPE_THRESHOLD', '0.85'))
 # Legacy lore encyclopedia — kept only as the one-time migration source for memory.db
 LORE_DB_PATH: Final[str] = os.getenv('LORE_DB_PATH', 'data/lore.db')
+
+# --- Scheduler (cron / one-shot delayed tasks) ---
+SCHEDULER_ENABLED: Final[bool] = os.getenv('SCHEDULER_ENABLED', 'true').strip().lower() in ('1', 'true', 'yes')
+SCHEDULER_DB_PATH: Final[str] = os.getenv('SCHEDULER_DB_PATH', 'data/scheduler.db')
+SCHEDULER_LOOP_INTERVAL: Final[int] = int(os.getenv('SCHEDULER_LOOP_INTERVAL', '15'))
+SCHEDULER_MAX_JOBS_PER_GUILD: Final[int] = int(os.getenv('SCHEDULER_MAX_JOBS_PER_GUILD', '50'))
+SCHEDULER_MAX_PROMPT: Final[int] = int(os.getenv('SCHEDULER_MAX_PROMPT', '500'))
+
+# --- Channel summaries (/resumo + summarize_channel tool) ---
+SUMMARY_ENABLED: Final[bool] = os.getenv('SUMMARY_ENABLED', 'true').strip().lower() in ('1', 'true', 'yes')
+# Model for the summary calls; a cheaper model is usually fine here.
+SUMMARY_MODEL: Final[str] = os.getenv('SUMMARY_MODEL') or CHAT_MODEL
+# Hard caps on what one summary reads: newest N messages, at most D days back.
+SUMMARY_MAX_MESSAGES: Final[int] = int(os.getenv('SUMMARY_MAX_MESSAGES', '1000'))
+SUMMARY_MAX_DAYS: Final[int] = int(os.getenv('SUMMARY_MAX_DAYS', '7'))
+# Rendered messages per LLM call; longer ranges are summarized map-reduce style.
+SUMMARY_SEGMENT_CHARS: Final[int] = int(os.getenv('SUMMARY_SEGMENT_CHARS', '24000'))
 
 # --- Rate Limiting (per-user) ---
 COOLDOWN_RATE: Final[int] = int(os.getenv('COOLDOWN_RATE', '1'))

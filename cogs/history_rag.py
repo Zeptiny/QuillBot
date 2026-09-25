@@ -18,6 +18,7 @@ except ImportError:
 from discord import app_commands
 from discord.ext import commands, tasks
 
+from cogs.local_inference import run_local_model
 from cogs.utils import format_chunk_line, format_message_line, message_content_text, render_search_results
 
 from config import (
@@ -269,12 +270,18 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
                 logger.exception("Failed to init OpenAI client for HistoryRAG")
         self._chunks: dict[int, list[dict]] = {}
         self._matrices: dict[int, np.ndarray | None] = {}
+        # guild_id -> buffer with spare rows; _matrices[gid] is a prefix view of it.
+        self._mat_bufs: dict[int, np.ndarray] = {}
         self._locks: dict[int, asyncio.Lock] = {}
         self._recent: dict[int, collections.deque] = {}
         self._backfilling: set[int] = set()
+        # channel_id -> newest msg id already indexed when the bot started; the
+        # startup backfill resumes after it instead of re-walking all history.
+        self._backfill_after: dict[int, int] = {}
         self._msg_index: dict[int, dict[int, int]] = {}
         self._queue: asyncio.Queue = asyncio.Queue()
         self._worker_task: asyncio.Task | None = None
+        self._fts_health_checked = False
 
     def _get_local_model(self):
         if self._local_model is not None:
@@ -302,8 +309,9 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
 
     async def _embed_batch(self, texts: list[str]) -> list[list[float]]:
         if EMBEDDING_PROVIDER == "local":
-            model = self._get_local_model()
-            emb = await asyncio.to_thread(model.encode, texts, normalize_embeddings=True, show_progress_bar=False)
+            emb = await run_local_model(
+                lambda: self._get_local_model().encode(texts, normalize_embeddings=True, show_progress_bar=False)
+            )
             if hasattr(emb, "tolist"):
                 return emb.tolist()
             return [list(e) for e in emb]
@@ -314,6 +322,67 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
 
     def _db_path(self) -> str:
         return HISTORY_DB_PATH
+
+    @staticmethod
+    def _create_fts_schema(con: sqlite3.Connection) -> bool:
+        """Create the derived FTS5 table and its chunk-delete trigger."""
+        try:
+            con.execute("""
+            CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+                msg_id UNINDEXED, guild_id UNINDEXED, chunk_text, content, tokenize='porter unicode61'
+            )""")
+            con.execute("CREATE TRIGGER IF NOT EXISTS chunks_fts_delete AFTER DELETE ON chunks BEGIN DELETE FROM chunks_fts WHERE msg_id=old.msg_id; END;")
+            return True
+        except sqlite3.Error:
+            logger.warning("FTS5 not available, keyword search will fallback to substring", exc_info=True)
+            return False
+
+    def _rebuild_fts_index(self, con: sqlite3.Connection) -> bool:
+        """Recreate the derived FTS index from canonical ``chunks`` rows."""
+        con.execute("SAVEPOINT rebuild_chunks_fts")
+        try:
+            con.execute("DROP TRIGGER IF EXISTS chunks_fts_delete")
+            try:
+                con.execute("DROP TABLE IF EXISTS chunks_fts")
+            except sqlite3.Error:
+                # A malformed FTS shadow table can prevent xDestroy from
+                # opening the virtual table. Remove its physical shadow tables
+                # and stale sqlite_master entry, then recreate it cleanly.
+                for shadow in (
+                    "chunks_fts_config",
+                    "chunks_fts_content",
+                    "chunks_fts_data",
+                    "chunks_fts_docsize",
+                    "chunks_fts_idx",
+                ):
+                    try:
+                        con.execute(f"DROP TABLE IF EXISTS {shadow}")
+                    except sqlite3.Error:
+                        pass
+                schema_version = con.execute("PRAGMA schema_version").fetchone()[0]
+                con.execute("PRAGMA writable_schema=ON")
+                try:
+                    con.execute("DELETE FROM sqlite_master WHERE type='table' AND name='chunks_fts'")
+                finally:
+                    con.execute("PRAGMA writable_schema=OFF")
+                con.execute(f"PRAGMA schema_version={schema_version + 1}")
+            if not self._create_fts_schema(con):
+                raise sqlite3.OperationalError("FTS5 is unavailable")
+            con.execute("""
+                INSERT INTO chunks_fts (msg_id, guild_id, chunk_text, content)
+                SELECT msg_id, guild_id, chunk_text, content FROM chunks
+            """)
+            con.execute("RELEASE rebuild_chunks_fts")
+            logger.warning("Rebuilt FTS5 index from chunks after an FTS health-check failure")
+            return True
+        except sqlite3.Error:
+            try:
+                con.execute("ROLLBACK TO rebuild_chunks_fts")
+                con.execute("RELEASE rebuild_chunks_fts")
+            except sqlite3.Error:
+                pass
+            logger.exception("Failed rebuilding FTS5 index")
+            return False
 
     def _ensure_db(self):
         path = self._db_path()
@@ -359,14 +428,15 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
             # indexed message-context window queries (else both full-scan the guild).
             con.execute("CREATE INDEX IF NOT EXISTS idx_guild_author_chan ON chunks(guild_id, author_id, channel_name)")
             con.execute("CREATE INDEX IF NOT EXISTS idx_guild_chan_ts ON chunks(guild_id, channel_id, ts)")
-            try:
-                con.execute("""
-                CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
-                    msg_id UNINDEXED, guild_id UNINDEXED, chunk_text, content, tokenize='porter unicode61'
-                )""")
-                con.execute("CREATE TRIGGER IF NOT EXISTS chunks_fts_delete AFTER DELETE ON chunks BEGIN DELETE FROM chunks_fts WHERE msg_id=old.msg_id; END;")
-            except Exception:
-                logger.warning("FTS5 not available, keyword search will fallback to substring")
+            if self._create_fts_schema(con) and not self._fts_health_checked:
+                try:
+                    # Opening the virtual table catches malformed FTS shadow data
+                    # that CREATE ... IF NOT EXISTS does not validate.
+                    con.execute("SELECT 1 FROM chunks_fts LIMIT 1").fetchone()
+                    self._fts_health_checked = True
+                except sqlite3.Error:
+                    logger.warning("FTS5 health check failed; rebuilding the derived index", exc_info=True)
+                    self._fts_health_checked = self._rebuild_fts_index(con)
             con.execute("""
             CREATE TABLE IF NOT EXISTS authors (
                 guild_id INTEGER NOT NULL,
@@ -442,7 +512,16 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
             logger.exception("Failed to load history DB for guild %s", guild_id)
             return False
 
-    def _upsert_chunks_to_db(self, guild_id: int, chunks: list[dict], embeddings: list | None = None):
+    def _upsert_chunks_to_db(
+        self, guild_id: int, chunks: list[dict], embeddings: list | None = None,
+        replace_ids: set[str] | None = None,
+    ):
+        """Upsert chunk rows and their FTS entries.
+
+        ``replace_ids`` names the msg_ids that may already have an FTS row;
+        only those get the (full-scan) FTS delete. None treats every row as
+        possibly stored.
+        """
         if not chunks:
             return
         path = self._db_path()
@@ -468,10 +547,14 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
             try:
                 # FTS5 has no PK on msg_id: REPLACE on chunks never cleans the old
                 # FTS row, so re-upserts (edits, re-backfill) would append duplicates.
-                con.executemany(
-                    "DELETE FROM chunks_fts WHERE guild_id=? AND msg_id=?",
-                    [(r[1], r[0]) for r in rows],
-                )
+                # msg_id is UNINDEXED, so each delete scans the whole FTS table —
+                # skip it for rows known to be new.
+                stale = rows if replace_ids is None else [r for r in rows if r[0] in replace_ids]
+                if stale:
+                    con.executemany(
+                        "DELETE FROM chunks_fts WHERE guild_id=? AND msg_id=?",
+                        [(r[1], r[0]) for r in stale],
+                    )
                 con.executemany(
                     "INSERT INTO chunks_fts (msg_id, guild_id, chunk_text, content) VALUES (?,?,?,?)",
                     [(r[0], r[1], r[8], r[7]) for r in rows],
@@ -567,8 +650,8 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
         finally:
             con.close()
 
-    def _existing_msg_ids(self, guild_id: int, msg_ids: list[str]) -> set[str]:
-        """Return the subset of msg_ids already stored for a guild."""
+    def _existing_msg_ids(self, guild_id: int, msg_ids: list[str]) -> set[str] | None:
+        """Return the subset of msg_ids already stored for a guild (None if the probe failed)."""
         msg_ids = [str(m) for m in msg_ids if m]
         if not msg_ids:
             return set()
@@ -582,7 +665,7 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
             return {str(r[0]) for r in cur.fetchall()}
         except Exception:
             logger.debug("existing msg_id probe failed", exc_info=True)
-            return set()
+            return None
         finally:
             con.close()
 
@@ -655,6 +738,19 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
                 recent.append(format_chunk_line(ch))
             self._recent[cid] = recent
 
+    def _indexed_watermarks(self) -> dict[int, int]:
+        """Newest indexed message id per channel across all loaded guilds."""
+        marks: dict[int, int] = {}
+        for chunks in self._chunks.values():
+            for c in chunks:
+                try:
+                    cid, mid = int(c["channel_id"]), int(c["msg_id"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if mid > marks.get(cid, 0):
+                    marks[cid] = mid
+        return marks
+
     def _lock(self, guild_id: int) -> asyncio.Lock:
         if guild_id not in self._locks:
             self._locks[guild_id] = asyncio.Lock()
@@ -677,7 +773,7 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
             return
         if EMBEDDING_PROVIDER == "local":
             try:
-                await asyncio.to_thread(self._get_local_model)
+                await run_local_model(self._get_local_model)
             except Exception:
                 logger.warning("HistoryRAG local model failed, will fallback to remote if possible")
         try:
@@ -688,6 +784,10 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
             await asyncio.to_thread(self._load_all_guilds)
         except Exception:
             logger.exception("Failed to scan history store")
+        # Snapshot before any live message is ingested: a live message indexed
+        # ahead of the backfill must not move the resume point past the gap
+        # left while the bot was offline.
+        self._backfill_after = self._indexed_watermarks()
         try:
             await asyncio.to_thread(self._rebuild_authors_from_chunks)
         except Exception:
@@ -765,42 +865,44 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
             return
         self._backfilling.add(guild.id)
         try:
-            lock = self._lock(guild.id)
-            async with lock:
+            # The lock only guards the per-guild setup: holding it through the
+            # whole (possibly long) channel walk would stall message deletes,
+            # and _index_batch takes it per batch anyway.
+            async with self._lock(guild.id):
                 if guild.id not in self._chunks:
                     self._chunks[guild.id] = []
                     self._matrices[guild.id] = None
                     self._msg_index[guild.id] = {}
-                channels: list[discord.abc.Messageable] = []
-                for ch in guild.channels:
-                    if isinstance(ch, (discord.TextChannel, discord.Thread, discord.VoiceChannel)):
-                        if isinstance(ch, discord.VoiceChannel):
-                            continue
-                        perms = ch.permissions_for(guild.me)
-                        if perms.read_message_history and perms.view_channel:
-                            channels.append(ch)
-                    elif isinstance(ch, discord.ForumChannel):
-                        for thread in ch.threads:
-                            if thread.permissions_for(guild.me).read_message_history:
+            channels: list[discord.abc.Messageable] = []
+            for ch in guild.channels:
+                if isinstance(ch, (discord.TextChannel, discord.Thread, discord.VoiceChannel)):
+                    if isinstance(ch, discord.VoiceChannel):
+                        continue
+                    perms = ch.permissions_for(guild.me)
+                    if perms.read_message_history and perms.view_channel:
+                        channels.append(ch)
+                elif isinstance(ch, discord.ForumChannel):
+                    for thread in ch.threads:
+                        if thread.permissions_for(guild.me).read_message_history:
+                            channels.append(thread)
+                    try:
+                        async for thread in ch.archived_threads(limit=None):
+                            if thread.permissions_for(guild.me).read_message_history and thread.permissions_for(guild.me).view_channel:
                                 channels.append(thread)
-                        try:
-                            async for thread in ch.archived_threads(limit=None):
-                                if thread.permissions_for(guild.me).read_message_history and thread.permissions_for(guild.me).view_channel:
-                                    channels.append(thread)
-                                await asyncio.sleep(0)
-                        except Exception:
-                            pass
-                for cat in guild.channels:
-                    if isinstance(cat, discord.CategoryChannel):
-                        for ch in cat.channels:
-                            if isinstance(ch, discord.Thread):
-                                perms = ch.permissions_for(guild.me)
-                                if perms.read_message_history and perms.view_channel and ch not in channels:
-                                    channels.append(ch)
-                channels = list(dict.fromkeys(channels))
-                logger.info("History backfill guild %s (%s) %d channels", guild.name, guild.id, len(channels))
-                for channel in channels:
-                    await self._backfill_channel(guild, channel)
+                            await asyncio.sleep(0)
+                    except Exception:
+                        pass
+            for cat in guild.channels:
+                if isinstance(cat, discord.CategoryChannel):
+                    for ch in cat.channels:
+                        if isinstance(ch, discord.Thread):
+                            perms = ch.permissions_for(guild.me)
+                            if perms.read_message_history and perms.view_channel and ch not in channels:
+                                channels.append(ch)
+            channels = list(dict.fromkeys(channels))
+            logger.info("History backfill guild %s (%s) %d channels", guild.name, guild.id, len(channels))
+            for channel in channels:
+                await self._backfill_channel(guild, channel)
         except Exception:
             logger.exception("Backfill failed for guild %s", guild.id)
         finally:
@@ -815,8 +917,15 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
             recent = collections.deque(maxlen=HISTORY_WINDOW_SIZE)
             self._recent[cid] = recent
         to_index: list[discord.Message] = []
+        # Resume after the newest message indexed before this run: everything
+        # older is already stored, so only the offline gap is fetched. The
+        # sliding window (recent) was seeded from the DB on load.
+        after_id = self._backfill_after.pop(cid, None)
+        after = discord.Object(id=after_id) if after_id else None
+        if after is not None:
+            logger.debug("History backfill channel %s resuming after msg %s", cid, after_id)
         try:
-            async for msg in channel.history(limit=HISTORY_BACKFILL_LIMIT, oldest_first=True):
+            async for msg in channel.history(limit=HISTORY_BACKFILL_LIMIT, after=after, oldest_first=True):
                 if msg.id in existing:
                     line = format_message_line(msg)
                     recent.append(line)
@@ -847,6 +956,15 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
                 gid, stacked.shape, len(chunks),
             )
             return False
+        # Backfill and live ingestion can both pick up a message near the
+        # resume point; keep the first copy so the index never holds duplicates.
+        index = self._msg_index.setdefault(gid, {})
+        fresh = [i for i, ch in enumerate(chunks) if int(ch["msg_id"]) not in index]
+        if not fresh:
+            return False
+        if len(fresh) < len(chunks):
+            chunks = [chunks[i] for i in fresh]
+            stacked = stacked[fresh]
         mat = self._matrices.get(gid)
         if mat is not None and mat.shape[0] and (
             mat.ndim != 2 or mat.shape[1] != stacked.shape[1]
@@ -856,13 +974,33 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
                 gid, mat.shape, stacked.shape,
             )
             return False
-        self._matrices[gid] = (
-            stacked if mat is None or mat.shape[0] == 0 else np.vstack([mat, stacked])
-        )
+        self._matrices[gid] = self._grow_matrix(gid, mat, stacked)
         for ch in chunks:
             self._chunks[gid].append(ch)
             self._msg_index[gid][int(ch["msg_id"])] = len(self._chunks[gid]) - 1
         return True
+
+    def _grow_matrix(self, gid: int, mat: np.ndarray | None, rows: np.ndarray) -> np.ndarray:
+        """Return ``mat`` with ``rows`` appended, without copying it on every flush.
+
+        The matrix is a prefix view of a buffer with spare rows: appends write
+        past its current end and only a full buffer is reallocated (with ~1/8
+        headroom). Rows before the current end are never touched here, so a
+        view already handed to a running search stays valid.
+        """
+        n = 0 if mat is None else mat.shape[0]
+        need = n + rows.shape[0]
+        buf = self._mat_bufs.get(gid)
+        if (
+            buf is None or mat is None or mat.base is not buf
+            or need > buf.shape[0] or buf.shape[1] != rows.shape[1]
+        ):
+            buf = np.empty((need + max(1024, need // 8), rows.shape[1]), dtype=np.float32)
+            if n:
+                buf[:n] = mat
+            self._mat_bufs[gid] = buf
+        buf[n:need] = rows
+        return buf[:need]
 
     async def _index_batch(self, guild: discord.Guild, channel: discord.abc.Messageable, msgs: list[discord.Message]):
         if not msgs:
@@ -919,14 +1057,23 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
                 appended = self._append_chunks(gid, chunks, embeddings)
         if not appended:
             return
+        # Persist only the chunks this call appended: a message picked up by
+        # both backfill and live ingestion is stored by whichever indexed it
+        # first, so the new-row check below cannot race with the other writer.
+        index, stored = self._msg_index[gid], self._chunks[gid]
+        fresh = [i for i, c in enumerate(chunks) if stored[index[int(c["msg_id"])]] is c]
+        chunks = [chunks[i] for i in fresh]
+        embeddings = [embeddings[i] for i in fresh]
         logger.info("Indexed %d msgs guild %s channel %s (total %d)", len(chunks), gid, cid, len(self._chunks[gid]))
         try:
             batch_ids = [str(c['msg_id']) for c in chunks]
             already_stored = await asyncio.to_thread(self._existing_msg_ids, gid, batch_ids)
-            await asyncio.to_thread(self._upsert_chunks_to_db, gid, chunks, embeddings)
+            await asyncio.to_thread(
+                self._upsert_chunks_to_db, gid, chunks, embeddings, replace_ids=already_stored,
+            )
             await asyncio.to_thread(
                 self._upsert_authors, gid, chunks,
-                count_msg_ids=set(batch_ids) - already_stored,
+                count_msg_ids=set(batch_ids) - (already_stored or set()),
             )
         except Exception:
             logger.exception("Failed persisting history batch guild %s", gid)
@@ -999,6 +1146,8 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
             chunks = self._chunks[gid]
             chunks.pop(idx)
             self._msg_index[gid] = {int(c["msg_id"]): i for i, c in enumerate(chunks)}
+            # np.delete returns a fresh array; drop the old growth buffer with it.
+            self._mat_bufs.pop(gid, None)
             if chunks:
                 self._matrices[gid] = np.delete(self._matrices[gid], idx, axis=0)
                 await asyncio.to_thread(self._delete_chunk_from_db, gid, str(message.id))
@@ -1189,10 +1338,9 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
         use_local = provider in ("local", "auto") and (provider == "local" or "openrouter.ai" not in OPENAI_BASE_URL)
         if use_local:
             try:
-                reranker = self._get_local_reranker()
                 docs = [c.get("chunk_text", c.get("content", ""))[:800] for c in candidates]
                 pairs = [[query, d] for d in docs]
-                scores = await asyncio.to_thread(reranker.predict, pairs)
+                scores = await run_local_model(lambda: self._get_local_reranker().predict(pairs))
                 scored = sorted(zip(scores, candidates), key=lambda x: x[0], reverse=True)
                 return [c for _, c in scored[:top_n]]
             except Exception:
@@ -1260,7 +1408,8 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
     def _keyword_fallback(self, query: str, guild_id: int, limit: int, channel_id: str | None, author_ids: set[str] | None, dt_after: datetime.datetime | None, dt_before: datetime.datetime | None, sort_by: str) -> list[dict]:
         """Substring keyword scan over in-memory chunks (FTS unavailable or empty)."""
         scored = []
-        for c in self._chunks.get(guild_id, []):
+        # Runs in a worker thread: iterate a snapshot, the event loop keeps mutating the list.
+        for c in list(self._chunks.get(guild_id, [])):
             if channel_id and c["channel_id"] != str(channel_id):
                 continue
             if author_ids and c["author_id"] not in author_ids:
@@ -1285,79 +1434,69 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
             scored.sort(reverse=True, key=lambda x: x[0])
         return [dict(c, _score=float(s), _keyword_score=float(s)) for s, c in scored]
 
-    async def search(self, query: str, guild_id: int, limit: int = 5, channel_id: str | None = None, author_id: str | None = None, author_name: str | None = None, after: str | None = None, before: str | None = None, search_mode: str = "hybrid", sort_by: str = "relevance", dedupe: bool = True) -> list[dict]:
-        dt_after = _parse_dt(after) if after else None
-        dt_before = _parse_dt(before) if before else None
-        author_ids = None
-        if author_id or author_name:
-            author_ids = set(await self._resolve_author(guild_id, author_id, author_name))
-            if author_id and str(author_id) not in author_ids:
-                author_ids.add(str(author_id))
-            if not author_ids and (author_id or author_name):
-                return []
-        cache_key = f"{guild_id}:{query}:{limit}:{channel_id}:{author_id}:{author_name}:{after}:{before}:{search_mode}:{sort_by}:{dedupe}"
-        try:
-            cached = self._query_cache.get(cache_key)
-            if cached is not None:
-                return [dict(c) for c in cached]
-        except Exception:
-            pass
-        if search_mode == "keyword":
-            res = await self._keyword_search(query, guild_id, limit, channel_id, author_ids, dt_after, dt_before, sort_by)
-            if not res:
-                res = self._keyword_fallback(query, guild_id, limit, channel_id, author_ids, dt_after, dt_before, sort_by)
-            res = self._dedupe_adjacent(res, limit) if dedupe else res[:limit]
-            if res:
-                # Never negative-cache: guilds still loading/backfilling would
-                # serve a confident "nothing found" for the whole TTL otherwise.
-                try:
-                    self._query_cache[cache_key] = [dict(r) for r in res]
-                except Exception:
-                    pass
-            return res
-        if guild_id not in self._chunks or not self._chunks[guild_id]:
-            return []
-        mat = self._matrices.get(guild_id)
-        if mat is None or len(mat) == 0:
-            return []
-        chunks = self._chunks[guild_id]
-        indices = list(range(len(chunks)))
-        if channel_id:
-            indices = [i for i in indices if chunks[i]["channel_id"] == str(channel_id)]
-            if not indices:
-                return []
-        if author_ids:
-            indices = [i for i in indices if chunks[i]["author_id"] in author_ids]
-            if not indices:
-                return []
-        if dt_after or dt_before:
-            filtered = []
-            for i in indices:
-                ts = _parse_dt(chunks[i].get("ts"))
+    @staticmethod
+    def _filter_indices(
+        chunks: list[dict],
+        channel_id: str | None,
+        author_ids: set[str] | None,
+        dt_after: datetime.datetime | None,
+        dt_before: datetime.datetime | None,
+    ) -> np.ndarray | None:
+        """Positions of the chunks passing the filters; None when no filter is set."""
+        if not (channel_id or author_ids or dt_after or dt_before):
+            return None
+        cid = str(channel_id) if channel_id else None
+        keep = []
+        for i, c in enumerate(chunks):
+            if cid and c["channel_id"] != cid:
+                continue
+            if author_ids and c["author_id"] not in author_ids:
+                continue
+            if dt_after or dt_before:
+                ts = _parse_dt(c.get("ts"))
                 if ts is None:
                     continue
                 if dt_after and ts < dt_after:
                     continue
                 if dt_before and ts > dt_before:
                     continue
-                filtered.append(i)
-            indices = filtered
-            if not indices:
-                return []
-        mat_f = mat[np.array(indices)]
-        chunks_f = [chunks[i] for i in indices]
-        try:
-            q_emb = (await self._embed_batch([query]))[0]
-        except Exception:
-            logger.exception("History search embed failed")
-            return []
-        q_arr = np.array(q_emb, dtype=np.float32)
-        dots = mat_f @ q_arr
-        norms = np.linalg.norm(mat_f, axis=1) * np.linalg.norm(q_arr)
+            keep.append(i)
+        return np.asarray(keep, dtype=np.intp)
+
+    def _score_candidates(
+        self,
+        query: str,
+        guild_id: int,
+        chunks: list[dict],
+        mat: np.ndarray,
+        idx: np.ndarray | None,
+        q_arr: np.ndarray,
+        pool: int,
+        channel_id: str | None,
+        author_ids: set[str] | None,
+        dt_after: datetime.datetime | None,
+        dt_before: datetime.datetime | None,
+        search_mode: str,
+        sort_by: str,
+    ) -> list[dict]:
+        """Score a snapshot of the guild index and return the top ``pool`` candidates.
+
+        Runs in a worker thread. The whole matrix is scored in place and the
+        filtered rows are then picked from the score vector, instead of
+        copying the matrix rows (all of them when unfiltered) on every search.
+        """
+        dots = mat @ q_arr
+        # Row norms without materialising mat**2 the way np.linalg.norm does.
+        norms = np.sqrt(np.einsum("ij,ij->i", mat, mat)) * np.linalg.norm(q_arr)
         with np.errstate(invalid='ignore', divide='ignore'):
             vec_scores = np.where(norms > 0, dots / norms, 0.0)
+        if idx is None:
+            chunks_f = chunks
+        else:
+            vec_scores = vec_scores[idx]
+            chunks_f = [chunks[i] for i in idx]
         if search_mode == "hybrid":
-            fts_scores_map = await asyncio.to_thread(self._fts_search, query, guild_id, 200, channel_id, author_ids, dt_after, dt_before)
+            fts_scores_map = self._fts_search(query, guild_id, 200, channel_id, author_ids, dt_after, dt_before)
             if fts_scores_map:
                 vec_rank = {chunks_f[i]["msg_id"]: float(vec_scores[i]) for i in range(len(chunks_f))}
                 allowed_ids = {chunks_f[i]["msg_id"] for i in range(len(chunks_f))}
@@ -1381,23 +1520,67 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
             decay_factors = np.array([_time_decay_factor(c["ts"], HISTORY_TIME_DECAY_LAMBDA) for c in chunks_f], dtype=np.float32)
             scores = scores * (0.7 + 0.3 * decay_factors)
         if sort_by == "recent" and HISTORY_TIME_DECAY_LAMBDA == 0:
-            order = np.argsort([c["ts"] for c in chunks_f])[::-1]
-            top_idx = order[: max(limit * 6, 30)]
-            candidates = [dict(chunks_f[i], _score=float(scores[i]), _keyword_score=float(_keyword_score(query, chunks_f[i]))) for i in top_idx]
-            reranked = await self._rerank_history(query, candidates, top_n=len(candidates))
-            reranked = self._dedupe_adjacent(reranked, limit) if dedupe else reranked[:limit]
-            if reranked:
-                try:
-                    self._query_cache[cache_key] = [dict(r) for r in reranked]
-                except Exception:
-                    pass
-            return reranked
-        top_k_rerank = max(limit * 6, 30)
-        top_idx = np.argsort(scores)[::-1][:top_k_rerank]
+            top_idx = np.argsort([c["ts"] for c in chunks_f])[::-1][:pool]
+        else:
+            top_idx = np.argsort(scores)[::-1][:pool]
         candidates = [dict(chunks_f[i], _score=float(scores[i]), _keyword_score=float(_keyword_score(query, chunks_f[i]))) for i in top_idx]
         if sort_by == "recent" and HISTORY_TIME_DECAY_LAMBDA > 0:
             candidates.sort(key=lambda x: (x["_score"], x["ts"]), reverse=True)
-        else:
+        return candidates
+
+    async def search(self, query: str, guild_id: int, limit: int = 5, channel_id: str | None = None, author_id: str | None = None, author_name: str | None = None, after: str | None = None, before: str | None = None, search_mode: str = "hybrid", sort_by: str = "relevance", dedupe: bool = True, rerank: bool = True) -> list[dict]:
+        dt_after = _parse_dt(after) if after else None
+        dt_before = _parse_dt(before) if before else None
+        author_ids = None
+        if author_id or author_name:
+            author_ids = set(await self._resolve_author(guild_id, author_id, author_name))
+            if author_id and str(author_id) not in author_ids:
+                author_ids.add(str(author_id))
+            if not author_ids and (author_id or author_name):
+                return []
+        cache_key = f"{guild_id}:{query}:{limit}:{channel_id}:{author_id}:{author_name}:{after}:{before}:{search_mode}:{sort_by}:{dedupe}:{rerank}"
+        try:
+            cached = self._query_cache.get(cache_key)
+            if cached is not None:
+                return [dict(c) for c in cached]
+        except Exception:
+            pass
+        if search_mode == "keyword":
+            res = await self._keyword_search(query, guild_id, limit, channel_id, author_ids, dt_after, dt_before, sort_by)
+            if not res:
+                res = await asyncio.to_thread(self._keyword_fallback, query, guild_id, limit, channel_id, author_ids, dt_after, dt_before, sort_by)
+            res = self._dedupe_adjacent(res, limit) if dedupe else res[:limit]
+            if res:
+                # Never negative-cache: guilds still loading/backfilling would
+                # serve a confident "nothing found" for the whole TTL otherwise.
+                try:
+                    self._query_cache[cache_key] = [dict(r) for r in res]
+                except Exception:
+                    pass
+            return res
+        if not self._chunks.get(guild_id):
+            return []
+        mat = self._matrices.get(guild_id)
+        if mat is None or len(mat) == 0:
+            return []
+        # Snapshot for the worker threads: the event loop keeps appending to and
+        # deleting from the chunk list meanwhile, while the matrix is only ever
+        # replaced or grown past its current end (see _grow_matrix).
+        chunks = list(self._chunks[guild_id])
+        idx = await asyncio.to_thread(self._filter_indices, chunks, channel_id, author_ids, dt_after, dt_before)
+        if idx is not None and not len(idx):
+            return []
+        try:
+            q_emb = (await self._embed_batch([query]))[0]
+        except Exception:
+            logger.exception("History search embed failed")
+            return []
+        candidates = await asyncio.to_thread(
+            self._score_candidates, query, guild_id, chunks, mat, idx,
+            np.asarray(q_emb, dtype=np.float32), max(limit * 6, 30),
+            channel_id, author_ids, dt_after, dt_before, search_mode, sort_by,
+        )
+        if rerank and not (sort_by == "recent" and HISTORY_TIME_DECAY_LAMBDA > 0):
             # Rerank the full pool so dedupe can pick representatives from beyond
             # the old top-`limit` slice (both rerankers score the whole list anyway).
             candidates = await self._rerank_history(query, candidates, top_n=len(candidates))
@@ -1459,8 +1642,10 @@ class HistoryRAG(commands.Cog, name="HistoryRAG"):
         }
 
     async def count_mentions(self, guild_id: int, query: str, group_by: str = "author", limit: int = 10, after: str | None = None, before: str | None = None) -> list[dict]:
-        # dedupe=False: mention counting needs every matching message, not one per conversation window
-        results = await self.search(query, guild_id, limit=200, after=after, before=before, search_mode="hybrid", sort_by="relevance", dedupe=False)
+        # dedupe=False: mention counting needs every matching message, not one per conversation window.
+        # rerank=False: counting only needs the matching set, and cross-encoding its 1200-candidate pool
+        # pinned every core for minutes on CPU.
+        results = await self.search(query, guild_id, limit=200, after=after, before=before, search_mode="hybrid", sort_by="relevance", dedupe=False, rerank=False)
         if not results:
             return []
         threshold = 0.15

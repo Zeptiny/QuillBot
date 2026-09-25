@@ -18,15 +18,19 @@ from openai import AsyncOpenAI, RateLimitError
 from cogs import image_store as _image_store
 from cogs.conversation_store import (
     ConversationStore as _ConversationStore,
-    add_participant as _add_participant,
+    add_participants as _add_participants,
     apply_cache_control as _apply_cache_control,
     author_info as _author_info,
     build_conversation_block as _build_conversation_block,
     build_current_message as _build_current_message,
     build_history_messages as _build_history_messages,
     cap_turns as _cap_turns,
+    conversation_participant_ids as _conversation_participant_ids,
     make_turn as _make_turn,
+    message_participant_infos as _message_participant_infos,
+    select_image_refs as _select_image_refs,
 )
+from cogs.local_inference import run_local_model
 from cogs.memory import MEMORY_ABOUT_TOOL, MEMORY_SEARCH_TOOL, MEMORY_WRITE_TOOL
 from cogs.plugin_apis import HTTP_HEADERS as _HTTP_HEADERS
 from cogs.plugin_apis import search_all as _search_plugins_all
@@ -85,20 +89,8 @@ from config import (
 logger = logging.getLogger(__name__)
 
 MAX_TOOL_ROUNDS = 6  # Safety cap on tool-calling iterations
+_SPARK_REPORT_CACHE_SIZE = 32  # Parsed Spark reports kept for follow-ups
 
-
-def _conversation_participants(message: discord.Message) -> set[str]:
-    """User ids relevant to a message: author, mentions and reply target."""
-    ids = {str(message.author.id)}
-    for u in getattr(message, 'mentions', []):
-        if not u.bot:
-            ids.add(str(u.id))
-    ref = getattr(message, 'reference', None)
-    ref_msg = getattr(ref, 'resolved', None)
-    ref_author = getattr(ref_msg, 'author', None)
-    if ref_author is not None and not ref_author.bot:
-        ids.add(str(ref_author.id))
-    return ids
 
 _MEMORY_INSTRUCTIONS = (
     "- Você tem uma memória persistente: um bloco <memory> com lembranças relevantes é "
@@ -469,8 +461,12 @@ class DocsRAG(commands.Cog):
             ttl_seconds=CONVERSATIONS_TTL_SECONDS,
             max_stored=CONVERSATIONS_MAX_STORED,
         )
-        # Spark reports are too heavy to persist — kept in memory per conversation
-        self._spark_by_conv: dict[str, SparkReport] = {}
+        # Spark reports are too heavy to persist — kept in memory per conversation.
+        # Bounded and expiring with the conversation TTL (each follow-up re-sets
+        # the entry, refreshing it) so parsed reports never pile up in RAM.
+        self._spark_by_conv: TTLCache = TTLCache(
+            maxsize=_SPARK_REPORT_CACHE_SIZE, ttl=CONVERSATIONS_TTL_SECONDS,
+        )
         # Per-user follow-up cooldown (same period as slash commands)
         self._followup_cd: TTLCache = TTLCache(maxsize=500, ttl=COOLDOWN_PER)
 
@@ -500,7 +496,7 @@ class DocsRAG(commands.Cog):
         )
         if EMBEDDING_PROVIDER == 'local':
             try:
-                await asyncio.to_thread(self._get_local_model)
+                await run_local_model(self._get_local_model)
             except Exception:
                 logger.warning("Falling back to remote embeddings due to local model load failure")
         loaded = await asyncio.to_thread(self._load_vectors)
@@ -728,8 +724,9 @@ class DocsRAG(commands.Cog):
 
     async def _embed_batch(self, texts: list[str]) -> list[list[float]]:
         if EMBEDDING_PROVIDER == 'local':
-            model = self._get_local_model()
-            embeddings = await asyncio.to_thread(model.encode, texts, normalize_embeddings=True, show_progress_bar=False)
+            embeddings = await run_local_model(
+                lambda: self._get_local_model().encode(texts, normalize_embeddings=True, show_progress_bar=False)
+            )
             if hasattr(embeddings, 'tolist'):
                 return embeddings.tolist()
             return [list(e) for e in embeddings]
@@ -841,7 +838,8 @@ class DocsRAG(commands.Cog):
             self._indexing = False
 
     async def _index_docs_inner(self, sources: list[dict] | None = None):
-        sources_to_index = sources if sources is not None else DOC_SOURCES
+        partial = sources is not None
+        sources_to_index = sources if partial else DOC_SOURCES
         logger.info(
             "Indexing %d documentation source(s)...",
             len(sources_to_index),
@@ -853,17 +851,19 @@ class DocsRAG(commands.Cog):
         source_results = await asyncio.gather(*source_tasks, return_exceptions=True)
 
         all_chunks = []
-        indexed_labels: list[str] = []
+        failed_labels: set[str] = set()
         for src, result in zip(sources_to_index, source_results, strict=True):
-            if isinstance(result, Exception):
+            if isinstance(result, BaseException):
                 logger.error("Error indexing source '%s': %s", src['label'], result)
+                failed_labels.add(src['label'])
+            elif not result:
+                # Nothing fetched (GitHub outage, rate limit): treat as a
+                # failure so the source keeps its previous chunks.
+                failed_labels.add(src['label'])
             else:
                 all_chunks.extend(result)
-                indexed_labels.append(src['label'])
 
         logger.info("Total chunks before embedding: %d", len(all_chunks))
-        if not all_chunks:
-            return
 
         # Generate embeddings in batches
         batch_size = 20
@@ -872,50 +872,76 @@ class DocsRAG(commands.Cog):
             texts = [c['content'] for c in batch]
             try:
                 embeddings = await self._embed_batch(texts)
+                if len(embeddings) != len(batch):
+                    raise ValueError(f'{len(embeddings)} embeddings for {len(batch)} chunks')
                 for chunk, emb in zip(batch, embeddings):
                     chunk['embedding'] = emb
             except Exception:
                 logger.exception("Failed to embed batch %d", i // batch_size)
+                failed_labels.update(c['source'] for c in batch)
 
-        self.chunks = [c for c in all_chunks if 'embedding' in c]
-        logger.info("Documentation indexed: %d chunks with embeddings", len(self.chunks))
+        # A source is replaced only when every one of its chunks embedded;
+        # otherwise its previous chunks stay, so a flaky run (or a single-source
+        # /reindex) never shrinks the rest of the index.
+        replaced = {src['label'] for src in sources_to_index} - failed_labels
+        if failed_labels:
+            logger.warning(
+                "Doc source(s) failed to index, keeping their previous chunks: %s",
+                ', '.join(sorted(failed_labels)),
+            )
+        new_chunks = [c for c in all_chunks if c['source'] in replaced]
+        if not new_chunks:
+            logger.warning("Reindex produced no usable chunks; existing index left untouched")
+            return
         # The float32 matrix is the single source of truth for embeddings:
         # pop() the per-chunk copies (Python-float lists cost ~8x the matrix).
-        self._emb_matrix = np.array(
-            [c.pop('embedding') for c in self.chunks], dtype=np.float32
+        new_matrix = np.array([c.pop('embedding') for c in new_chunks], dtype=np.float32)
+
+        # Carry over every chunk whose source was not replaced — except, on a
+        # full reindex, sources that were removed from DOC_SOURCES.
+        configured = {src['label'] for src in DOC_SOURCES}
+        keep_idx = [
+            i for i, c in enumerate(self.chunks)
+            if c.get('source') not in replaced and (partial or c.get('source') in configured)
+        ]
+        kept_chunks = [self.chunks[i] for i in keep_idx]
+        kept_matrix: np.ndarray | None = None
+        if keep_idx and self._emb_matrix is not None:
+            kept_matrix = self._emb_matrix[np.array(keep_idx)]
+            if kept_matrix.ndim != 2 or kept_matrix.shape[1] != new_matrix.shape[1]:
+                logger.warning(
+                    "Dropping %d carried-over chunks: embedding width changed (%s -> %s)",
+                    len(kept_chunks), kept_matrix.shape, new_matrix.shape,
+                )
+                kept_chunks, kept_matrix = [], None
+        self.chunks = kept_chunks + new_chunks
+        self._emb_matrix = new_matrix if kept_matrix is None else np.vstack([kept_matrix, new_matrix])
+        logger.info(
+            "Documentation indexed: %d new chunks (%s), %d carried over, %d total",
+            len(new_chunks), ', '.join(sorted(replaced)), len(kept_chunks), len(self.chunks),
         )
 
-        # Track per-source SHAs and timestamps
-        if sources is not None:
-            # Partial reindex: update only the requested sources
-            for src in sources_to_index:
-                label = src['label']
-                url = f'https://api.github.com/repos/{src["repo"]}/commits/{src["branch"]}'
-                try:
-                    async with self.session.get(url) as resp:
-                        if resp.status == 200:
-                            data = await resp.json()
-                            self._source_shas[label] = data.get('sha', '')
-                except Exception:
-                    logger.exception("Failed to fetch commit SHA for %s", label)
-                self._source_last_index[label] = __import__('time').monotonic()
-        else:
-            # Full reindex: update all sources and composite SHA
-            self._last_commit_sha = await self._get_composite_sha()
-            for src in DOC_SOURCES:
-                label = src['label']
-                sha = self._source_shas.get(label, '')
-                if not sha:
-                    url = f'https://api.github.com/repos/{src["repo"]}/commits/{src["branch"]}'
-                    try:
-                        async with self.session.get(url) as resp:
-                            if resp.status == 200:
-                                data = await resp.json()
-                                sha = data.get('sha', '')
-                                self._source_shas[label] = sha
-                    except Exception:
-                        logger.exception("Failed to fetch commit SHA for %s", label)
-                self._source_last_index[label] = __import__('time').monotonic()
+        # Track per-source SHAs and wall-clock index times (shown by /health)
+        now = time.time()
+        for src in sources_to_index:
+            label = src['label']
+            if label not in replaced:
+                continue
+            url = f'https://api.github.com/repos/{src["repo"]}/commits/{src["branch"]}'
+            try:
+                async with self.session.get(url) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        self._source_shas[label] = data.get('sha', '')
+            except Exception:
+                logger.exception("Failed to fetch commit SHA for %s", label)
+            self._source_last_index[label] = now
+        if not partial:
+            if failed_labels:
+                # Leave the composite SHA stale so the periodic check retries.
+                logger.warning("Composite SHA not advanced: failed sources will be retried")
+            else:
+                self._last_commit_sha = await self._get_composite_sha()
 
         await asyncio.to_thread(self._save_vectors)
 
@@ -1232,6 +1258,7 @@ class DocsRAG(commands.Cog):
         origin: str | None = None,
         context_message: discord.Message | None = None,
         prior_context: list[str] | None = None,
+        context_image_urls: list[str] | None = None,
     ) -> tuple[str, list[discord.Embed], list[dict], dict]:
         """Run the LLM with tool-calling in a loop until it produces a final answer.
 
@@ -1274,6 +1301,7 @@ class DocsRAG(commands.Cog):
         # replayed history byte-identical across follow-ups, making provider
         # prefix caching effective.
         context_blocks: list[str] = []
+        context_images = [u for u in (context_image_urls or []) if u]
         if MEMORY_ENABLED and guild is not None:
             mem_cog = self.bot.get_cog('Memory')
             if mem_cog is not None:
@@ -1296,7 +1324,8 @@ class DocsRAG(commands.Cog):
                     self.bot, channel, before=context_message,
                 )
                 if chan_ctx:
-                    context_blocks.append(chan_ctx)
+                    context_blocks.append(chan_ctx.text)
+                    context_images.extend(chan_ctx.images)
             except Exception:
                 logger.exception('Failed to build recent channel context for _run_agent')
 
@@ -1381,6 +1410,7 @@ class DocsRAG(commands.Cog):
             prior_context=prior_context,
             channel_id=getattr(channel, 'id', None),
             context_blocks='\n\n'.join(context_blocks) or None,
+            context_image_urls=context_images,
         )
         messages.append(current_message)
 
@@ -1452,9 +1482,12 @@ class DocsRAG(commands.Cog):
                 )
             )
 
+        image_refs, context_image_refs, _ = _select_image_refs(urls, context_images)
         return answer, embeds, sources, {
             'user_message': current_message,
             'trajectory': trajectory,
+            'image_urls': image_refs,
+            'context_image_urls': context_image_refs,
         }
 
     async def _store_conversation(
@@ -1466,6 +1499,7 @@ class DocsRAG(commands.Cog):
         spark_report: SparkReport | None = None,
         interaction: discord.Interaction | None = None,
         capture: dict | None = None,
+        participant_infos: list[dict] | None = None,
     ) -> None:
         """Persist a conversation exchange for follow-up replies."""
         user = interaction.user if interaction is not None else None
@@ -1479,10 +1513,11 @@ class DocsRAG(commands.Cog):
             author=author, ts=ts,
             channel_id=getattr(channel, 'id', None),
             channel_name=getattr(channel, 'name', None),
-            images=[],
+            images=(capture or {}).get('image_urls', []),
             sources=sources,
             user_message=(capture or {}).get('user_message'),
             trajectory=(capture or {}).get('trajectory'),
+            context_images=(capture or {}).get('context_image_urls'),
         )
         origin = {
             'channel_id': str(getattr(channel, 'id', '') or ''),
@@ -1490,13 +1525,15 @@ class DocsRAG(commands.Cog):
             'guild_id': str(getattr(guild, 'id', '') or ''),
             'guild_name': getattr(guild, 'name', '') or '',
         }
+        participants = [author] if author.get('id') else []
+        _add_participants(participants, participant_infos or [])
         await self.store.create(
             str(message.id),
             guild_id=origin['guild_id'] or None,
             channel_id=origin['channel_id'] or None,
             data={
                 'turns': [turn],
-                'participants': [author] if author.get('id') else [],
+                'participants': participants,
                 'origin': origin,
                 'started_ts': ts,
             },
@@ -1552,7 +1589,13 @@ class DocsRAG(commands.Cog):
                 if fresh:
                     conv = fresh
                 history = conv['data'].get('turns', []).copy()
-                prior_context = await _fetch_turn_gap(message, history)
+                participant_infos = await _message_participant_infos(message)
+                participant_ids = _conversation_participant_ids(
+                    conv['data'], participant_infos,
+                )
+                prior_context_result = await _fetch_turn_gap(message, history)
+                prior_context = prior_context_result.lines
+                prior_context_images = prior_context_result.images
 
                 answer, embeds, sources, capture = await self._run_agent(
                     follow_up_question,
@@ -1564,10 +1607,11 @@ class DocsRAG(commands.Cog):
                     channel=message.channel,
                     created_at=message.created_at,
                     reply_to=str(ref_id),
-                    participant_ids=_conversation_participants(message),
+                    participant_ids=participant_ids,
                     origin=message.jump_url,
                     context_message=message,
                     prior_context=prior_context,
+                    context_image_urls=prior_context_images,
                 )
                 if len(embeds) == 1:
                     reply = await message.reply(embed=embeds[0])
@@ -1583,16 +1627,17 @@ class DocsRAG(commands.Cog):
                     message_id=message.id,
                     channel_id=message.channel.id,
                     channel_name=getattr(message.channel, 'name', None),
-                    images=image_urls,
+                    images=capture.get('image_urls', image_urls),
                     sources=sources,
                     reply_to=ref_id,
                     prior_context=prior_context,
                     user_message=capture.get('user_message'),
                     trajectory=capture.get('trajectory'),
+                    context_images=capture.get('context_image_urls'),
                 )
                 data = conv['data']
                 data['turns'] = _cap_turns(history + [turn], CONVERSATIONS_MAX_TURNS)
-                _add_participant(data.setdefault('participants', []), _author_info(message.author))
+                _add_participants(data.setdefault('participants', []), participant_infos)
                 await self.store.update(
                     conv['conv_id'], data, new_handle_msg_id=reply.id,
                 )

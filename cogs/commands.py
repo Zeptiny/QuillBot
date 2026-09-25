@@ -13,16 +13,21 @@ from openai import AsyncOpenAI, RateLimitError
 from cogs import image_store
 from cogs.conversation_store import (
     ConversationStore,
-    add_participant,
+    add_participants,
     apply_cache_control,
     author_info,
     build_conversation_block,
     build_current_message,
     build_history_messages,
     cap_turns,
+    conversation_participant_ids,
     make_turn,
+    message_participant_infos,
+    select_image_refs,
 )
 from cogs.memory import MEMORY_ABOUT_TOOL, MEMORY_SEARCH_TOOL, MEMORY_WRITE_TOOL
+from cogs.scheduler import SCHEDULER_TOOLS
+from cogs.summary import SUMMARIZE_CHANNEL_TOOL, summary_tool_status
 from cogs.tavily_tools import TOOLS as TAVILY_TOOLS
 from cogs.tavily_tools import exec_tool as tavily_exec_tool
 from cogs.tavily_tools import status_label as tavily_status_label
@@ -45,6 +50,7 @@ from cogs.utils import (
     fetch_recent_channel_context,
     fetch_turn_gap,
     history_tool_status,
+    ping_send_kwargs,
     run_tool_loop,
     split_response,
 )
@@ -64,24 +70,14 @@ from config import (
     MEMORY_ENABLED,
     OPENAI_API_KEY,
     OPENAI_BASE_URL,
+    SCHEDULER_ENABLED,
+    SUMMARY_ENABLED,
     TAVILY_AVAILABLE,
+    WEB_SEARCH_ENABLED,
 )
 
 logger = logging.getLogger(__name__)
 
-
-def _conversation_participants(message: discord.Message) -> set[str]:
-    """User ids relevant to a message: author, mentions and reply target."""
-    ids = {str(message.author.id)}
-    for u in getattr(message, 'mentions', []):
-        if not u.bot:
-            ids.add(str(u.id))
-    ref = getattr(message, 'reference', None)
-    ref_msg = getattr(ref, 'resolved', None)
-    ref_author = getattr(ref_msg, 'author', None)
-    if ref_author is not None and not ref_author.bot:
-        ids.add(str(ref_author.id))
-    return ids
 
 _MEMORY_INSTRUCTIONS = (
     "- Você tem uma memória persistente: um bloco <memory> com lembranças "
@@ -105,6 +101,29 @@ _WEB_SEARCH_INSTRUCTIONS = (
     "- Quando citar resultados da web, inclua o título e o link da fonte.\n"
 )
 
+_SCHEDULER_INSTRUCTIONS = (
+    "- Você pode criar tarefas agendadas (lembretes, verificações periódicas, etc.) "
+    "usando as ferramentas do agendador.\n"
+    "  - Use `schedule_create` para criar uma tarefa. Para uma vez, use type='once' "
+    "e delay (ex: '5m', '2h', '2026-09-04 14:30'). Para recorrente, use type='cron' "
+    "e uma expressão cron de 5 campos (ex: '0 2 * * *' = todo dia às 2 AM).\n"
+    "  - Use `schedule_list` para ver tarefas existentes.\n"
+    "  - Use `schedule_delete` para cancelar uma tarefa pelo ID.\n"
+    "  - Para NOTIFICAR alguém na resposta, use a menção real no formato "
+    "<@user_id> (os IDs aparecem como author_id nas mensagens do canal e em "
+    "memory_about). Menções dentro de embed não notificam — o bot as converte "
+    "em ping real fora do embed. Nunca use @everyone, @here ou menções de cargo.\n"
+) if SCHEDULER_ENABLED else ""
+
+_SUMMARY_INSTRUCTIONS = (
+    "- Para pedidos de resumo (\"o que perdi?\", \"resume a conversa de hoje\", "
+    "\"do que falaram no #canal desde ontem?\"), use `summarize_channel` — "
+    "get_channel_history só traz as últimas 50 mensagens e não serve para períodos. "
+    "Converta \"hoje\", \"de manhã\", \"desde ontem\" em data/hora ISO usando o "
+    "horário de <contexto>. Entregue o resumo mantendo os links ↗ e cite pessoas "
+    "sem @ (um resumo não deve notificar ninguém).\n"
+) if SUMMARY_ENABLED else ""
+
 _DISCORD_FORMAT = (
     "A resposta será exibida no Discord (embed description) — use APENAS sintaxe que o Discord renderiza:\n"
     "- Permitido: **negrito**, *itálico*, __sublinhado__, ~~tachado~~, `código inline`, "
@@ -124,7 +143,9 @@ GENERAL_SYSTEM_PROMPT = (
     "<instructions>\n"
     "- Responda perguntas gerais com base no seu conhecimento.\n"
     + _MEMORY_INSTRUCTIONS
-    + (_WEB_SEARCH_INSTRUCTIONS if TAVILY_AVAILABLE else '') +
+    + (_WEB_SEARCH_INSTRUCTIONS if TAVILY_AVAILABLE else '')
+    + _SCHEDULER_INSTRUCTIONS
+    + _SUMMARY_INSTRUCTIONS +
     "- Seja honesto quando não souber a resposta — não invente informações.\n"
     "</instructions>\n\n"
     "<response_format>\n"
@@ -419,7 +440,12 @@ class Commands(commands.Cog):
             checks = await self._check_apis(session)
 
         # Web search status
-        tavily_status = '🟢 Ativa' if TAVILY_AVAILABLE else ('🔴 Desativada' if not TAVILY_API_KEY else '🟡 Sem API key')
+        if TAVILY_AVAILABLE:
+            tavily_status = '🟢 Ativa'
+        elif not WEB_SEARCH_ENABLED:
+            tavily_status = '🔴 Desativada'
+        else:
+            tavily_status = '🟡 Sem API key'
 
         # Vector store stats
         docs_rag = self.bot.cogs.get('DocsRAG')
@@ -566,11 +592,12 @@ class Commands(commands.Cog):
                 await interaction.edit_original_response(content=None)
             except discord.HTTPException:
                 pass
+            ping_kwargs = ping_send_kwargs(answer, interaction.guild)
             if len(embeds) == 1:
-                msg = await interaction.followup.send(embed=embeds[0], wait=True)
+                msg = await interaction.followup.send(wait=True, **ping_kwargs, embed=embeds[0])
             else:
                 msg = await interaction.followup.send(
-                    embed=embeds[0], view=PaginatedEmbedView(embeds), wait=True
+                    wait=True, **ping_kwargs, embed=embeds[0], view=PaginatedEmbedView(embeds)
                 )
             await self._store_new_conversation(
                 msg, question, answer, sources,
@@ -578,7 +605,7 @@ class Commands(commands.Cog):
                 guild=interaction.guild,
                 channel=interaction.channel,
                 created_at=interaction.created_at,
-                images=[image_url] if image_url else [],
+                images=capture.get('image_urls', [image_url] if image_url else []),
                 capture=capture,
             )
 
@@ -615,6 +642,7 @@ class Commands(commands.Cog):
         message_id: str | int | None = None,
         reply_to: str | int | None = None,
         capture: dict | None = None,
+        participant_infos: list[dict] | None = None,
     ) -> None:
         """Persist a brand-new conversation anchored on the bot's reply message."""
         author = author_info(user)
@@ -630,6 +658,7 @@ class Commands(commands.Cog):
             reply_to=reply_to,
             user_message=(capture or {}).get('user_message'),
             trajectory=(capture or {}).get('trajectory'),
+            context_images=(capture or {}).get('context_image_urls'),
         )
         origin = {
             'channel_id': str(getattr(channel, 'id', '') or ''),
@@ -637,13 +666,15 @@ class Commands(commands.Cog):
             'guild_id': str(getattr(guild, 'id', '') or ''),
             'guild_name': getattr(guild, 'name', '') or '',
         }
+        participants = [author] if author.get('id') else []
+        add_participants(participants, participant_infos or [])
         await self.store.create(
             str(reply_msg.id),
             guild_id=origin['guild_id'] or None,
             channel_id=origin['channel_id'] or None,
             data={
                 'turns': [turn],
-                'participants': [author] if author.get('id') else [],
+                'participants': participants,
                 'origin': origin,
                 'started_ts': ts,
             },
@@ -665,6 +696,7 @@ class Commands(commands.Cog):
         origin: str | None = None,
         context_message: discord.Message | None = None,
         prior_context: list[str] | None = None,
+        context_image_urls: list[str] | None = None,
     ) -> tuple[str, list[discord.Embed], list[dict], dict]:
         # Message layout is ordered for provider prefix caching: the system
         # prompt and replayed history stay byte-identical across follow-ups of
@@ -679,6 +711,7 @@ class Commands(commands.Cog):
             # past the window and bust the prefix cache.
             system_content += '\n\n' + build_conversation_block(history)
         context_blocks: list[str] = []
+        context_images = [u for u in (context_image_urls or []) if u]
         if user or guild or channel:
             try:
                 context_block = build_full_context_block(user or (interaction.user if interaction else None), guild or (interaction.guild if interaction else None), channel or (interaction.channel if interaction else None), created_at or (interaction.created_at if interaction else None))
@@ -707,7 +740,8 @@ class Commands(commands.Cog):
                     before=context_message,
                 )
                 if chan_ctx:
-                    context_blocks.append(chan_ctx)
+                    context_blocks.append(chan_ctx.text)
+                    context_images.extend(chan_ctx.images)
             except Exception:
                 logger.exception('Failed to build recent channel context')
         # Content-array format with an explicit cache_control breakpoint
@@ -738,6 +772,7 @@ class Commands(commands.Cog):
             prior_context=prior_context,
             channel_id=getattr(channel, 'id', None),
             context_blocks='\n\n'.join(context_blocks) or None,
+            context_image_urls=context_images,
         )
         messages.append(current_message)
 
@@ -747,6 +782,10 @@ class Commands(commands.Cog):
             base_tools.append(SQL_HISTORY_TOOL)
         if MEMORY_ENABLED:
             base_tools.extend([MEMORY_SEARCH_TOOL, MEMORY_WRITE_TOOL, MEMORY_ABOUT_TOOL])
+        if SCHEDULER_ENABLED:
+            base_tools.extend(SCHEDULER_TOOLS)
+        if SUMMARY_ENABLED:
+            base_tools.append(SUMMARIZE_CHANNEL_TOOL)
         active_tools = base_tools if base_tools else None
         fallback_channel = channel or (interaction.channel if interaction else None)
         fallback_guild = guild or (interaction.guild if interaction else None)
@@ -767,6 +806,28 @@ class Commands(commands.Cog):
                     requester=user, channel=channel, origin=origin,
                     participant_ids=participant_ids,
                 )
+            if name in ('schedule_create', 'schedule_list', 'schedule_delete'):
+                sched_cog = self.bot.get_cog('Scheduler')
+                if not sched_cog:
+                    return 'Agendador não disponível.', []
+                g = fallback_guild
+                if not g:
+                    return 'Agendador requer estar em um servidor.', []
+                actor_name = f'bot (via {user.display_name})' if user is not None else 'bot'
+                return await sched_cog.exec_tool(
+                    name, args, guild=g, actor_name=actor_name,
+                    requester=user, channel=fallback_channel,
+                )
+            if name == 'summarize_channel':
+                summary_cog = self.bot.get_cog('Summary')
+                if not summary_cog:
+                    return 'Resumo de canal não disponível.', []
+                # The triggering message bounds the range so the request
+                # itself is never summarized; permissions are the requester's.
+                return await summary_cog.exec_tool(
+                    args, guild=fallback_guild, channel=fallback_channel,
+                    requester=user, before=context_message,
+                )
             result = await exec_history_tool(name, args, bot=self.bot, guild=fallback_guild, channel=fallback_channel)
             if result is not None:
                 return result
@@ -783,6 +844,14 @@ class Commands(commands.Cog):
                 return f'🧠 Memória — {act}: *{tgt}*'
             if name == 'memory_about':
                 return f"🧠 Relembrando {args.get('user', 'quem pergunta')}…"
+            if name == 'schedule_create':
+                return f"⏰ Agendando: *{args.get('prompt', '')[:40]}*"
+            if name == 'schedule_list':
+                return '⏰ Listando tarefas agendadas…'
+            if name == 'schedule_delete':
+                return f'⏰ Removendo tarefa #{args.get("id", "?")}'
+            if name == 'summarize_channel':
+                return summary_tool_status(args, fallback_guild)
             label = history_tool_status(name, args)
             if label is not None:
                 return label
@@ -835,9 +904,12 @@ class Commands(commands.Cog):
                 )
             )
 
+        image_refs, context_image_refs, _ = select_image_refs(urls, context_images)
         return answer, embeds, sources, {
             'user_message': current_message,
             'trajectory': trajectory,
+            'image_urls': image_refs,
+            'context_image_urls': context_image_refs,
         }
 
     async def cog_app_command_error(
@@ -887,7 +959,13 @@ class Commands(commands.Cog):
                         if fresh:
                             conv = fresh
                         history = conv['data'].get('turns', []).copy()
-                        prior_context = await fetch_turn_gap(message, history)
+                        participant_infos = await message_participant_infos(message)
+                        participant_ids = conversation_participant_ids(
+                            conv['data'], participant_infos,
+                        )
+                        prior_context_result = await fetch_turn_gap(message, history)
+                        prior_context = prior_context_result.lines
+                        prior_context_images = prior_context_result.images
                         answer, embeds, sources, capture = await self._run_chat(
                             follow_up_question,
                             history=history,
@@ -897,16 +975,20 @@ class Commands(commands.Cog):
                             channel=message.channel,
                             created_at=message.created_at,
                             reply_to=str(ref_id),
-                            participant_ids=_conversation_participants(message),
+                            participant_ids=participant_ids,
                             origin=message.jump_url,
                             context_message=message,
                             prior_context=prior_context,
+                            context_image_urls=prior_context_images,
                         )
                         if len(embeds) == 1:
-                            reply = await message.reply(embed=embeds[0])
+                            reply = await message.reply(
+                                **ping_send_kwargs(answer, message.guild), embed=embeds[0]
+                            )
                         else:
                             reply = await message.reply(
-                                embed=embeds[0], view=PaginatedEmbedView(embeds)
+                                **ping_send_kwargs(answer, message.guild),
+                                embed=embeds[0], view=PaginatedEmbedView(embeds),
                             )
                         turn = make_turn(
                             follow_up_question, answer,
@@ -915,16 +997,17 @@ class Commands(commands.Cog):
                             message_id=message.id,
                             channel_id=message.channel.id,
                             channel_name=getattr(message.channel, 'name', None),
-                            images=image_urls,
+                            images=capture.get('image_urls', image_urls),
                             sources=sources,
                             reply_to=ref_id,
                             prior_context=prior_context,
                             user_message=capture.get('user_message'),
                             trajectory=capture.get('trajectory'),
+                            context_images=capture.get('context_image_urls'),
                         )
                         data = conv['data']
                         data['turns'] = cap_turns(history + [turn], CONVERSATIONS_MAX_TURNS)
-                        add_participant(data.setdefault('participants', []), author_info(message.author))
+                        add_participants(data.setdefault('participants', []), participant_infos)
                         await self.store.update(
                             conv['conv_id'], data, new_handle_msg_id=reply.id,
                         )
@@ -1027,6 +1110,7 @@ class Commands(commands.Cog):
                 await message.reply(
                     f'Olá {message.author.mention}! Me mencione com uma pergunta. Ex: @{self.bot.user.display_name} como otimizar meu servidor?',
                     mention_author=False,
+                    allowed_mentions=discord.AllowedMentions(users=[message.author]),
                 )
             except discord.HTTPException:
                 pass
@@ -1034,6 +1118,7 @@ class Commands(commands.Cog):
         if not clean_question and all_image_urls:
             clean_question = 'Analise esta imagem.'
         self._followup_cd[user_id] = True
+        participant_infos = await message_participant_infos(message)
         logger.info("Processing @mention chat user=%s guild=%s question=%r ref=%s images=%d", message.author.id, message.guild.id if message.guild else None, clean_question[:80], bool(ref_context), len(all_image_urls))
         async with message.channel.typing():
             try:
@@ -1044,23 +1129,29 @@ class Commands(commands.Cog):
                     guild=message.guild,
                     channel=message.channel,
                     created_at=message.created_at,
-                    participant_ids=_conversation_participants(message),
+                    participant_ids={p['id'] for p in participant_infos if p.get('id')},
                     origin=message.jump_url,
                     context_message=message,
                 )
                 if len(embeds) == 1:
-                    reply = await message.reply(embed=embeds[0], mention_author=False)
+                    reply = await message.reply(
+                        mention_author=False, **ping_send_kwargs(answer, message.guild), embed=embeds[0]
+                    )
                 else:
-                    reply = await message.reply(embed=embeds[0], view=PaginatedEmbedView(embeds), mention_author=False)
+                    reply = await message.reply(
+                        mention_author=False, **ping_send_kwargs(answer, message.guild),
+                        embed=embeds[0], view=PaginatedEmbedView(embeds),
+                    )
                 await self._store_new_conversation(
                     reply, clean_question, answer, sources,
                     user=message.author,
                     guild=message.guild,
                     channel=message.channel,
                     created_at=message.created_at,
-                    images=all_image_urls,
+                    images=capture.get('image_urls', all_image_urls),
                     message_id=message.id,
                     capture=capture,
+                    participant_infos=participant_infos,
                 )
             except RateLimitError:
                 await message.reply('⏳ Limite de requisições atingido. Tente novamente em alguns minutos.', mention_author=False)

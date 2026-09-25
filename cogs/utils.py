@@ -1,16 +1,26 @@
 """Shared text utilities used across multiple cogs."""
 
+import asyncio
 import datetime
 import json
 import logging
+import re
+import sqlite3
+import unicodedata
+import uuid
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any, Final
 from zoneinfo import ZoneInfo
 
 import discord
 from openai import AsyncOpenAI
 
+from cogs import image_store
 from config import (
+    CHANNEL_CONTEXT_IMAGE_MAX_AGE_MINUTES,
+    CHANNEL_CONTEXT_IMAGES_ENABLED,
     CHANNEL_CONTEXT_MESSAGES,
     CONVERSATIONS_GAP_MESSAGES,
     HISTORY_SQL_TOOL_ENABLED,
@@ -20,6 +30,105 @@ from config import (
 logger = logging.getLogger(__name__)
 
 BR_TZ = ZoneInfo("America/Sao_Paulo")
+
+# ---------------------------------------------------------------------------
+# Ping-safe user mention extraction
+# ---------------------------------------------------------------------------
+
+_MENTION_USER_RE = re.compile(r'<@!?(\d{15,25})>')
+# '@' not preceded by a word char or another '@' (skips emails, @@) — single
+# token; multi-word display names are resolved by extending the match.
+_AT_MENTION_RE = re.compile(r'(?<![\w@])@([\w][\w.\-]{0,31})')
+# Never pingable as @tokens: Discord pings and PT-BR "everyone" shorthand.
+_PING_BLACKLIST = {'here', 'everyone', 'all', 'todos', 'todo'}
+
+
+def _norm_name(text: str) -> str:
+    text = unicodedata.normalize('NFKD', text or '')
+    text = ''.join(c for c in text if not unicodedata.combining(c))
+    return re.sub(r'\s+', ' ', text).strip().lower()
+
+
+def extract_pingable_mentions(text: str, guild: discord.Guild | None, *, limit: int = 10) -> str:
+    """Collect ping-safe user mentions from LLM output as a content string.
+
+    Discord only notifies for mentions in the message *content* — mentions
+    inside embeds render but never ping.  This helper gathers the users the
+    model referenced and returns them as ``'<@id> <@id>'`` for use as
+    ``content=`` alongside the embed.
+
+    Accepts both ``<@user_id>`` mentions and ``@username`` / ``@display name``
+    tokens (resolved against guild members, accent/case-insensitive, extending
+    up to 3 words for names with spaces).  Only real human members ping:
+    roles, ``@here``/``@everyone``, bots (including this bot — prevents
+    self-ping loops) and unresolvable names are silently dropped.
+    """
+    if not text or guild is None:
+        return ''
+    picked: list[str] = []
+
+    def _add(member: discord.Member | None) -> None:
+        if member is None or member.bot:
+            return
+        sid = str(member.id)
+        if sid not in picked:
+            picked.append(sid)
+
+    def _resolve(name: str) -> discord.Member | None:
+        member = guild.get_member_named(name)
+        if member is not None:
+            return member
+        target = _norm_name(name)
+        return next(
+            (
+                m for m in guild.members
+                if not m.bot and target in (_norm_name(m.display_name), _norm_name(m.name))
+            ),
+            None,
+        )
+
+    for uid in _MENTION_USER_RE.findall(text):
+        _add(guild.get_member(int(uid)))
+        if len(picked) >= limit:
+            return ' '.join(f'<@{i}>' for i in picked)
+
+    for match in _AT_MENTION_RE.finditer(text):
+        if len(picked) >= limit:
+            break
+        raw = match.group(1)
+        if raw.lower() in _PING_BLACKLIST:
+            continue
+        member = _resolve(raw)
+        if member is None:
+            # Multi-word display name: greedily extend with following words,
+            # stripping trailing punctuation ("@John Doe," -> "John Doe").
+            extended = raw
+            for word in text[match.end():].lstrip().split()[:2]:
+                extended = f'{extended} {word.rstrip(".,;:!?…")}'
+                member = _resolve(extended)
+                if member is not None:
+                    break
+        _add(member)
+    return ' '.join(f'<@{i}>' for i in picked)
+
+
+def ping_send_kwargs(text: str, guild: discord.Guild | None) -> dict:
+    """Send kwargs that turn mentions in LLM output *text* into real pings.
+
+    Mentions inside embeds never notify (Discord platform behavior) — the
+    extracted user pings ride as message ``content``.  everyone/roles stay
+    unparsable so no code path using this can ever ping @everyone.
+    """
+    kwargs: dict = {
+        'allowed_mentions': discord.AllowedMentions(
+            users=True, roles=False, everyone=False,
+        ),
+    }
+    mentions = extract_pingable_mentions(text, guild)
+    if mentions:
+        kwargs['content'] = mentions
+    return kwargs
+
 
 CHANNEL_HISTORY_TOOL = {
     'type': 'function',
@@ -252,7 +361,7 @@ SQL_HISTORY_TOOL = {
             'por mês: GROUP BY substr(c.ts,1,7); por hora: GROUP BY substr(c.ts,12,2); '
             "FTS5: MATCH '\"frase exata\" AND (a OR b) NOT c', prefixo 'palavra*'; "
             'REGEXP(padrão, texto) e REGEXP sempre com re.IGNORECASE; '
-            'data: compare c.ts como texto ISO ou use datetime(c.ts). Sempre termine com LIMIT.'
+            'data: compare c.ts como texto ISO ou use datetime(c.ts).'
         ),
         'parameters': {
             'type': 'object',
@@ -301,6 +410,19 @@ def _fmt_dt_line(dt: datetime.datetime | None) -> str:
 # ---------------------------------------------------------------------------
 
 MESSAGE_LINE_MAX_CONTENT: Final[int] = 800
+CHANNEL_CONTEXT_MAX_IMAGES: Final[int] = 4
+
+
+@dataclass
+class ChannelContext:
+    """Textual channel context plus persisted images available to the model."""
+
+    text: str = ''
+    lines: list[str] = field(default_factory=list)
+    images: list[str] = field(default_factory=list)
+
+    def __bool__(self) -> bool:
+        return bool(self.text or self.lines or self.images)
 
 
 def _flatten(s: str) -> str:
@@ -491,13 +613,57 @@ def build_full_context_block(
     return "\n".join(parts)
 
 
+def _context_image_attachments(msg: discord.Message, now: datetime.datetime) -> list[Any]:
+    """Image attachments of a context message eligible to be shown to the model.
+
+    Empty when channel-context images are disabled or the message is older than
+    ``CHANNEL_CONTEXT_IMAGE_MAX_AGE_MINUTES`` (stale images are rarely what a
+    question is about, and every one sent costs tokens).
+    """
+    if not CHANNEL_CONTEXT_IMAGES_ENABLED:
+        return []
+    created = getattr(msg, 'created_at', None)
+    if (
+        CHANNEL_CONTEXT_IMAGE_MAX_AGE_MINUTES > 0
+        and created is not None
+        and now - created > datetime.timedelta(minutes=CHANNEL_CONTEXT_IMAGE_MAX_AGE_MINUTES)
+    ):
+        return []
+    return [
+        attachment for attachment in getattr(msg, 'attachments', [])
+        if (getattr(attachment, 'content_type', None) or '').startswith('image/')
+    ]
+
+
+async def _persist_context_images(groups: list[list[Any]]) -> list[str]:
+    """Persist per-message attachment groups concurrently.
+
+    *groups* come newest-first (history walk order); the refs are returned in
+    chronological order, matching the rendered context lines.
+    """
+    if not groups:
+        return []
+    results = await asyncio.gather(
+        *(image_store.persist_images(group) for group in groups),
+        return_exceptions=True,
+    )
+    refs: list[str] = []
+    for result in reversed(results):
+        if isinstance(result, BaseException):
+            logger.warning('Failed to persist channel-context images: %s', result)
+            continue
+        refs.extend(result)
+    return refs
+
+
 async def fetch_channel_history(
     bot: discord.Client,
     channel: discord.abc.Messageable | None,
     limit: int = 20,
     channel_id: str | None = None,
     before: discord.abc.Snowflake | None = None,
-) -> str:
+    include_images: bool = False,
+) -> str | ChannelContext:
     target = channel
     if channel_id:
         try:
@@ -514,22 +680,35 @@ async def fetch_channel_history(
         return "Histórico não disponível para este canal."
     limit = max(1, min(50, int(limit)))
     lines: list[str] = []
+    image_groups: list[list[Any]] = []
+    image_slots = CHANNEL_CONTEXT_MAX_IMAGES
+    now = datetime.datetime.now(datetime.timezone.utc)
     try:
         async for msg in target.history(limit=limit, before=before):
             lines.append(format_message_line(msg))
+            if include_images and image_slots > 0:
+                attachments = _context_image_attachments(msg, now)[:image_slots]
+                if attachments:
+                    image_groups.append(attachments)
+                    image_slots -= len(attachments)
     except discord.Forbidden:
         return "Sem permissão para ler histórico deste canal."
     except Exception as e:
         logger.exception("fetch_channel_history failed")
         return f"Erro ao buscar histórico: {e}"
     if not lines:
-        return "Nenhuma mensagem encontrada no histórico."
+        empty = "Nenhuma mensagem encontrada no histórico."
+        return ChannelContext(text=empty) if include_images else empty
     lines.reverse()
     header = (
         f"Histórico de #{getattr(target, 'name', target.id)} "
         f"(channel_id={target.id}) — últimas {len(lines)} mensagens, cronológica:\n"
     )
-    return header + "\n".join(lines)
+    text = header + "\n".join(lines)
+    if not include_images:
+        return text
+    images = await _persist_context_images(image_groups)
+    return ChannelContext(text=text, lines=lines, images=images)
 
 
 async def fetch_recent_channel_context(
@@ -538,18 +717,31 @@ async def fetch_recent_channel_context(
     *,
     before: discord.abc.Snowflake | None = None,
     limit: int | None = None,
-) -> str | None:
+) -> ChannelContext | None:
     """Latest channel messages as auto-injected LLM context.
 
     Controlled by ``CHANNEL_CONTEXT_MESSAGES`` (0 disables). Returns ``None``
-    when disabled or without a readable channel. ``before`` excludes the
-    triggering message from the window (mention/follow-up flows).
+    when disabled or without a readable channel. Image attachments are
+    persisted and returned separately from the formatted text. ``before``
+    excludes the triggering message from the window (mention/follow-up flows).
     """
     n = CHANNEL_CONTEXT_MESSAGES if limit is None else limit
     if n <= 0 or channel is None:
         return None
-    text = await fetch_channel_history(bot, channel, limit=n, before=before)
-    return f"<mensagens_recentes_do_canal>\n{text}\n</mensagens_recentes_do_canal>"
+    context = await fetch_channel_history(
+        bot, channel, limit=n, before=before, include_images=True,
+    )
+    if not isinstance(context, ChannelContext):
+        context = ChannelContext(text=context)
+    logger.info(
+        "Recent channel context channel=%s messages=%d images=%d",
+        getattr(channel, 'id', None), len(context.lines), len(context.images),
+    )
+    return ChannelContext(
+        text=f"<mensagens_recentes_do_canal>\n{context.text}\n</mensagens_recentes_do_canal>",
+        lines=context.lines,
+        images=context.images,
+    )
 
 
 async def fetch_channel_gap(
@@ -559,7 +751,7 @@ async def fetch_channel_gap(
     before: discord.abc.Snowflake,
     skip_ids: set[str] | None = None,
     limit: int | None = None,
-) -> list[str]:
+) -> ChannelContext:
     """Human channel messages between a stored turn and a new follow-up.
 
     Anchors on the previous bot-directed turn's message id and returns the
@@ -568,19 +760,22 @@ async def fetch_channel_gap(
     ``before`` and stops at the anchor id, so nothing older than the previous
     turn leaks in; only human messages consume the budget, so truncation keeps
     the NEWEST chatter lines. Controlled by ``CONVERSATIONS_GAP_MESSAGES``
-    (0 disables). Returns [] on failure — the recent-channel window is then
-    the fallback.
+    (0 disables). Returns an empty context on failure — the recent-channel
+    window is then the fallback.
     """
     n = CONVERSATIONS_GAP_MESSAGES if limit is None else limit
     if n <= 0 or channel is None or not hasattr(channel, "history"):
-        return []
+        return ChannelContext()
     try:
         anchor = discord.Object(id=int(after_id))
     except (TypeError, ValueError):
-        return []
+        return ChannelContext()
     skip = {str(s) for s in (skip_ids or set()) if s}
     skip.add(str(after_id))
     lines: list[str] = []
+    image_groups: list[list[Any]] = []
+    image_slots = CHANNEL_CONTEXT_MAX_IMAGES
+    now = datetime.datetime.now(datetime.timezone.utc)
     try:
         async for msg in channel.history(limit=max(n * 3, 100), before=before):
             if msg.id <= anchor.id:
@@ -590,23 +785,29 @@ async def fetch_channel_gap(
             if not msg.content and not msg.attachments and not msg.embeds:
                 continue
             lines.append(format_message_line(msg))
+            if image_slots > 0:
+                attachments = _context_image_attachments(msg, now)[:image_slots]
+                if attachments:
+                    image_groups.append(attachments)
+                    image_slots -= len(attachments)
             if len(lines) >= n:
                 break
+        images = await _persist_context_images(image_groups)
     except Exception:
         logger.exception("fetch_channel_gap failed")
-        return []
+        return ChannelContext()
     lines.reverse()
-    return lines
+    return ChannelContext(text="\n".join(lines), lines=lines, images=images)
 
 
-async def fetch_turn_gap(message: discord.Message, history: list[dict]) -> list[str]:
+async def fetch_turn_gap(message: discord.Message, history: list[dict]) -> ChannelContext:
     """Channel chatter since the previous bot-directed turn (same channel only)."""
     last_turn = history[-1] if history else None
     anchor_id = (last_turn or {}).get('message_id')
     if not anchor_id:
-        return []
+        return ChannelContext()
     if last_turn.get('channel_id') and str(last_turn['channel_id']) != str(message.channel.id):
-        return []
+        return ChannelContext()
     return await fetch_channel_gap(
         message.channel,
         after_id=anchor_id,
@@ -805,6 +1006,11 @@ async def exec_history_tool(
             text = await hist.exec_sql(guild.id, sql)  # type: ignore
         except ValueError as e:
             return f'Consulta rejeitada: {e} Reescreva e tente de novo.', []
+        except sqlite3.OperationalError as e:
+            # Mistakes in model-written SQL (unknown column, syntax, timeout)
+            # are expected and fed back to the model: log the query, not a trace.
+            logger.warning('sql_history query failed: %s | sql=%s', e, ' '.join(sql.split())[:1000])
+            return f'Erro SQL: {e} Corrija a consulta (veja esquema na descrição da ferramenta).', []
         except Exception as e:
             logger.exception('sql_history failed')
             return f'Erro SQL: {e} Corrija a consulta (veja esquema na descrição da ferramenta).', []
@@ -967,6 +1173,83 @@ def serialize_trajectory(messages: list[Any]) -> list[dict]:
     return out
 
 
+# Tool calls some providers hand back as raw text in ``content`` instead of
+# ``tool_calls``: always when the request carries no ``tools`` (the forced
+# final round), and whenever their parser misses the model's native format.
+# Bodies: GLM (``name<arg_key>k</arg_key><arg_value>v</arg_value>``),
+# Qwen3-Coder (``<function=name><parameter=k>v</parameter></function>``) and
+# Hermes/Qwen JSON (``{"name": ..., "arguments": {...}}``).  An unterminated
+# block (output cut at max_tokens) runs to the end of the text and is only
+# stripped: its arguments are incomplete.
+_TEXT_TOOL_CALL_RE = re.compile(r'<tool_call>(.*?)(</tool_call>|\Z)', re.S)
+_GLM_ARG_RE = re.compile(r'<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>', re.S)
+_XML_FUNCTION_RE = re.compile(r'<function=([^>\s]+)>(.*?)(?:</function>|\Z)', re.S)
+_XML_PARAM_RE = re.compile(r'<parameter=([^>\s]+)>(.*?)</parameter>', re.S)
+
+
+def _parse_text_tool_call(body: str, schemas: dict[str, dict]) -> tuple[str, dict] | None:
+    body = body.strip()
+    if body.startswith('{'):
+        try:
+            obj = json.loads(body)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(obj, dict):
+            return None
+        name = obj.get('name')
+        args = obj.get('arguments', obj.get('parameters', {}))
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except json.JSONDecodeError:
+                return None
+        if name not in schemas or not isinstance(args, dict):
+            return None
+        return name, args
+    fn = _XML_FUNCTION_RE.search(body)
+    if fn:
+        name, pairs = fn.group(1).strip(), _XML_PARAM_RE.findall(fn.group(2))
+    else:
+        name, pairs = body.split('<', 1)[0].strip(), _GLM_ARG_RE.findall(body)
+    if name not in schemas:
+        return None
+    args: dict[str, Any] = {}
+    for key, value in pairs:
+        key, value = key.strip(), value.strip()
+        if schemas[name].get(key, {}).get('type', 'string') != 'string':
+            try:
+                value = json.loads(value)
+            except json.JSONDecodeError:
+                pass
+        args[key] = value
+    return name, args
+
+
+def extract_text_tool_calls(
+    content: str | None, tools: list[dict] | None = None,
+) -> tuple[str, list[tuple[str, dict]], bool]:
+    """Split raw-text tool-call markup out of an assistant *content*.
+
+    Returns ``(text_without_markup, calls, had_markup)``.  *calls* holds the
+    ``(name, args)`` of blocks that parse as a call to one of *tools*; every
+    ``<tool_call>`` block is removed from the text either way, so the markup
+    never reaches the user.
+    """
+    if not content or '<tool_call>' not in content:
+        return content or '', [], False
+    schemas: dict[str, dict] = {}
+    for tool in tools or []:
+        fn = tool.get('function') or {}
+        if fn.get('name'):
+            schemas[fn['name']] = (fn.get('parameters') or {}).get('properties') or {}
+    calls = [
+        parsed
+        for m in _TEXT_TOOL_CALL_RE.finditer(content)
+        if m.group(2) and (parsed := _parse_text_tool_call(m.group(1), schemas))
+    ]
+    return _TEXT_TOOL_CALL_RE.sub('', content).strip(), calls, True
+
+
 async def run_tool_loop(
     client: AsyncOpenAI,
     model: str,
@@ -1049,12 +1332,41 @@ async def run_tool_loop(
             _usage_summary(response),
         )
 
-        if not choice.message.tool_calls:
+        tool_calls = list(choice.message.tool_calls or [])
+        assistant_msg: Any = choice.message
+        if not tool_calls and tools:
+            text, parsed, _ = extract_text_tool_calls(choice.message.content, tools)
+            if parsed:
+                logger.warning(
+                    "Recovered %d tool call(s) returned as text (model=%s finish_reason=%s): %s",
+                    len(parsed), model, finish_reason, [name for name, _ in parsed],
+                )
+                tool_calls = [
+                    SimpleNamespace(
+                        id=f'call_{uuid.uuid4().hex[:24]}',
+                        type='function',
+                        function=SimpleNamespace(name=name, arguments=json.dumps(args, ensure_ascii=False)),
+                    )
+                    for name, args in parsed
+                ]
+                assistant_msg = {
+                    'role': 'assistant',
+                    'content': text or None,
+                    'tool_calls': [
+                        {
+                            'id': tc.id,
+                            'type': 'function',
+                            'function': {'name': tc.function.name, 'arguments': tc.function.arguments},
+                        }
+                        for tc in tool_calls
+                    ],
+                }
+        if not tool_calls:
             break
 
-        messages.append(choice.message)
+        messages.append(assistant_msg)
 
-        for tc in choice.message.tool_calls:
+        for tc in tool_calls:
             try:
                 args = json.loads(tc.function.arguments)
             except (json.JSONDecodeError, TypeError):
@@ -1074,7 +1386,22 @@ async def run_tool_loop(
                 except discord.HTTPException:
                     pass
 
-            result_text, sources = await exec_tool(tc.function.name, args)
+            try:
+                result_text, sources = await exec_tool(tc.function.name, args)
+            except Exception as e:
+                # One failing tool (bad model-supplied args, API hiccup) must
+                # not abort the whole answer: report it back to the model,
+                # which can retry with other arguments or answer without it.
+                logger.exception(
+                    "Tool %s failed (model=%s args=%r)",
+                    tc.function.name, model, str(args)[:200],
+                )
+                result_text = (
+                    f'Erro ao executar a ferramenta {tc.function.name}: '
+                    f'{type(e).__name__}: {str(e)[:200]}. '
+                    'Corrija os argumentos ou responda sem esta ferramenta.'
+                )
+                sources = []
 
             if sources:
                 if dedup_key is not None:
@@ -1122,11 +1449,15 @@ async def run_tool_loop(
         _accumulate_usage(usage_totals, response)
 
     final_choice = response.choices[0]
-    answer = final_choice.message.content or ''
-    if not answer.strip():
+    # A reply that still tries to call a tool (as text: no tools were sent, or
+    # none of its calls parsed) is not an answer — only its preamble would be
+    # left once the markup is stripped, so it gets the same retry as an empty one.
+    answer, _, had_markup = extract_text_tool_calls(final_choice.message.content)
+    if not answer.strip() or had_markup:
         logger.warning(
-            "LLM returned an empty answer (finish_reason=%s usage=[%s]); "
+            "LLM returned %s (finish_reason=%s usage=[%s]); "
             "retrying once without tools and with a conciseness nudge",
+            'a tool call as text instead of an answer' if had_markup else 'an empty answer',
             getattr(final_choice, 'finish_reason', None),
             _usage_summary(response),
         )
@@ -1147,7 +1478,7 @@ async def run_tool_loop(
         )
         _accumulate_usage(usage_totals, response)
         final_choice = response.choices[0]
-        answer = final_choice.message.content or ''
+        answer, _, _ = extract_text_tool_calls(final_choice.message.content)
     if not answer.strip():
         logger.warning(
             "LLM returned an empty answer (user got the fallback message): "

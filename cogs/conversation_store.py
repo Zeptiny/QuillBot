@@ -202,6 +202,57 @@ def author_info(user: Any) -> dict:
     return {'id': str(getattr(user, 'id', '')), 'name': name, 'display': display}
 
 
+async def message_participant_infos(message: Any) -> list[dict]:
+    """Return the human users explicitly involved in a Discord message.
+
+    A reply target is fetched when Discord did not resolve it in the gateway
+    payload.  That makes memory scope independent of the message cache.
+    """
+    users = [getattr(message, 'author', None), *getattr(message, 'mentions', [])]
+    ref = getattr(message, 'reference', None)
+    ref_msg = getattr(ref, 'resolved', None)
+    ref_id = getattr(ref, 'message_id', None)
+    if ref_msg is None and ref_id:
+        fetch_message = getattr(getattr(message, 'channel', None), 'fetch_message', None)
+        if fetch_message is not None:
+            try:
+                ref_msg = await fetch_message(ref_id)
+            except Exception:
+                logger.debug('[conversation] could not resolve reply target %s', ref_id, exc_info=True)
+    if ref_msg is not None:
+        users.append(getattr(ref_msg, 'author', None))
+
+    infos: list[dict] = []
+    for user in users:
+        if user is None or getattr(user, 'bot', False):
+            continue
+        add_participant(infos, author_info(user))
+    return infos
+
+
+def conversation_participant_ids(data: dict | None, incoming: list[dict] | None = None) -> set[str]:
+    """Return the canonical participant ids for a shared conversation.
+
+    Older persisted conversations may not have a complete ``participants``
+    list, so derive author ids from their stored turns as a backwards-compatible
+    fallback.
+    """
+    data = data or {}
+    ids = {
+        str(p.get('id'))
+        for p in data.get('participants', [])
+        if isinstance(p, dict) and p.get('id')
+    }
+    for turn in data.get('turns', []):
+        author = turn.get('author') if isinstance(turn, dict) else None
+        if isinstance(author, dict) and author.get('id'):
+            ids.add(str(author['id']))
+    for info in incoming or []:
+        if isinstance(info, dict) and info.get('id'):
+            ids.add(str(info['id']))
+    return ids
+
+
 def make_turn(
     question: str,
     answer: str,
@@ -217,8 +268,13 @@ def make_turn(
     prior_context: list[str] | None = None,
     user_message: dict | None = None,
     trajectory: list[dict] | None = None,
+    context_images: list[str] | None = None,
 ) -> dict:
     """Build a single conversation turn record.
+
+    ``images`` are the user's own images; ``context_images`` are channel images
+    that were inlined alongside them. They are stored apart so verbatim replay
+    re-sends both, while only the user's are ever described as shared by them.
 
     ``user_message`` is the exact message dict sent to the LLM for this turn
     (only its text is kept — images are re-inlined from their stored refs, so
@@ -247,6 +303,9 @@ def make_turn(
         'reply_to': str(reply_to) if reply_to else None,
         'prior_context': [l for l in (prior_context or []) if l][:max(30, CONVERSATIONS_GAP_MESSAGES)],
     }
+    context_refs = [u for u in (context_images or []) if u][:image_store.MAX_IMAGES_PER_TURN]
+    if context_refs:
+        turn['context_images'] = context_refs
     captured_text = message_text(user_message)
     if captured_text:
         turn['user_message'] = captured_text
@@ -285,6 +344,12 @@ def add_participant(participants: list[dict], info: dict) -> None:
         'name': info.get('name', ''),
         'display': info.get('display', ''),
     })
+
+
+def add_participants(participants: list[dict], infos: list[dict]) -> None:
+    """Add all supplied users to a conversation's persisted participant list."""
+    for info in infos:
+        add_participant(participants, info)
 
 
 def _fmt_ts(ts: float | None) -> str:
@@ -341,6 +406,37 @@ def _append_image_marker(text: str, count: int) -> str:
     return f'{text}\n\n{marker}' if text else marker
 
 
+def _newest(images: list[str], count: int) -> list[str]:
+    """The last *count* items of a chronological list (``[]`` when count <= 0)."""
+    return images[max(0, len(images) - count):] if count > 0 else []
+
+
+def select_image_refs(
+    image_urls: list[str] | None = None,
+    context_image_urls: list[str] | None = None,
+) -> tuple[list[str], list[str], int]:
+    """Select current images first, then context images, within the turn budget.
+
+    Returns ``(current, context, current_dropped)``. Context images are
+    chronological, so the newest ones are kept — the image right above the
+    question is the one most likely being asked about. Only the user's own
+    images count as dropped: channel images over budget are simply omitted
+    (the context text still lists them as ``[anexo:…]``), so the model is never
+    told the user shared images they did not.
+    """
+    limit = image_store.MAX_IMAGES_PER_TURN
+    current_images = [u for u in (image_urls or []) if u]
+    context_images = [u for u in (context_image_urls or []) if u]
+    current = current_images[:limit]
+    context = _newest(context_images, limit - len(current))
+    return current, context, max(0, len(current_images) - limit)
+
+
+def _ref_list(raw: Any) -> list[str]:
+    """Non-empty string refs from a stored image list (tolerates corrupt data)."""
+    return [u for u in raw if isinstance(u, str) and u] if isinstance(raw, list) else []
+
+
 def _replay_verbatim_turn(turn: dict, image_budget: int) -> tuple[list[dict], int] | None:
     """Rebuild the exact messages of a captured turn, or ``None`` to fall back.
 
@@ -355,12 +451,16 @@ def _replay_verbatim_turn(turn: dict, image_budget: int) -> tuple[list[dict], in
     text = turn.get('user_message')
     if not isinstance(text, str) or not text.strip():
         return None
-    raw_images = turn.get('images')
-    images = [u for u in raw_images if isinstance(u, str) and u] if isinstance(raw_images, list) else []
-    inline, _ = _split_images(images[:max(0, image_budget)])
-    dropped = len(images) - len(inline)
-    if dropped:
-        text = _append_image_marker(text, dropped)
+    images = _ref_list(turn.get('images'))
+    context_images = _ref_list(turn.get('context_images'))
+    budget = max(0, image_budget)
+    user_inline, _ = _split_images(images[:budget])
+    context_inline, _ = _split_images(_newest(context_images, budget - len(user_inline)))
+    inline = user_inline + context_inline
+    if len(images) > len(user_inline):
+        text = _append_image_marker(text, len(images) - len(user_inline))
+    if len(context_images) > len(context_inline):
+        text = f'{text}\n\n{image_store.context_image_marker(len(context_images) - len(context_inline))}'
     if inline:
         user_msg: dict = {'role': 'user', 'content': [{'type': 'text', 'text': text}, *inline]}
     else:
@@ -487,15 +587,18 @@ def build_current_message(
     prior_context: list[str] | None = None,
     channel_id: str | int | None = None,
     context_blocks: str | None = None,
+    context_image_urls: list[str] | None = None,
 ) -> dict:
     """Build the current user message, attributed when part of a conversation.
 
     ``context_blocks`` carries per-request context (current time/place, memory
-    selection, recent channel window). Keeping it in the *tail* message —
+    selection, recent channel window), while ``context_image_urls`` carries
+    persisted images from that context. Keeping both in the *tail* message —
     instead of the system prompt — leaves the history prefix byte-identical
     across follow-ups, which makes provider prefix caching effective.
     """
-    images = [u for u in (image_urls or []) if u][:4]
+    current_images, context_images, dropped = select_image_refs(image_urls, context_image_urls)
+    inline: list[dict] = []
     parts: list[dict] | None = None
     head = (f"{context_blocks}\n\n" if context_blocks else '') + _prior_context_head(
         [l for l in (prior_context or []) if l], channel_id
@@ -511,12 +614,22 @@ def build_current_message(
         text = f"{head}[{' • '.join(meta)}]\n{question}"
     elif head:
         text = f"{head}{question}"
-    if images:
-        inline, dropped = _split_images(images)
-        if dropped:
-            text = _append_image_marker(text, dropped)
-        if inline:
-            parts = [{'type': 'text', 'text': text}, *inline]
+    if current_images or context_images:
+        current_inline, current_missing = _split_images(current_images)
+        # Context images missing on disk are just omitted: the note below only
+        # announces the ones actually attached, and they are not the user's.
+        context_inline, _ = _split_images(context_images)
+        inline = current_inline + context_inline
+        dropped += current_missing
+        if context_inline:
+            note = image_store.context_image_note(
+                len(context_inline), after_user_images=bool(current_inline),
+            )
+            text = f'{text}\n\n{note}' if text else note
+    if dropped:
+        text = _append_image_marker(text, dropped)
+    if inline:
+        parts = [{'type': 'text', 'text': text}, *inline]
     if parts is not None:
         return {'role': 'user', 'content': parts}
     return {'role': 'user', 'content': text}

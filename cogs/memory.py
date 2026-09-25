@@ -1201,6 +1201,7 @@ class Memory(commands.Cog, name='Memory'):
 
     async def _find_target(
         self, args: dict, guild: discord.Guild, subjects: list[str],
+        *, allowed_subjects: set[str] | None = None,
     ) -> tuple[dict | None, str]:
         """Locate an existing memory by id or content match within scope."""
         mid = args.get('memory_id')
@@ -1213,6 +1214,8 @@ class Memory(commands.Cog, name='Memory'):
                 return None, '`memory_id` inválido.'
             if entry is None or entry['status'] != 'active':
                 return None, f'Nenhuma memória ativa com id={mid}.'
+            if allowed_subjects is not None and entry['subject'] not in allowed_subjects:
+                return None, self._PRIVACY_MSG
             return entry, ''
         match = (args.get('content_match') or args.get('content') or '').strip()
         if not match:
@@ -1284,6 +1287,8 @@ class Memory(commands.Cog, name='Memory'):
                 'ele participe da conversa. Use o ID dele (disponível no contexto da '
                 'conversa), ou salve como fato do servidor omitindo `about_user`.'
             ), []
+        if subject and subject not in participants:
+            return self._PRIVACY_MSG, []
         origin_url = (origin or '').strip() or ''
         if origin_url and not origin_url.startswith('http'):
             origin_url = ''
@@ -1336,7 +1341,9 @@ class Memory(commands.Cog, name='Memory'):
             ), []
 
         subjects = ['', subject] if subject else ['']
-        entry, err = await self._find_target(args, guild, subjects)
+        entry, err = await self._find_target(
+            args, guild, subjects, allowed_subjects={'', *participants},
+        )
         if err:
             return err, []
 
