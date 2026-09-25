@@ -5,11 +5,8 @@ stripping), validate_trajectory fallbacks, make_turn capture (+ disable/oversize
 guards), stepped window hysteresis, verbatim replay with append-only growth
 (prefix-cache stability), SQLite persistence of captured turns, and
 apply_cache_control. No Discord or LLM calls.
-
-Run: python3 test_trajectory_replay.py
 """
 
-import asyncio
 import shutil
 import tempfile
 from types import SimpleNamespace
@@ -26,18 +23,7 @@ from cogs.conversation_store import (
 )
 from cogs.utils import SQL_HISTORY_TOOL, extract_text_tool_calls, run_tool_loop, serialize_trajectory
 
-PASS = 0
-FAIL = 0
-
-
-def check(name, cond, detail=''):
-    global PASS, FAIL
-    if cond:
-        PASS += 1
-        print(f'  ok  {name}')
-    else:
-        FAIL += 1
-        print(f'FAIL  {name}  {detail}')
+from helpers import check
 
 
 def fake_assistant(content=None, tool_calls=None, reasoning='chain-of-thought'):
@@ -91,7 +77,7 @@ def legacy_turn(i):
 
 
 def test_serialize_and_validate():
-    print('serialize_trajectory / validate_trajectory')
+    """serialize_trajectory / validate_trajectory."""
     asst = fake_assistant(tool_calls=[('web_search', '{"q":"lag"}')])
     ser = serialize_trajectory([asst, tool_msg('call_0', 'hits'), fake_assistant('done!')])
     check('keeps tool_calls + ids', ser[0]['tool_calls'][0]['id'] == 'call_0', str(ser[0]))
@@ -115,7 +101,7 @@ def test_serialize_and_validate():
 
 
 def test_make_turn_capture():
-    print('make_turn capture')
+    """make_turn capture."""
     turn = captured_turn(1)
     check('user_message stored as plain text', turn['user_message'] == '[Agora — Nyuu]\nQuestion 1')
     check('trajectory stored', len(turn['trajectory']) == 3)
@@ -148,7 +134,7 @@ def test_make_turn_capture():
 
 
 def test_stepped_floor():
-    print('stepped_floor hysteresis')
+    """stepped_floor hysteresis."""
     cases = {6: 0, 7: 3, 9: 3, 10: 6, 12: 6, 13: 9}
     for count, want in cases.items():
         got = stepped_floor(count, window=6, step=3)
@@ -162,7 +148,7 @@ def test_stepped_floor():
 
 
 def test_replay_and_cache_stability():
-    print('build_history_messages replay + cache stability')
+    """build_history_messages replay + cache stability."""
     kwargs = dict(max_turns=16, trajectory_turns=6, trajectory_step=3)
 
     turns = [captured_turn(i) for i in range(4)]
@@ -233,7 +219,7 @@ def test_replay_and_cache_stability():
 
 
 def test_verbatim_image_budget():
-    print('verbatim replay image budget + markers')
+    """verbatim replay image budget + markers."""
     real_is_ref, real_part = cs.image_store.is_image_ref, cs.image_store.image_part
     real_marker = cs.image_store.image_marker
     try:
@@ -271,7 +257,7 @@ def test_verbatim_image_budget():
 
 
 def test_apply_cache_control():
-    print('apply_cache_control')
+    """apply_cache_control."""
     msg = {'role': 'user', 'content': 'hello'}
     marked = apply_cache_control(msg)
     check('str wrapped with breakpoint', marked['content'][-1]['cache_control'] == {'type': 'ephemeral'})
@@ -296,7 +282,7 @@ def _fake_client(responses):
 
 
 async def test_run_tool_loop_capture():
-    print('run_tool_loop trajectory capture')
+    """run_tool_loop trajectory capture."""
     tc_msg = fake_assistant(tool_calls=[('web_search', '{"q":"lag"}')], reasoning='thinking...')
     client = _fake_client([
         fake_response(tc_msg, 'tool_calls'),
@@ -322,7 +308,7 @@ async def test_run_tool_loop_capture():
 
 
 async def test_run_tool_loop_retry_capture():
-    print('run_tool_loop empty-answer retry capture')
+    """run_tool_loop empty-answer retry capture."""
     tc_msg = fake_assistant(tool_calls=[('web_search', '{}')])
     client = _fake_client([
         fake_response(tc_msg, 'tool_calls'),
@@ -354,7 +340,7 @@ SEARCH_TOOL = {'type': 'function', 'function': {'name': 'search_history', 'param
 
 
 def test_extract_text_tool_calls():
-    print('extract_text_tool_calls')
+    """extract_text_tool_calls."""
     tools = [SQL_HISTORY_TOOL, SEARCH_TOOL]
     text, calls, had = extract_text_tool_calls(GLM_LEAK, tools)
     check('glm inline call parsed', calls == [('sql_history', {'sql': LEAKED_SQL})], str(calls))
@@ -389,7 +375,7 @@ def test_extract_text_tool_calls():
 
 
 async def test_run_tool_loop_recovers_text_tool_call():
-    print('run_tool_loop executes a tool call left in content')
+    """run_tool_loop executes a tool call left in content."""
     client = _fake_client([
         fake_response(fake_assistant(GLM_LEAK), 'stop'),
         fake_response(fake_assistant('Ranking pronto.'), 'stop'),
@@ -416,7 +402,7 @@ async def test_run_tool_loop_recovers_text_tool_call():
 
 
 async def test_run_tool_loop_forced_round_markup_retried():
-    print('run_tool_loop never returns tool-call markup as the answer')
+    """run_tool_loop never returns tool-call markup as the answer."""
     tc_msg = fake_assistant(tool_calls=[('sql_history', '{"sql": "SELECT 1"}')])
     client = _fake_client([
         fake_response(tc_msg, 'tool_calls'),
@@ -445,7 +431,7 @@ async def test_run_tool_loop_forced_round_markup_retried():
 
 
 async def test_store_roundtrip():
-    print('ConversationStore persistence round-trip')
+    """ConversationStore persistence round-trip."""
     tmp = tempfile.mkdtemp()
     try:
         store = ConversationStore(f'{tmp}/convs.db', kind='chat')
@@ -461,23 +447,3 @@ async def test_store_roundtrip():
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
-
-async def main():
-    test_serialize_and_validate()
-    test_make_turn_capture()
-    test_stepped_floor()
-    test_replay_and_cache_stability()
-    test_apply_cache_control()
-    await test_run_tool_loop_capture()
-    await test_run_tool_loop_retry_capture()
-    test_extract_text_tool_calls()
-    await test_run_tool_loop_recovers_text_tool_call()
-    await test_run_tool_loop_forced_round_markup_retried()
-    await test_store_roundtrip()
-    test_verbatim_image_budget()
-    print(f'\n{PASS} passed, {FAIL} failed')
-    raise SystemExit(1 if FAIL else 0)
-
-
-if __name__ == '__main__':
-    asyncio.run(main())

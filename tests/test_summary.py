@@ -386,18 +386,3 @@ def test_resumo_command_and_publish():
         asyncio.run(_flow())
     finally:
         summary.can_read = original
-
-
-if __name__ == '__main__':
-    test_parse_period()
-    test_split_segments_by_size_and_gap()
-    test_render_citations()
-    test_defuse_mentions()
-    test_collect_since_last_message()
-    test_collect_cap_and_max_days()
-    test_summarize_single_call_renders_links_and_mentions()
-    test_summarize_map_reduce()
-    test_summarize_nothing_new_skips_llm()
-    test_exec_tool_permissions_and_output()
-    test_resumo_command_and_publish()
-    print('ok')

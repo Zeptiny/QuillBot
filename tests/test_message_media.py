@@ -327,19 +327,3 @@ def test_reaction_tool_limit_and_no_target():
     slash = mm.ReactionTool(ReactChannel([]))  # /chat: no triggering message
     assert asyncio.run(slash({'emoji': '👍'})).startswith('Informe message_id')
     assert asyncio.run(mm.ReactionTool(None)({'emoji': '👍'})) == 'Não há canal atual onde reagir.'
-
-
-if __name__ == '__main__':
-    test_content_text_markers()
-    test_media_sources_order_and_lottie()
-    test_giphy_urls_and_label()
-    test_linked_media_falls_back()
-    test_context_groups_media_first_then_emoji_sheets()
-    test_reaction_summaries_names_counts_and_cache()
-    test_reaction_summaries_timeout_and_disabled()
-    test_channel_history_lines_carry_reactions()
-    test_encode_animation_sheet_and_transparency()
-    test_question_with_media()
-    test_reaction_tool_targets_and_emojis()
-    test_reaction_tool_limit_and_no_target()
-    print('ok')

@@ -5,16 +5,12 @@ the reranker, the full-scan FTS delete skipped for new rows (and only the
 chunks a batch appended being persisted), search scoring running off the
 event loop on the live matrix without copying it, and the matrix growth
 buffer keeping earlier views intact.
-
-Run: python3 test_history_perf.py
 """
 
 import asyncio
 import datetime
 import os
-import shutil
 import sqlite3
-import tempfile
 import threading
 import time
 from types import SimpleNamespace
@@ -24,22 +20,11 @@ import numpy as np
 from cogs.history_rag import HistoryRAG
 from cogs.local_inference import run_local_model
 
+from helpers import check
+
 GID = 1
 GENERAL = "100"
 DEV = "200"
-
-PASS = 0
-FAIL = 0
-
-
-def check(name, cond, detail=''):
-    global PASS, FAIL
-    if cond:
-        PASS += 1
-        print(f'  ok  {name}')
-    else:
-        FAIL += 1
-        print(f'FAIL  {name}  {detail}')
 
 
 def chunk(mid, cid, content, vec):
@@ -93,7 +78,7 @@ def fts_counts(tmpdb):
 # --- local model thread -----------------------------------------------------
 
 def test_local_model_calls_serialized():
-    print('local model calls run one at a time on one thread')
+    """local model calls run one at a time on one thread."""
     state = {'active': 0, 'peak': 0, 'threads': set()}
     guard = threading.Lock()
 
@@ -152,7 +137,7 @@ def _indexed_rag(tmpdb):
 
 
 def test_count_mentions_skips_rerank(tmpdb):
-    print('count_mentions counts without the reranker; search still reranks')
+    """count_mentions counts without the reranker; search still reranks."""
     rag = _indexed_rag(tmpdb)
     calls = []
 
@@ -171,7 +156,7 @@ def test_count_mentions_skips_rerank(tmpdb):
 
 
 def test_search_scores_live_matrix_in_thread(tmpdb):
-    print('search scores the live matrix off the event loop')
+    """search scores the live matrix off the event loop."""
     rag = _indexed_rag(tmpdb)
     live = rag._matrices[GID]
     seen = {}
@@ -202,7 +187,7 @@ def test_search_scores_live_matrix_in_thread(tmpdb):
 # --- FTS delete / persistence --------------------------------------------------
 
 def test_fts_delete_only_for_stored_rows(tmpdb):
-    print('FTS delete (full scan) only runs for rows that may already exist')
+    """FTS delete (full scan) only runs for rows that may already exist."""
     rag = fresh_rag(tmpdb)
     c, v = chunk(10, GENERAL, "mensagem nova", [1.0, 0.0])
     with TracedConnect() as tr:
@@ -233,7 +218,7 @@ def _msg(mid, content):
 
 
 def test_index_batch_persists_only_appended(tmpdb):
-    print('_index_batch persists only what it appended, without FTS deletes')
+    """_index_batch persists only what it appended, without FTS deletes."""
     rag = fresh_rag(tmpdb)
     rag._chunks[GID] = []
     rag._matrices[GID] = None
@@ -266,7 +251,7 @@ def test_index_batch_persists_only_appended(tmpdb):
 # --- matrix growth buffer ----------------------------------------------------
 
 def test_matrix_growth_buffer():
-    print('matrix grows in place and keeps earlier views intact')
+    """matrix grows in place and keeps earlier views intact."""
     rag = HistoryRAG.__new__(HistoryRAG)
     rag._chunks = {1: []}
     rag._matrices = {1: None}
@@ -301,21 +286,3 @@ def test_matrix_growth_buffer():
     check('append after delete reallocates', rag._mat_bufs[1] is not old_buf)
     check('old buffer untouched', np.array_equal(old_buf[:3], before))
     check('rows after delete + append', rag._matrices[1][0, 0] == 2.0 and rag._matrices[1][-1, 0] == 9999.0)
-
-
-if __name__ == '__main__':
-    tmp = tempfile.mkdtemp(prefix='quillbot_perf_test_')
-    try:
-        test_local_model_calls_serialized()
-        for i, test in enumerate((
-            test_count_mentions_skips_rerank,
-            test_search_scores_live_matrix_in_thread,
-            test_fts_delete_only_for_stored_rows,
-            test_index_batch_persists_only_appended,
-        )):
-            test(os.path.join(tmp, f'history{i}.db'))
-        test_matrix_growth_buffer()
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
-    print(f'\n{PASS} passed, {FAIL} failed')
-    raise SystemExit(1 if FAIL else 0)

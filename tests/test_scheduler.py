@@ -1,6 +1,5 @@
 """Regression smoke test for cron scheduling lifecycle."""
 
-import asyncio
 import os
 import tempfile
 from unittest.mock import patch
@@ -24,7 +23,7 @@ class FakeBot:
         return self.guild
 
 
-async def main():
+async def test_cron_job_fires_and_reschedules():
     with tempfile.TemporaryDirectory(prefix='quillbot_scheduler_test_') as temp_dir:
         store = SchedulerStore(os.path.join(temp_dir, 'scheduler.db'))
         store.ensure()
@@ -60,6 +59,3 @@ async def main():
         assert next_fire is not None and next_fire > _now(), updated
         assert prompted == [job['id']], prompted
 
-
-asyncio.run(main())
-print('CRON SCHEDULER TEST PASSED')

@@ -278,13 +278,3 @@ def test_mention_context_images_are_labeled():
     finally:
         cs.image_store.is_image_ref = original_is_ref
         cs.image_store.image_part = original_part
-
-
-if __name__ == '__main__':
-    test_followup_gap_preserves_images()
-    test_current_message_inlines_context_images_with_current_image_priority()
-    test_mention_context_images_are_labeled()
-    test_turn_keeps_context_images_apart()
-    test_context_images_switch_and_age_limit()
-    test_attachment_download_is_reused()
-    print('ok')
