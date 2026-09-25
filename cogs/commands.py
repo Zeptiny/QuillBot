@@ -10,7 +10,7 @@ from discord import app_commands
 from discord.ext import commands
 from openai import AsyncOpenAI, RateLimitError
 
-from cogs import image_store
+from cogs import image_store, message_media
 from cogs.conversation_store import (
     ConversationStore,
     add_participants,
@@ -947,10 +947,8 @@ class Commands(commands.Cog):
                     follow_up_question = re.sub(r'\s+', ' ', follow_up_question).strip()
                 if not follow_up_question and not message.attachments:
                     return
-                image_urls = await image_store.persist_images(
-                    att for att in message.attachments
-                    if att.content_type and att.content_type.startswith('image/')
-                )
+                image_urls = await image_store.persist_images(message_media.visual_sources(message))
+                follow_up_question = message_media.question_with_media(follow_up_question, message)
                 if not follow_up_question:
                     follow_up_question = 'Analise esta imagem.'
                 async with self.store.conversation_lock(conv['conv_id']), message.channel.typing():
@@ -1054,12 +1052,10 @@ class Commands(commands.Cog):
         clean_question = mention_pattern.sub('', message.content).strip()
         # Also strip any extra mention artifacts and whitespace
         clean_question = re.sub(r'\s+', ' ', clean_question).strip()
-        current_image_urls = await image_store.persist_images(
-            att for att in message.attachments
-            if att.content_type and att.content_type.startswith('image/')
-        )
+        clean_question = message_media.question_with_media(clean_question, message)
+        current_image_urls = await image_store.persist_images(message_media.visual_sources(message))
         ref_context = ""
-        ref_image_urls: list[discord.Attachment] = []
+        ref_image_urls: list = []
         if message.reference and message.reference.message_id:
             ref_msg = message.reference.resolved
             if ref_msg is None:
@@ -1073,21 +1069,23 @@ class Commands(commands.Cog):
             if ref_msg:
                 try:
                     ref_author = getattr(ref_msg.author, 'display_name', str(ref_msg.author))
-                    ref_content = (ref_msg.content or "").strip()
+                    ref_content = message_media.emoji_text(ref_msg.content or "").strip()
                     if len(ref_content) > 1500:
                         ref_content = ref_content[:1500] + "…"
-                    for att in getattr(ref_msg, 'attachments', []):
-                        if att.content_type and att.content_type.startswith('image/'):
-                            ref_image_urls.append(att)
+                    ref_image_urls = message_media.visual_sources(ref_msg)
+                    ref_media = message_media.visual_markers(ref_msg)
                     attach_names = [att.filename for att in getattr(ref_msg, 'attachments', []) if not (att.content_type and att.content_type.startswith('image/'))]
                     parts = [f"[Mensagem respondida — {ref_author} (@{ref_msg.author.name})]"]
                     if ref_content:
                         parts.append(f"Conteúdo: {ref_content}")
                     if attach_names:
                         parts.append(f"Anexos: {', '.join(attach_names[:5])}")
-                    if ref_msg.attachments and not ref_content and not attach_names and ref_image_urls:
-                        parts.append(f"Anexos: {len(ref_image_urls)} imagem(ns)")
-                    if not ref_content and not ref_msg.attachments and ref_msg.embeds:
+                    ref_images = message_media.image_attachments(ref_msg)
+                    if ref_images and not ref_content and not attach_names:
+                        parts.append(f"Anexos: {len(ref_images)} imagem(ns)")
+                    if ref_media:
+                        parts.append(f"Mídia: {ref_media}")
+                    if not ref_content and not ref_msg.attachments and not ref_media and ref_msg.embeds:
                         try:
                             embed = ref_msg.embeds[0]
                             embed_text = (embed.description or embed.title or "")[:500]

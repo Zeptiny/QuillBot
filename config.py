@@ -83,6 +83,12 @@ CHANNEL_CONTEXT_MESSAGES: Final[int] = int(os.getenv('CHANNEL_CONTEXT_MESSAGES',
 CHANNEL_CONTEXT_IMAGES_ENABLED: Final[bool] = os.getenv('CHANNEL_CONTEXT_IMAGES_ENABLED', 'true').strip().lower() in ('1', 'true', 'yes')
 # Only channel images posted within this many minutes are sent; 0 = no age limit.
 CHANNEL_CONTEXT_IMAGE_MAX_AGE_MINUTES: Final[int] = int(os.getenv('CHANNEL_CONTEXT_IMAGE_MAX_AGE_MINUTES', '60'))
+# Show reactions on channel-context lines (get_channel_history, the recent
+# window, follow-up gaps and get_message_context), with up to
+# REACTION_USERS_LIMIT reactor names each. Names cost one API call per reaction
+# (cached while the count is unchanged); 0 shows counts only.
+CHANNEL_CONTEXT_REACTIONS_ENABLED: Final[bool] = os.getenv('CHANNEL_CONTEXT_REACTIONS_ENABLED', 'true').strip().lower() in ('1', 'true', 'yes')
+REACTION_USERS_LIMIT: Final[int] = int(os.getenv('REACTION_USERS_LIMIT', '5'))
 
 # --- Conversations (multi-turn chat memory) ---
 CONVERSATIONS_DB_PATH: Final[str] = os.getenv('CONVERSATIONS_DB_PATH', 'data/conversations.db')

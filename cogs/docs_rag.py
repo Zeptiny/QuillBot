@@ -16,6 +16,7 @@ from discord.ext import commands, tasks
 from openai import AsyncOpenAI, RateLimitError
 
 from cogs import image_store as _image_store
+from cogs import message_media as _message_media
 from cogs.conversation_store import (
     ConversationStore as _ConversationStore,
     add_participants as _add_participants,
@@ -1572,9 +1573,9 @@ class DocsRAG(commands.Cog):
             return
 
         image_urls: list[str] = await _image_store.persist_images(
-            att for att in message.attachments
-            if att.content_type and att.content_type.startswith('image/')
+            _message_media.visual_sources(message)
         )
+        follow_up_question = _message_media.question_with_media(follow_up_question, message)
 
         if not follow_up_question:
             follow_up_question = 'Analise esta imagem.'
