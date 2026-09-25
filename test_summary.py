@@ -265,10 +265,19 @@ def test_summarize_nothing_new_skips_llm():
     assert result.empty and client.calls == []
 
 
+def _on_real_clock(msgs):
+    """Shift fixture messages so they sit the same distance from the real
+    clock as from NOW; exec_tool and /resumo count periods back from now()."""
+    shift = datetime.datetime.now(UTC) - NOW
+    for m in msgs:
+        m.created_at += shift
+    return msgs
+
+
 def test_exec_tool_permissions_and_output():
     guild = FakeGuild()
     other_guild = FakeGuild()
-    msgs = [fake_message(1, 5, 'deploy feito', minutes_ago=30)]
+    msgs = _on_real_clock([fake_message(1, 5, 'deploy feito', minutes_ago=30)])
     channel = FakeChannel(msgs, guild=guild)
     foreign = FakeChannel([], guild=other_guild)
     foreign.id = 444444444444444444
@@ -328,10 +337,10 @@ class FakeInteraction:
 
 def test_resumo_command_and_publish():
     guild = FakeGuild()
-    msgs = [
+    msgs = _on_real_clock([
         fake_message(1, 5, 'build nova no ar', minutes_ago=30),
         fake_message(2, 6, 'ok, <@7> testa aí', minutes_ago=20, mentions=(7,)),
-    ]
+    ])
     channel = FakeChannel(msgs, guild=guild)
     stored = []
 
