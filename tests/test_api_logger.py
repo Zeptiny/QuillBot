@@ -1,22 +1,29 @@
-"""Smoke test for api_logger: both transports, redaction, body capture, error path."""
+"""api_logger: both transports, redaction, body capture, error path, inbound hook.
+
+install() patches aiohttp and httpx for the whole process and config reads the
+log settings at import, so the scenario runs in its own interpreter: pytest
+collects test_api_logger(), which re-runs this file as a script.
+"""
 
 import asyncio
 import json
 import os
-import tempfile
+import subprocess
+import sys
 
-tmp = tempfile.mkdtemp()
-os.environ['API_REQUEST_LOG_PATH'] = os.path.join(tmp, 'api.log')
-os.environ['API_REQUEST_LOG_BODY'] = 'all'
-os.environ['API_REQUEST_LOG_ENABLED'] = 'true'
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-import aiohttp
-import httpx
-from aiohttp import web
 
-import api_logger
-
-api_logger.install()
+def test_api_logger(tmp_path):
+    env = dict(
+        os.environ,
+        API_REQUEST_LOG_PATH=str(tmp_path / 'api.log'),
+        API_REQUEST_LOG_BODY='all',
+        API_REQUEST_LOG_ENABLED='true',
+        PYTHONPATH=os.pathsep.join(filter(None, [ROOT, os.environ.get('PYTHONPATH')])),
+    )
+    proc = subprocess.run([sys.executable, __file__], env=env, cwd=tmp_path, capture_output=True, text=True, timeout=120)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
 
 
 async def handler(request):
@@ -94,7 +101,14 @@ async def main():
     assert len(inbound) == 1 and inbound[0]['command'] == 'ask' and inbound[0]['user_id'] == 123
     assert inbound[0]['interaction_type'] == 'application_command'
     assert inbound[0]['guild_id'] == 456 and inbound[0]['channel_id'] == 789
-    print('ALL_ASSERTS_PASSED')
 
 
-asyncio.run(main())
+if __name__ == '__main__':
+    import aiohttp
+    import httpx
+    from aiohttp import web
+
+    import api_logger
+
+    api_logger.install()
+    asyncio.run(main())

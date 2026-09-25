@@ -4,11 +4,8 @@ Exercises: input validation (single SELECT, guild scoping, no writes/PRAGMA),
 the sandbox (embedding column denied, query_only, timeout abort), REGEXP,
 rendering/truncation, and exec_history_tool wiring. All against a throwaway
 SQLite DB. No Discord or LLM calls.
-
-Run: python3 test_history_sql.py
 """
 
-import asyncio
 import os
 import shutil
 import sqlite3
@@ -18,25 +15,14 @@ import numpy as np
 
 from cogs.history_rag import HistoryRAG
 
+from helpers import check
+
 GID = 777
 GID2 = 888
 GENERAL = "100"
 DEV = "200"
 ALICE_ID = "111"
 BOB_ID = "222"
-
-PASS = 0
-FAIL = 0
-
-
-def check(name, cond, extra=""):
-    global PASS, FAIL
-    if cond:
-        PASS += 1
-        print(f"  PASS  {name}")
-    else:
-        FAIL += 1
-        print(f"  FAIL  {name} {extra}")
 
 
 def chunk(mid, gid, cid, cname, aid, aname, afull, content, ts, reply_to=None):
@@ -85,7 +71,7 @@ def rejects(rag, sql, guild=GID, label=""):
         return False
 
 
-async def main():
+async def test_sql_history_tool():
     tmp = tempfile.mkdtemp(prefix="quillbot_sql_test_")
     tmpdb = os.path.join(tmp, "history.db")
     try:
@@ -99,7 +85,7 @@ async def main():
         rag._upsert_chunks_to_db(GID2, other)
         rag._upsert_authors(GID2, other)
 
-        print("== validation: single read-only SELECT scoped to the guild ==")
+        # --- validation: single read-only SELECT scoped to the guild
         check("empty rejected", rejects(rag, "", label="vazio"))
         check("plain select ok", not rejects(rag, f"SELECT COUNT(*) FROM chunks WHERE guild_id={GID}"))
         check("missing guild id rejected", rejects(rag, "SELECT COUNT(*) FROM chunks"))
@@ -116,7 +102,7 @@ async def main():
         check("cte ok", not rejects(rag, f"WITH t AS (SELECT 1 x) SELECT * FROM t WHERE guild_id={GID} OR x=1"))
         check("overlong query rejected", rejects(rag, f"SELECT 1 WHERE guild_id={GID} AND content LIKE '%{'a' * 5000}%'"))
 
-        print("== write shapes that pass the SELECT regex (authorizer must deny) ==")
+        # --- write shapes that pass the SELECT regex (authorizer must deny)
         for label, sql in [
             ("with-insert", f"WITH t AS (SELECT 1 x) INSERT INTO authors (guild_id, author_id) SELECT {GID}, 'evil' FROM t"),
             ("with-delete", f"WITH t AS (SELECT 1 x) DELETE FROM chunks WHERE guild_id={GID}"),
@@ -133,12 +119,12 @@ async def main():
         con.close()
         check("no data mutated", all(a != "evil" for (a,) in rows), str(rows))
 
-        print("== guild isolation ==")
+        # --- guild isolation
         out = rag._exec_sql_sync(GID, f"SELECT msg_id, content FROM chunks WHERE guild_id={GID}", 5.0, 50)
         check("only current guild rows", "secret other guild" not in out and "server lag" in out, out)
         check("guild-less query rejected", rejects(rag, "SELECT COUNT(*) FROM chunks"))
 
-        print("== aggregations, FTS, mentions, replies ==")
+        # --- aggregations, FTS, mentions, replies
         out = rag._exec_sql_sync(GID, f"SELECT author_full, COUNT(*) n FROM chunks WHERE guild_id={GID} GROUP BY author_full ORDER BY n DESC", 5.0, 50)
         check("group by author", "Alice (@alice) | 3" in out and "Bob (@bob) | 2" in out, out)
         out = rag._exec_sql_sync(GID, f"SELECT c.msg_id FROM chunks c JOIN chunks_fts f ON f.msg_id=c.msg_id WHERE f.guild_id={GID} AND chunks_fts MATCH 'lag' ORDER BY c.msg_id", 5.0, 50)
@@ -161,7 +147,7 @@ async def main():
         out = rag._exec_sql_sync(GID, f"SELECT substr(ts,1,7) m, COUNT(*) FROM chunks WHERE guild_id={GID} GROUP BY m ORDER BY m", 5.0, 50)
         check("monthly buckets", "2025-06" in out and "2025-07" in out, out)
 
-        print("== regexp function ==")
+        # --- regexp function
         out = rag._exec_sql_sync(GID, f"SELECT COUNT(*) FROM chunks WHERE guild_id={GID} AND REGEXP('spike|terrible', content)", 5.0, 50)
         check("regexp or-pattern", "2" in out, out)
         out = rag._exec_sql_sync(GID, f"SELECT COUNT(*) FROM chunks WHERE guild_id={GID} AND REGEXP('LAG', content)", 5.0, 50)
@@ -172,7 +158,7 @@ async def main():
         except ValueError as e:
             check("bad regex errors", "REGEXP" in str(e))
 
-        print("== sandbox ==")
+        # --- sandbox
         try:
             rag._exec_sql_sync(GID, f"SELECT embedding FROM chunks WHERE guild_id={GID} LIMIT 1", 5.0, 50)
             check("embedding read denied", False)
@@ -191,7 +177,7 @@ async def main():
         except Exception as e:
             check("timeout aborts runaway query", False, f"unexpected {type(e).__name__}: {e}")
 
-        print("== rendering and truncation ==")
+        # --- rendering and truncation
         out = rag._exec_sql_sync(GID, f"SELECT COUNT(*) n FROM chunks WHERE guild_id={GID}", 5.0, 50)
         check("header row present", out.split("\n")[0] == "n", out)
         check("count value rendered", out.split("\n")[1] == "5", out)
@@ -207,7 +193,7 @@ async def main():
         out = rag._exec_sql_sync(GID, f"SELECT NULL n FROM chunks WHERE guild_id={GID} LIMIT 1", 5.0, 50)
         check("null rendered", "NULL" in out, out)
 
-        print("== read-only coexists with the writer (WAL) ==")
+        # --- read-only coexists with the writer (WAL)
         wcon = sqlite3.connect(tmpdb)
         try:
             out = rag._exec_sql_sync(GID, f"SELECT COUNT(*) FROM chunks WHERE guild_id={GID}", 5.0, 50)
@@ -215,7 +201,7 @@ async def main():
         finally:
             wcon.close()
 
-        print("== tool wiring (exec_history_tool) ==")
+        # --- tool wiring (exec_history_tool)
         import cogs.utils as utils_mod
         from cogs import utils as U
         class _FakeBot:
@@ -247,10 +233,3 @@ async def main():
         check("tool definition present", U.SQL_HISTORY_TOOL["function"]["name"] == "sql_history")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
-
-    print(f"\n{PASS} passed, {FAIL} failed")
-    raise SystemExit(1 if FAIL else 0)
-
-
-if __name__ == "__main__":
-    asyncio.run(main())

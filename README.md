@@ -18,6 +18,7 @@ Built with [discord.py](https://discordpy.readthedocs.io/) + RAG (Retrieval-Augm
 - [Configuration](#configuration)
 - [Running the Bot](#running-the-bot)
 - [Docker](#docker)
+- [Tests](#tests)
 
 ---
 
@@ -294,6 +295,7 @@ QuillBot/
 │   └── utils.py          # Shared: truncate_safe, split_response, PaginatedEmbedView, context builders, run_tool_loop
 ├── responses/
 │   └── errors.py         # 25 compiled Minecraft error regex patterns + pt-BR responses
+├── tests/                # pytest suite, one file per module/feature (see Tests)
 └── data/
     ├── vectors.json/.npy # Docs RAG vector store
     ├── memory.db          # Persistent memory (memories + history)
@@ -506,6 +508,38 @@ docker compose up --build -d
 ```
 
 - Uses `python:3.11-slim`, persists `data/` via volume mount, reads config from `.env`.
+
+---
+
+## Tests
+
+The suite lives in `tests/` and runs with pytest. It needs no Discord token, network or models: Discord objects, the LLM client and embeddings are faked, and SQLite databases go in temporary directories.
+
+```bash
+pip install -r requirements-dev.txt
+pytest                         # whole suite
+pytest tests/test_summary.py   # one file
+pytest -k reindex              # tests whose name matches
+```
+
+| File | Covers |
+|---|---|
+| `test_api_logger.py` | Request logging for aiohttp/httpx, redaction, body capture, inbound interactions (runs in its own process) |
+| `test_channel_context_images.py` | Images from automatically fetched channel context |
+| `test_conversation_participants.py` | Participant scope for shared conversations and memory writes |
+| `test_docs_rag.py` | Docs `/reindex`: partial and full reindex, failed sources kept |
+| `test_history_backfill.py` | History backfill watermarks and the duplicate-append guard |
+| `test_history_perf.py` | History search/indexing performance fixes (threading, FTS deletes, matrix buffer) |
+| `test_history_search.py` | FTS search, filters, dedupe, authors table, message context, `find_user` |
+| `test_history_sql.py` | The read-only `sql_history` tool and its sandbox |
+| `test_mentions.py` | Which mentions in a reply become real pings |
+| `test_message_media.py` | Stickers, GIFs, custom emojis, reactions and the `add_reaction` tool |
+| `test_scheduler.py` | Cron job firing and rescheduling |
+| `test_summary.py` | `/resumo`: period parsing, fetching, map-reduce, permissions |
+| `test_tool_loop.py` | Tool errors reported to the model instead of aborting the turn |
+| `test_trajectory_replay.py` | Trajectory capture, verbatim replay, text tool-call recovery |
+
+`tests/conftest.py` puts the repo root on the import path, runs `async def` tests without a plugin, and provides a `tmpdb` fixture. `tests/helpers.py` has `check(label, condition, detail)`, a labelled assert. New tests go in the file for the module they cover, or a new `test_<module>.py`.
 
 ---
 

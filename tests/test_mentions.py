@@ -1,5 +1,7 @@
-"""Quick smoke test for extract_pingable_mentions."""
+"""extract_pingable_mentions: which @names and <@ids> in a reply become real pings."""
 from types import SimpleNamespace as NS
+
+import pytest
 
 from cogs.utils import extract_pingable_mentions
 
@@ -25,7 +27,7 @@ joao = NS(id=333333333333333333, bot=False, name='joao', display_name='João', d
 other_bot = NS(id=444444444444444444, bot=True, name='otherbot', display_name='OtherBot', discriminator='0001')
 g = FakeGuild([nyuu, john, joao, other_bot])
 
-tests = [
+CASES = [
     ('Olá <@111111111111111111>! Hora de dormir.', g, '<@111111111111111111>'),
     ('Ei @nyuu, vai dormir!', g, '<@111111111111111111>'),
     ('Ei @John Doe, vai dormir!', g, '<@222222222222222222>'),
@@ -39,13 +41,12 @@ tests = [
     ('@nyuu', None, ''),
 ]
 
-for i, (text, guild, expected) in enumerate(tests, 1):
-    r = extract_pingable_mentions(text, guild)
-    assert r == expected, f'test {i}: got {r!r}, want {expected!r} — text: {text!r}'
-    label = r if r else '(empty)'
-    print(f'{i}. OK: {text[:45]!r} -> {label}')
 
-r = extract_pingable_mentions('@nyuu @joao @John Doe', g, limit=2)
-assert r == '<@111111111111111111> <@333333333333333333>', r
-print('11. OK: limit=2 ->', r)
-print('ALL MENTION TESTS PASSED')
+@pytest.mark.parametrize('text, guild, expected', CASES)
+def test_extract_pingable_mentions(text, guild, expected):
+    assert extract_pingable_mentions(text, guild) == expected
+
+
+def test_limit():
+    r = extract_pingable_mentions('@nyuu @joao @John Doe', g, limit=2)
+    assert r == '<@111111111111111111> <@333333333333333333>'

@@ -1,7 +1,4 @@
-"""Smoke tests for participant scope in shared conversations.
-
-Run: python test_conversation_participants.py
-"""
+"""Participant scope in shared conversations (who a memory write may be about)."""
 
 import asyncio
 from types import SimpleNamespace
@@ -12,26 +9,14 @@ from cogs.conversation_store import (
 )
 from cogs.memory import Memory
 
-
-PASS = 0
-FAIL = 0
-
-
-def check(name, condition, detail=''):
-    global PASS, FAIL
-    if condition:
-        PASS += 1
-        print(f'  ok  {name}')
-    else:
-        FAIL += 1
-        print(f'FAIL  {name} {detail}')
+from helpers import check
 
 
 def user(uid, name, *, bot=False):
     return SimpleNamespace(id=uid, name=name, display_name=name.title(), bot=bot)
 
 
-async def main():
+async def test_participant_scope():
     alice = user(100, 'alice')
     bob = user(200, 'bob')
     carol = user(300, 'carol')
@@ -96,10 +81,3 @@ async def main():
     finally:
         asyncio.to_thread = real_to_thread
     check('memory-id mutations respect participant scope', entry is None and error == memory._PRIVACY_MSG, error)
-
-    print(f'\n{PASS} passed, {FAIL} failed')
-    return 1 if FAIL else 0
-
-
-if __name__ == '__main__':
-    raise SystemExit(asyncio.run(main()))

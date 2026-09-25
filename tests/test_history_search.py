@@ -3,11 +3,8 @@
 Exercises: phrase-aware FTS, SQL-pushed filters, dedupe, authors table
 (rename-proof resolution + find_user + migration), and indexed message
 context — all against a throwaway SQLite DB. No Discord or LLM calls.
-
-Run: python3 test_history_search.py
 """
 
-import asyncio
 import os
 import shutil
 import sqlite3
@@ -22,24 +19,13 @@ from cogs.history_rag import (
     _sanitize_fts_query,
 )
 
+from helpers import check
+
 GID = 1
 GENERAL = "100"
 DEV = "200"
 ALICE_ID = "111"
 BOB_ID = "222"
-
-PASS = 0
-FAIL = 0
-
-
-def check(name, cond, extra=""):
-    global PASS, FAIL
-    if cond:
-        PASS += 1
-        print(f"  PASS  {name}")
-    else:
-        FAIL += 1
-        print(f"  FAIL  {name} {extra}")
 
 
 def chunk(mid, cid, cname, aid, aname, afull, content, ts, chunk_text=None):
@@ -87,7 +73,7 @@ def fresh_rag(tmpdb):
     return rag
 
 
-async def main():
+async def test_history_search():
     tmp = tempfile.mkdtemp(prefix="quillbot_hist_test_")
     tmpdb = os.path.join(tmp, "history.db")
     try:
@@ -96,7 +82,7 @@ async def main():
         rag._upsert_chunks_to_db(GID, chunks)
         rag._upsert_authors(GID, chunks)
 
-        print("== phrase-aware query extraction ==")
+        # --- phrase-aware query extraction
         check("phrases kept verbatim", _extract_query_terms('o "paper lag" aconteceu') == ["paper lag", "aconteceu"])
         check("loose words filtered", _extract_query_terms("we fixed the lag") == ["fixed", "the", "lag"])
         fts_q = _sanitize_fts_query('"paper lag" spike')
@@ -107,7 +93,7 @@ async def main():
             and _keyword_score('"paper lag"', {"chunk_text": "paper config lag", "content": ""}) == 0.0,
         )
 
-        print("== FTS with SQL-pushed filters ==")
+        # --- FTS with SQL-pushed filters
         rows = rag._fts_search_rows('"paper lag"', GID, 100)
         check("phrase matches only adjacent tokens", [r[0]["msg_id"] for r in rows] == ["1", "2"], str(rows))
         rows = rag._fts_search_rows("lag", GID, 100)
@@ -124,19 +110,19 @@ async def main():
         rows = rag._fts_search_rows("lag", GID, 100, author_ids={ALICE_ID, BOB_ID})
         check("multi-author IN expansion", {r[0]["msg_id"] for r in rows} == {"1", "2", "6"}, str(rows))
 
-        print("== keyword search end-to-end (guild NOT loaded in memory) ==")
+        # --- keyword search end-to-end (guild NOT loaded in memory)
         res = await rag.search("lag", GID, limit=5, search_mode="keyword", dedupe=False)
         check("db-only keyword search works", len(res) == 3 and GID not in rag._chunks, str([(r["msg_id"], r["_score"]) for r in res]))
         check("result rows carry rendering fields", all("chunk_text" in r and "jump_url" in r and "author_full" in r for r in res))
 
-        print("== dedupe of overlapping windows ==")
+        # --- dedupe of overlapping windows
         res = await rag.search("lag", GID, limit=5, search_mode="keyword", dedupe=True)
         ids = [r["msg_id"] for r in res]
         check("adjacent general msgs collapse to one", ids == ["1", "6"], str(ids))
         raw = await rag.search("lag", GID, limit=5, search_mode="keyword", dedupe=False)
         check("dedupe=False keeps all", {r["msg_id"] for r in raw} == {"1", "2", "6"}, str([r["msg_id"] for r in raw]))
 
-        print("== authors table: rename-proof resolution ==")
+        # --- authors table: rename-proof resolution
         ids = await rag._resolve_author(GID, None, "alice smith")
         check("resolve by current name", ids == [ALICE_ID], str(ids))
         ids = await rag._resolve_author(GID, None, "alice")
@@ -146,7 +132,7 @@ async def main():
         ids = await rag._resolve_author(GID, None, "nobody")
         check("unknown name → empty", ids == [], str(ids))
 
-        print("== find_user ==")
+        # --- find_user
         users = rag._find_users_db(GID, "alice", 5)
         check("find_user by partial name", len(users) == 1 and users[0]["author_id"] == ALICE_ID, str(users))
         check("find_user has stats + top channels", users[0]["msg_count"] == 5 and users[0]["top_channels"][0][0] == "general", str(users))
@@ -157,7 +143,7 @@ async def main():
         users = rag._find_users_db(GID, "zed", 5)
         check("find_user no match → empty", users == [], str(users))
 
-        print("== migration: rebuild authors from legacy chunks ==")
+        # --- migration: rebuild authors from legacy chunks
         con = sqlite3.connect(tmpdb)
         con.execute("DELETE FROM authors")
         con.commit()
@@ -167,7 +153,7 @@ async def main():
         users = rag._find_users_db(GID, "alice", 5)
         check("aliases survive rebuild", users and "Alice" in users[0]["aliases"] and "Alice Smith" in users[0]["aliases"], str(users))
 
-        print("== indexed message context ==")
+        # --- indexed message context
         text = await rag.get_message_context_from_index(GID, GENERAL, "2", window=2)
         check("context built from index", text is not None and "▶ " in text and "msg_id=2" in text, text or "")
         lines = text.splitlines()
@@ -178,7 +164,7 @@ async def main():
         text = await rag.get_message_context_from_index(GID, DEV, "5", window=5)
         check("edge window at channel start", text is not None and "msg_id=5" in text, text or "")
 
-        print("== ingest keeps authors in sync ==")
+        # --- ingest keeps authors in sync
         new = [chunk(8, GENERAL, "general", ALICE_ID, "Alice Prime", "Alice Prime (@alice)", "new name again", "2025-08-01T10:00:00+00:00")]
         rag._upsert_chunks_to_db(GID, new)
         rag._upsert_authors(GID, new)
@@ -189,7 +175,7 @@ async def main():
         users = rag._find_users_db(GID, "alice", 5)
         check("delete decrements", users[0]["msg_count"] == 5, str(users[0]["msg_count"]))
 
-        print("== re-index is idempotent (no msg_count inflation) ==")
+        # --- re-index is idempotent (no msg_count inflation)
         existing = rag._existing_msg_ids(GID, ["1", "2", "8"])
         check("existing msg probe", existing == {"1", "2", "8"}, str(existing))
         batch = chunks[:2]
@@ -202,7 +188,7 @@ async def main():
         con.close()
         check("fts no duplicate rows on re-upsert", all(c == 1 for _, c in fts_rows), str(fts_rows))
 
-        print("== dedupe boundary behavior ==")
+        # --- dedupe boundary behavior
         def _res(mid, cid, ts):
             return {"msg_id": str(mid), "channel_id": cid, "ts": ts}
         base = "2025-06-01T10:00:00+00:00"
@@ -225,14 +211,13 @@ async def main():
         finally:
             hr_mod.HISTORY_DEDUPE_WINDOW_MINUTES = old_win
 
-        print("== keyword fallback from memory (FTS empty) ==")
+        # --- keyword fallback from memory (FTS empty)
         rag._chunks[GID] = build_chunks()
         orig_fts_rows = rag._fts_search_rows
         rag._fts_search_rows = lambda *a, **k: []  # type: ignore[method-assign]
         try:
             res = await rag.search("lag", GID, limit=5, search_mode="keyword", author_id=ALICE_ID, dedupe=False)
             check("fallback filters by author", {r["msg_id"] for r in res} == {"1", "2"}, str([r["msg_id"] for r in res]))
-            import datetime as _dt2
             res = await rag.search("lag", GID, limit=5, search_mode="keyword", channel_id=DEV, dedupe=False)
             check("fallback filters by channel", [r["msg_id"] for r in res] == ["6"], str([r["msg_id"] for r in res]))
             res = await rag.search("lag", GID, limit=5, search_mode="keyword", before="2025-06-02", dedupe=False)
@@ -241,7 +226,7 @@ async def main():
             rag._fts_search_rows = orig_fts_rows  # type: ignore[method-assign]
         rag._chunks.pop(GID, None)
 
-        print("== resolve fallback when authors table empty for guild ==")
+        # --- resolve fallback when authors table empty for guild
         con = sqlite3.connect(tmpdb)
         con.execute("DELETE FROM authors WHERE guild_id=?", (GID,))
         con.commit()
@@ -251,7 +236,7 @@ async def main():
         check("memory fallback on empty authors", ids == [ALICE_ID], str(ids))
         rag._chunks.pop(GID, None)
 
-        print("== per-guild migration (one guild must not block another) ==")
+        # --- per-guild migration (one guild must not block another)
         GID2 = 2
         bob2 = chunk(50, "300", "other", BOB_ID, "Bob", "Bob (@bob)", "other guild lag talk", "2025-05-01T10:00:00+00:00")
         bob2["guild_id"] = str(GID2)
@@ -277,12 +262,12 @@ async def main():
         users = rag._find_users_db(GID2, "bob", 5)
         check("rebuild picks newest name", users and users[0]["display_name"] == "Bob Renamed", str(users))
 
-        print("== LIKE metacharacters escaped ==")
+        # --- LIKE metacharacters escaped
         check("percent literal", rag._find_users_db(GID, "%", 5) == [])
         check("underscore literal", rag._find_users_db(GID, "Ali_e", 5) == [])
         check("backslash literal", rag._find_users_db(GID, "\\", 5) == [])
 
-        print("== purge clears authors when last chunk deleted ==")
+        # --- purge clears authors when last chunk deleted
         class _FA:
             id = BOB_ID
         class _FM:
@@ -300,7 +285,7 @@ async def main():
         con.close()
         check("authors purged with guild", users == [] and nchunks == 0, f"users={users} chunks={nchunks}")
 
-        print("== tool wiring (exec_history_tool) ==")
+        # --- tool wiring (exec_history_tool)
         import cogs.utils as utils_mod
         class _FakeBot:
             def __init__(self, cog): self._cog = cog
@@ -329,10 +314,3 @@ async def main():
             utils_mod.fetch_message_context = orig_fetch  # type: ignore[assignment]
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
-
-    print(f"\n{PASS} passed, {FAIL} failed")
-    raise SystemExit(1 if FAIL else 0)
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
