@@ -253,6 +253,35 @@ def conversation_participant_ids(data: dict | None, incoming: list[dict] | None 
     return ids
 
 
+async def find_recent_conversation(
+    store: Any,
+    channel: Any,
+    bot_user_id: int | str,
+    *,
+    before: Any,
+    limit: int,
+) -> tuple[int, dict] | None:
+    """Newest conversation of *store* with a bot message among the last *limit* channel messages.
+
+    Lets an @mention pick up the conversation the bot is already having in the
+    channel, as if the user had replied to the bot's latest message. Returns
+    ``(bot_message_id, conversation)`` or ``None`` (no window, no bot message
+    in it, or none of them belongs to a live conversation).
+    """
+    if limit <= 0 or channel is None or not hasattr(channel, 'history'):
+        return None
+    try:
+        async for msg in channel.history(limit=limit, before=before):
+            if str(getattr(msg.author, 'id', '')) != str(bot_user_id):
+                continue
+            conv = await store.get_by_handle(msg.id)
+            if conv:
+                return msg.id, conv
+    except Exception:
+        logger.debug('[conversation] could not scan channel for a recent conversation', exc_info=True)
+    return None
+
+
 def make_turn(
     question: str,
     answer: str,

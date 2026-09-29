@@ -21,6 +21,7 @@ from cogs.conversation_store import (
     build_history_messages,
     cap_turns,
     conversation_participant_ids,
+    find_recent_conversation,
     make_turn,
     message_participant_infos,
     select_image_refs,
@@ -56,6 +57,7 @@ from cogs.utils import (
 )
 from config import (
     CHANNEL_CONTEXT_MESSAGES,
+    CHAT_MENTION_CONTINUE_ENABLED,
     CHAT_MENTION_ENABLED,
     CHAT_MODEL,
     CONVERSATIONS_DB_PATH,
@@ -933,6 +935,105 @@ class Commands(commands.Cog):
         else:
             raise error
 
+    async def _continue_conversation(
+        self,
+        message: discord.Message,
+        handle_id: int,
+        conv: dict,
+        *,
+        reply_to: int | None,
+    ) -> None:
+        """Answer *message* as the next turn of the conversation behind *handle_id*.
+
+        ``reply_to`` is the bot message the user actually replied to; ``None``
+        when an @mention picked up a recent conversation without a reply.
+        """
+        user_id = message.author.id
+        if user_id in self._followup_cd:
+            try:
+                await message.reply('⏳ Aguarde antes de enviar outra resposta.', delete_after=5)
+            except discord.HTTPException:
+                pass
+            return
+        self._followup_cd[user_id] = True
+        follow_up_question = message.content.strip()
+        if self.bot.user:
+            follow_up_question = re.sub(rf'<@!?{self.bot.user.id}>', '', follow_up_question)
+            follow_up_question = re.sub(r'\s+', ' ', follow_up_question).strip()
+        if not follow_up_question and not message.attachments:
+            return
+        image_urls = await image_store.persist_images(message_media.visual_sources(message))
+        follow_up_question = message_media.question_with_media(follow_up_question, message)
+        if not follow_up_question:
+            follow_up_question = 'Analise esta imagem.'
+        async with self.store.conversation_lock(conv['conv_id']), message.channel.typing():
+            try:
+                fresh = await self.store.get_by_handle(handle_id)
+                if fresh:
+                    conv = fresh
+                history = conv['data'].get('turns', []).copy()
+                participant_infos = await message_participant_infos(message)
+                participant_ids = conversation_participant_ids(
+                    conv['data'], participant_infos,
+                )
+                prior_context_result = await fetch_turn_gap(message, history)
+                prior_context = prior_context_result.lines
+                prior_context_images = prior_context_result.images
+                answer, embeds, sources, capture = await self._run_chat(
+                    follow_up_question,
+                    history=history,
+                    image_urls=image_urls if image_urls else None,
+                    user=message.author,
+                    guild=message.guild,
+                    channel=message.channel,
+                    created_at=message.created_at,
+                    reply_to=str(reply_to) if reply_to else None,
+                    participant_ids=participant_ids,
+                    origin=message.jump_url,
+                    context_message=message,
+                    prior_context=prior_context,
+                    context_image_urls=prior_context_images,
+                )
+                if len(embeds) == 1:
+                    reply = await message.reply(
+                        **ping_send_kwargs(answer, message.guild), embed=embeds[0]
+                    )
+                else:
+                    reply = await message.reply(
+                        **ping_send_kwargs(answer, message.guild),
+                        embed=embeds[0], view=PaginatedEmbedView(embeds),
+                    )
+                turn = make_turn(
+                    follow_up_question, answer,
+                    author=author_info(message.author),
+                    ts=message.created_at.timestamp(),
+                    message_id=message.id,
+                    channel_id=message.channel.id,
+                    channel_name=getattr(message.channel, 'name', None),
+                    images=capture.get('image_urls', image_urls),
+                    sources=sources,
+                    reply_to=reply_to,
+                    prior_context=prior_context,
+                    user_message=capture.get('user_message'),
+                    trajectory=capture.get('trajectory'),
+                    context_images=capture.get('context_image_urls'),
+                )
+                data = conv['data']
+                data['turns'] = cap_turns(history + [turn], CONVERSATIONS_MAX_TURNS)
+                add_participants(data.setdefault('participants', []), participant_infos)
+                await self.store.update(
+                    conv['conv_id'], data, new_handle_msg_id=reply.id,
+                )
+            except RateLimitError:
+                await message.reply(
+                    '⏳ Limite de requisições atingido. Tente novamente em alguns minutos.'
+                )
+            except Exception:
+                logger.exception("Error in /chat follow-up reply")
+                await message.reply(
+                    'Ocorreu um erro ao processar sua pergunta. Tente novamente.'
+                )
+
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
         """Handle reply-based follow-up conversations and @mention chat mode."""
@@ -943,91 +1044,7 @@ class Commands(commands.Cog):
             ref_id = message.reference.message_id
             conv = await self.store.get_by_handle(ref_id)
             if conv:
-                user_id = message.author.id
-                if user_id in self._followup_cd:
-                    try:
-                        await message.reply('⏳ Aguarde antes de enviar outra resposta.', delete_after=5)
-                    except discord.HTTPException:
-                        pass
-                    return
-                self._followup_cd[user_id] = True
-                follow_up_question = message.content.strip()
-                if self.bot.user:
-                    follow_up_question = re.sub(rf'<@!?{self.bot.user.id}>', '', follow_up_question)
-                    follow_up_question = re.sub(r'\s+', ' ', follow_up_question).strip()
-                if not follow_up_question and not message.attachments:
-                    return
-                image_urls = await image_store.persist_images(message_media.visual_sources(message))
-                follow_up_question = message_media.question_with_media(follow_up_question, message)
-                if not follow_up_question:
-                    follow_up_question = 'Analise esta imagem.'
-                async with self.store.conversation_lock(conv['conv_id']), message.channel.typing():
-                    try:
-                        fresh = await self.store.get_by_handle(ref_id)
-                        if fresh:
-                            conv = fresh
-                        history = conv['data'].get('turns', []).copy()
-                        participant_infos = await message_participant_infos(message)
-                        participant_ids = conversation_participant_ids(
-                            conv['data'], participant_infos,
-                        )
-                        prior_context_result = await fetch_turn_gap(message, history)
-                        prior_context = prior_context_result.lines
-                        prior_context_images = prior_context_result.images
-                        answer, embeds, sources, capture = await self._run_chat(
-                            follow_up_question,
-                            history=history,
-                            image_urls=image_urls if image_urls else None,
-                            user=message.author,
-                            guild=message.guild,
-                            channel=message.channel,
-                            created_at=message.created_at,
-                            reply_to=str(ref_id),
-                            participant_ids=participant_ids,
-                            origin=message.jump_url,
-                            context_message=message,
-                            prior_context=prior_context,
-                            context_image_urls=prior_context_images,
-                        )
-                        if len(embeds) == 1:
-                            reply = await message.reply(
-                                **ping_send_kwargs(answer, message.guild), embed=embeds[0]
-                            )
-                        else:
-                            reply = await message.reply(
-                                **ping_send_kwargs(answer, message.guild),
-                                embed=embeds[0], view=PaginatedEmbedView(embeds),
-                            )
-                        turn = make_turn(
-                            follow_up_question, answer,
-                            author=author_info(message.author),
-                            ts=message.created_at.timestamp(),
-                            message_id=message.id,
-                            channel_id=message.channel.id,
-                            channel_name=getattr(message.channel, 'name', None),
-                            images=capture.get('image_urls', image_urls),
-                            sources=sources,
-                            reply_to=ref_id,
-                            prior_context=prior_context,
-                            user_message=capture.get('user_message'),
-                            trajectory=capture.get('trajectory'),
-                            context_images=capture.get('context_image_urls'),
-                        )
-                        data = conv['data']
-                        data['turns'] = cap_turns(history + [turn], CONVERSATIONS_MAX_TURNS)
-                        add_participants(data.setdefault('participants', []), participant_infos)
-                        await self.store.update(
-                            conv['conv_id'], data, new_handle_msg_id=reply.id,
-                        )
-                    except RateLimitError:
-                        await message.reply(
-                            '⏳ Limite de requisições atingido. Tente novamente em alguns minutos.'
-                        )
-                    except Exception:
-                        logger.exception("Error in /chat follow-up reply")
-                        await message.reply(
-                            'Ocorreu um erro ao processar sua pergunta. Tente novamente.'
-                        )
+                await self._continue_conversation(message, ref_id, conv, reply_to=ref_id)
                 return
         # --- 2) @mention chat mode (same as /chat) ---
         if not CHAT_MENTION_ENABLED:
@@ -1049,6 +1066,19 @@ class Commands(commands.Cog):
             except discord.HTTPException:
                 pass
             return
+        # A mention right after the bot talked continues that conversation, as
+        # if the user had replied to the bot's latest message in the window.
+        if CHAT_MENTION_CONTINUE_ENABLED and not message.reference:
+            typed = re.sub(rf'<@!?{self.bot.user.id}>', '', message.content).strip()
+            if typed or message.attachments:
+                recent = await find_recent_conversation(
+                    self.store, message.channel, self.bot.user.id,
+                    before=message, limit=CHANNEL_CONTEXT_MESSAGES,
+                )
+                if recent:
+                    handle_id, conv = recent
+                    await self._continue_conversation(message, handle_id, conv, reply_to=None)
+                    return
         # Per-user cooldown for mentions (reuse followup cooldown)
         user_id = message.author.id
         if user_id in self._followup_cd:
