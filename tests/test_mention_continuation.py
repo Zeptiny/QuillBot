@@ -86,9 +86,11 @@ def make_cog(store, monkeypatch):
     cog.client = object()
     cog._followup_cd = {}
     cog.continued = []
+    cog.ref_contexts = []
 
-    async def fake_continue(message, handle_id, conv, *, reply_to):
+    async def fake_continue(message, handle_id, conv, *, reply_to, ref_context='', ref_image_urls=None):
         cog.continued.append((message.id, handle_id, conv['conv_id'], reply_to))
+        cog.ref_contexts.append(ref_context)
     cog._continue_conversation = fake_continue
     monkeypatch.setattr(commands_mod, 'CHAT_MENTION_ENABLED', True)
     monkeypatch.setattr(commands_mod, 'CHANNEL_CONTEXT_MESSAGES', 10)
@@ -139,3 +141,19 @@ async def test_continuation_can_be_disabled(tmp_path, monkeypatch):
     except RuntimeError:
         pass
     check('disabled flag always starts a new conversation', cog.continued == [], cog.continued)
+
+
+async def test_mention_replying_to_someone_continues_with_context(tmp_path, monkeypatch):
+    store = await make_store(tmp_path)
+    cog = make_cog(store, monkeypatch)
+    monkeypatch.setattr(commands_mod, 'CHAT_MENTION_CONTINUE_ENABLED', True)
+    quoted = msg(70, 2, 'o servidor caiu de novo')
+    quoted.embeds = []
+    mention = msg(
+        80, 1, f'<@{BOT_ID}> e isso?',
+        reference=SimpleNamespace(message_id=70, resolved=quoted),
+    )
+    mention.channel = Channel([quoted, msg(60, BOT_ID, 'answer')])
+    await cog.on_message(mention)
+    check('reply to another user still merges, replying to that message', cog.continued == [(80, 60, '50', 70)], cog.continued)
+    check('quoted message rides along as context', 'o servidor caiu de novo' in cog.ref_contexts[0], cog.ref_contexts)

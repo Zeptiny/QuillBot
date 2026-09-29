@@ -935,6 +935,53 @@ class Commands(commands.Cog):
         else:
             raise error
 
+    async def _reply_context(self, message: discord.Message) -> tuple[str, list]:
+        """Text block and visual sources of the message *message* replies to ('' / [] when none)."""
+        ref_context = ""
+        ref_image_urls: list = []
+        if message.reference and message.reference.message_id:
+            ref_msg = message.reference.resolved
+            if ref_msg is None:
+                try:
+                    ref_msg = await message.channel.fetch_message(message.reference.message_id)
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    ref_msg = None
+                except Exception:
+                    logger.exception("Failed to fetch referenced message %s", message.reference.message_id)
+                    ref_msg = None
+            if ref_msg:
+                try:
+                    ref_author = getattr(ref_msg.author, 'display_name', str(ref_msg.author))
+                    ref_content = message_media.emoji_text(ref_msg.content or "").strip()
+                    if len(ref_content) > 1500:
+                        ref_content = ref_content[:1500] + "…"
+                    ref_image_urls = message_media.visual_sources(ref_msg)
+                    ref_media = message_media.visual_markers(ref_msg)
+                    attach_names = [att.filename for att in getattr(ref_msg, 'attachments', []) if not (att.content_type and att.content_type.startswith('image/'))]
+                    parts = [f"[Mensagem respondida — {ref_author} (@{ref_msg.author.name})]"]
+                    if ref_content:
+                        parts.append(f"Conteúdo: {ref_content}")
+                    if attach_names:
+                        parts.append(f"Anexos: {', '.join(attach_names[:5])}")
+                    ref_images = message_media.image_attachments(ref_msg)
+                    if ref_images and not ref_content and not attach_names:
+                        parts.append(f"Anexos: {len(ref_images)} imagem(ns)")
+                    if ref_media:
+                        parts.append(f"Mídia: {ref_media}")
+                    if not ref_content and not ref_msg.attachments and not ref_media and ref_msg.embeds:
+                        try:
+                            embed = ref_msg.embeds[0]
+                            embed_text = (embed.description or embed.title or "")[:500]
+                            if embed_text:
+                                parts.append(f"Embed: {embed_text}")
+                        except Exception:
+                            pass
+                    if len(parts) > 1:
+                        ref_context = "\n".join(parts)
+                except Exception:
+                    logger.exception("Failed to build ref context")
+        return ref_context, ref_image_urls
+
     async def _continue_conversation(
         self,
         message: discord.Message,
@@ -942,11 +989,15 @@ class Commands(commands.Cog):
         conv: dict,
         *,
         reply_to: int | None,
+        ref_context: str = '',
+        ref_image_urls: list | None = None,
     ) -> None:
         """Answer *message* as the next turn of the conversation behind *handle_id*.
 
-        ``reply_to`` is the bot message the user actually replied to; ``None``
-        when an @mention picked up a recent conversation without a reply.
+        ``reply_to`` is the message the user actually replied to; ``None`` when
+        an @mention picked up a recent conversation without a reply. When a
+        mention replied to someone else's message, ``ref_context`` and
+        ``ref_image_urls`` carry that message into the turn.
         """
         user_id = message.author.id
         if user_id in self._followup_cd:
@@ -960,10 +1011,17 @@ class Commands(commands.Cog):
         if self.bot.user:
             follow_up_question = re.sub(rf'<@!?{self.bot.user.id}>', '', follow_up_question)
             follow_up_question = re.sub(r'\s+', ' ', follow_up_question).strip()
-        if not follow_up_question and not message.attachments:
+        if not follow_up_question and not message.attachments and not ref_context:
             return
         image_urls = await image_store.persist_images(message_media.visual_sources(message))
         follow_up_question = message_media.question_with_media(follow_up_question, message)
+        if ref_image_urls:
+            image_urls += await image_store.persist_images(ref_image_urls)
+        if ref_context:
+            follow_up_question = (
+                f"{ref_context}\n---\n"
+                f"{follow_up_question or 'Analise a mensagem e imagem(ns) respondida(s) acima.'}"
+            )
         if not follow_up_question:
             follow_up_question = 'Analise esta imagem.'
         async with self.store.conversation_lock(conv['conv_id']), message.channel.typing():
@@ -1068,16 +1126,22 @@ class Commands(commands.Cog):
             return
         # A mention right after the bot talked continues that conversation, as
         # if the user had replied to the bot's latest message in the window.
-        if CHAT_MENTION_CONTINUE_ENABLED and not message.reference:
+        # A reply to someone else's message joins it too, with that message as context.
+        if CHAT_MENTION_CONTINUE_ENABLED:
             typed = re.sub(rf'<@!?{self.bot.user.id}>', '', message.content).strip()
-            if typed or message.attachments:
+            ref_id = message.reference.message_id if message.reference else None
+            if typed or message.attachments or ref_id:
                 recent = await find_recent_conversation(
                     self.store, message.channel, self.bot.user.id,
                     before=message, limit=CHANNEL_CONTEXT_MESSAGES,
                 )
                 if recent:
                     handle_id, conv = recent
-                    await self._continue_conversation(message, handle_id, conv, reply_to=None)
+                    ref_context, ref_image_urls = await self._reply_context(message)
+                    await self._continue_conversation(
+                        message, handle_id, conv, reply_to=ref_id,
+                        ref_context=ref_context, ref_image_urls=ref_image_urls,
+                    )
                     return
         # Per-user cooldown for mentions (reuse followup cooldown)
         user_id = message.author.id
@@ -1094,49 +1158,7 @@ class Commands(commands.Cog):
         clean_question = re.sub(r'\s+', ' ', clean_question).strip()
         clean_question = message_media.question_with_media(clean_question, message)
         current_image_urls = await image_store.persist_images(message_media.visual_sources(message))
-        ref_context = ""
-        ref_image_urls: list = []
-        if message.reference and message.reference.message_id:
-            ref_msg = message.reference.resolved
-            if ref_msg is None:
-                try:
-                    ref_msg = await message.channel.fetch_message(message.reference.message_id)
-                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                    ref_msg = None
-                except Exception:
-                    logger.exception("Failed to fetch referenced message %s", message.reference.message_id)
-                    ref_msg = None
-            if ref_msg:
-                try:
-                    ref_author = getattr(ref_msg.author, 'display_name', str(ref_msg.author))
-                    ref_content = message_media.emoji_text(ref_msg.content or "").strip()
-                    if len(ref_content) > 1500:
-                        ref_content = ref_content[:1500] + "…"
-                    ref_image_urls = message_media.visual_sources(ref_msg)
-                    ref_media = message_media.visual_markers(ref_msg)
-                    attach_names = [att.filename for att in getattr(ref_msg, 'attachments', []) if not (att.content_type and att.content_type.startswith('image/'))]
-                    parts = [f"[Mensagem respondida — {ref_author} (@{ref_msg.author.name})]"]
-                    if ref_content:
-                        parts.append(f"Conteúdo: {ref_content}")
-                    if attach_names:
-                        parts.append(f"Anexos: {', '.join(attach_names[:5])}")
-                    ref_images = message_media.image_attachments(ref_msg)
-                    if ref_images and not ref_content and not attach_names:
-                        parts.append(f"Anexos: {len(ref_images)} imagem(ns)")
-                    if ref_media:
-                        parts.append(f"Mídia: {ref_media}")
-                    if not ref_content and not ref_msg.attachments and not ref_media and ref_msg.embeds:
-                        try:
-                            embed = ref_msg.embeds[0]
-                            embed_text = (embed.description or embed.title or "")[:500]
-                            if embed_text:
-                                parts.append(f"Embed: {embed_text}")
-                        except Exception:
-                            pass
-                    if len(parts) > 1:
-                        ref_context = "\n".join(parts)
-                except Exception:
-                    logger.exception("Failed to build ref context")
+        ref_context, ref_image_urls = await self._reply_context(message)
         all_image_urls = current_image_urls + await image_store.persist_images(ref_image_urls)
         if ref_context:
             if clean_question:
