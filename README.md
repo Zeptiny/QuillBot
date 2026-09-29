@@ -59,6 +59,7 @@ General-purpose assistant (same agentic loop as `/ask` but with web search).
 - **Reactions:** `add_reaction` lets the model react with a Unicode emoji or a `:nome:` custom emoji of the server, only to messages in the current channel (the triggering message by default) and at most 3 per answer. `REACTION_TOOL_ENABLED=false` removes the tool
 - **Web search:** Supports `search_depth` (basic/advanced), `time_range`, domain filtering
 - **Reply follow-up** and **@mention mode:** Mention the bot (`@QuillBot <question>`) to chat without a slash command — same rate-limit and conversation handling as `/chat`
+- A mention continues the conversation when one of the bot's `/chat`/mention answers is among the last `CHANNEL_CONTEXT_MESSAGES` channel messages, just like replying to it; a mention that replies to someone else's message joins it too, with that message as context (`CHAT_MENTION_CONTINUE_ENABLED=false` always starts a new one)
 - Set `CHAT_MENTION_ENABLED=false` to disable mention mode
 
 #### `/resumo [canal] [periodo] [foco]`
@@ -363,6 +364,7 @@ cp .env.example .env   # if available, otherwise create .env manually
 | `WEB_SEARCH_ENABLED` | `true` | Enable Tavily web search |
 | `TAVILY_API_KEY` | — | Required when web search is enabled |
 | `CHAT_MENTION_ENABLED` | `true` | Enable @mention chat mode |
+| `CHAT_MENTION_CONTINUE_ENABLED` | `true` | A mention continues the newest bot conversation within the last `CHANNEL_CONTEXT_MESSAGES` messages instead of starting a new one (a quoted message is added as context) |
 | `CHANNEL_CONTEXT_MESSAGES` | `10` | Latest channel messages auto-injected as text and vision context into `/ask`, `/chat`, @mention and reply follow-ups (`0` disables) |
 | `CHANNEL_CONTEXT_IMAGES_ENABLED` | `true` | Send images attached to channel-context and follow-up gap messages as vision parts (`false` for text-only models) |
 | `CHANNEL_CONTEXT_IMAGE_MAX_AGE_MINUTES` | `60` | Only channel-context images newer than this are sent (`0` = no age limit) |

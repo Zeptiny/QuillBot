@@ -73,6 +73,9 @@ CONVERSATIONS_IMAGE_TURNS: Final[int] = int(os.getenv('CONVERSATIONS_IMAGE_TURNS
 
 # --- Chat Mention ---
 CHAT_MENTION_ENABLED: Final[bool] = os.getenv('CHAT_MENTION_ENABLED', 'true').strip().lower() in ('1', 'true', 'yes')
+# A mention continues the newest /chat conversation whose bot message is within
+# the last CHANNEL_CONTEXT_MESSAGES channel messages (like replying to it).
+CHAT_MENTION_CONTINUE_ENABLED: Final[bool] = os.getenv('CHAT_MENTION_CONTINUE_ENABLED', 'true').strip().lower() in ('1', 'true', 'yes')
 
 # --- Channel context (recent messages auto-injected into /ask, /chat, @mention and follow-ups) ---
 # Number of latest channel messages sent to the LLM as conversation context; 0 disables.
