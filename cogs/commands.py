@@ -16,6 +16,7 @@ from cogs.conversation_store import (
     add_participants,
     apply_cache_control,
     author_info,
+    author_stamp,
     build_conversation_block,
     build_current_message,
     build_history_messages,
@@ -84,11 +85,14 @@ _MEMORY_INSTRUCTIONS = (
     "- Você tem uma memória persistente: um bloco <memory> com lembranças "
     "relevantes é injetado automaticamente no início de cada resposta. Use-o "
     "naturalmente — nunca mencione o bloco nem os IDs [mem #N].\n"
+    "- No bloco <memory>, as memórias de cada pessoa ficam sob \"Sobre Nome (@usuário) "
+    "id=…\" — confira o id antes de atribuir uma memória a alguém.\n"
     "- Para lembrar de algo não injetado, use `memory_search`; para contextualizar "
     "quem é alguém, use `memory_about`.\n"
     "- Ao descobrir algo digno de memória (preferência estável, fato sobre pessoa, "
     "evento marcante, habilidade ensinada), salve com `memory_write` — uma frase "
-    "autocontida por memória, em terceira pessoa. Atualize com action=update quando "
+    "autocontida por memória, em terceira pessoa, citando o nome da pessoa; memórias "
+    "sobre alguém sempre com `about_user` = author_id dela. Atualize com action=update quando "
     "o fato mudar e use action=forget quando deixar de valer. Use pinned=true só "
     "para fatos centrais e permanentes.\n"
 ) if MEMORY_ENABLED else ""
@@ -724,10 +728,14 @@ class Commands(commands.Cog):
             mem_cog = self.bot.get_cog('Memory')
             if mem_cog is not None and (guild or (interaction.guild if interaction else None)):
                 try:
+                    speaker = user or (interaction.user if interaction else None)
                     mem_block = await mem_cog.build_memory_block(
                         (guild or interaction.guild).id, question,
                         speaker_id=str(user.id) if user is not None else None,
                         participant_ids=participant_ids,
+                        for_label=author_stamp(
+                            author_info(speaker), created_at.timestamp() if created_at else None,
+                        ) if speaker is not None else None,
                     )
                     if mem_block:
                         context_blocks.append(mem_block)
@@ -769,7 +777,6 @@ class Commands(commands.Cog):
             ts=created_at.timestamp() if created_at else None,
             image_urls=urls,
             reply_to=reply_to,
-            in_conversation=bool(history),
             prior_context=prior_context,
             channel_id=getattr(channel, 'id', None),
             context_blocks='\n\n'.join(context_blocks) or None,

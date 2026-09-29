@@ -1,6 +1,7 @@
 """Transport-level API request logging.
 
-Patches ``aiohttp.ClientSession._request`` and ``httpx.AsyncClient.send`` so
+Patches ``aiohttp.ClientSession._request`` and ``httpx.AsyncClient.send`` (plus
+``httpx2.AsyncClient.send``, which openai>=2 uses instead of httpx) so
 every outbound HTTP request made by the bot — including discord.py's REST
 client, the OpenAI SDK (LLM/embeddings/rerank) and tavily-python — is logged
 as one JSON line to a rotating file. An inbound listener logs every Discord
@@ -17,6 +18,7 @@ import json
 import logging
 import logging.handlers
 import os
+import re
 import time
 from typing import Any, Final
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -25,6 +27,11 @@ import aiohttp
 import discord
 import httpx
 from discord.ext import commands
+
+try:  # openai>=2 builds its client on httpx2, a separate package from httpx
+    import httpx2
+except ImportError:  # pragma: no cover - depends on the installed openai
+    httpx2 = None
 
 from config import (
     API_REQUEST_LOG_BACKUPS,
@@ -43,6 +50,7 @@ _logger.propagate = False
 
 _ORIG_AIOHTTP_REQUEST = aiohttp.ClientSession._request
 _ORIG_HTTPX_SEND = httpx.AsyncClient.send
+_ORIG_HTTPX2_SEND = httpx2.AsyncClient.send if httpx2 is not None else None
 
 _SENSITIVE_PARAMS: Final[tuple[str, ...]] = (
     'key', 'token', 'secret', 'password', 'signature', 'session', 'auth', 'code',
@@ -91,6 +99,9 @@ def _redact_url(url: str) -> str:
         return url
 
 
+_DATA_URI_RE = re.compile(r'(data:[\w/+.-]+;base64,)([A-Za-z0-9+/=]{64,})')
+
+
 def _body_value(raw: bytes | str | None) -> Any:
     """Normalize a wire body for the log: JSON object when it fits, else a truncated string.
 
@@ -104,8 +115,14 @@ def _body_value(raw: bytes | str | None) -> Any:
     text = text.strip()
     if not text:
         return None
+    # Inline images would eat the whole budget: keep only their size.
+    text = _DATA_URI_RE.sub(lambda m: f'{m.group(1)}<{len(m.group(2))} chars>', text)
     if len(text) > API_REQUEST_LOG_BODY_MAX_CHARS:
-        return text[:API_REQUEST_LOG_BODY_MAX_CHARS] + f'…[truncated {len(text) - API_REQUEST_LOG_BODY_MAX_CHARS} chars]'
+        # Keep both ends: a chat request's newest messages (the current
+        # question and its context blocks) are at the tail.
+        half = API_REQUEST_LOG_BODY_MAX_CHARS // 2
+        cut = len(text) - 2 * half
+        return f'{text[:half]}…[truncated {cut} chars]…{text[len(text) - half:]}'
     try:
         return json.loads(text)
     except (json.JSONDecodeError, ValueError):
@@ -169,6 +186,15 @@ async def _patched_aiohttp_request(
 async def _patched_httpx_send(
     self: httpx.AsyncClient, request: httpx.Request, **kwargs: Any
 ) -> httpx.Response:
+    return await _logged_httpx_send(_ORIG_HTTPX_SEND, self, request, **kwargs)
+
+
+async def _patched_httpx2_send(self: Any, request: Any, **kwargs: Any) -> Any:
+    return await _logged_httpx_send(_ORIG_HTTPX2_SEND, self, request, **kwargs)
+
+
+async def _logged_httpx_send(orig: Any, self: Any, request: Any, **kwargs: Any) -> Any:
+    """Shared by httpx and httpx2 (same Request/Response API)."""
     url = str(request.url)
     service = _service(url)
     capture = _should_capture(service) and not kwargs.get('stream')
@@ -180,7 +206,7 @@ async def _patched_httpx_send(
         except Exception:
             raw_request_body = None
     try:
-        response = await _ORIG_HTTPX_SEND(self, request, **kwargs)
+        response = await orig(self, request, **kwargs)
     except Exception as exc:
         _emit({
             'dir': 'outbound',
@@ -254,6 +280,8 @@ def install() -> None:
 
     aiohttp.ClientSession._request = _patched_aiohttp_request
     httpx.AsyncClient.send = _patched_httpx_send
+    if httpx2 is not None:
+        httpx2.AsyncClient.send = _patched_httpx2_send
 
     _emit({
         'dir': 'meta',

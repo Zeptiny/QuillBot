@@ -22,6 +22,7 @@ from cogs.conversation_store import (
     add_participants as _add_participants,
     apply_cache_control as _apply_cache_control,
     author_info as _author_info,
+    author_stamp as _author_stamp,
     build_conversation_block as _build_conversation_block,
     build_current_message as _build_current_message,
     build_history_messages as _build_history_messages,
@@ -97,11 +98,13 @@ _SPARK_REPORT_CACHE_SIZE = 32  # Parsed Spark reports kept for follow-ups
 _MEMORY_INSTRUCTIONS = (
     "- Você tem uma memória persistente: um bloco <memory> com lembranças relevantes é "
     "injetado automaticamente no início de cada resposta. Use-o naturalmente — nunca "
-    "mencione o bloco nem os IDs [mem #N]. Para lembrar de algo não injetado, use "
+    "mencione o bloco nem os IDs [mem #N]. As memórias de cada pessoa ficam sob "
+    "\"Sobre Nome (@usuário) id=…\" — confira o id antes de atribuí-las. Para lembrar de algo não injetado, use "
     "`memory_search`; para contextualizar quem é alguém, use `memory_about`.\n"
     "- Ao descobrir algo digno de memória (preferência estável, fato sobre pessoa, evento "
     "marcante, habilidade ensinada), salve com `memory_write` — uma frase autocontida por "
-    "memória, em terceira pessoa. Atualize com action=update quando o fato mudar e use "
+    "memória, em terceira pessoa, citando o nome da pessoa; memórias sobre alguém sempre "
+    "com `about_user` = author_id dela. Atualize com action=update quando o fato mudar e use "
     "action=forget quando deixar de valer. Use pinned=true só para fatos centrais e "
     "permanentes.\n"
 ) if MEMORY_ENABLED else ""
@@ -1321,6 +1324,9 @@ class DocsRAG(commands.Cog):
                         guild.id, question,
                         speaker_id=str(user.id) if user is not None else None,
                         participant_ids=participant_ids,
+                        for_label=_author_stamp(
+                            _author_info(user), created_at.timestamp() if created_at else None,
+                        ) if user is not None else None,
                     )
                     if mem_block:
                         context_blocks.append(mem_block)
@@ -1417,7 +1423,6 @@ class DocsRAG(commands.Cog):
             ts=created_at.timestamp() if created_at else None,
             image_urls=urls,
             reply_to=reply_to,
-            in_conversation=bool(history),
             prior_context=prior_context,
             channel_id=getattr(channel, 'id', None),
             context_blocks='\n\n'.join(context_blocks) or None,
