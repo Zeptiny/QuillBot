@@ -28,6 +28,7 @@ from cogs.conversation_store import (
     select_image_refs,
 )
 from cogs.memory import MEMORY_ABOUT_TOOL, MEMORY_SEARCH_TOOL, MEMORY_WRITE_TOOL
+from cogs.monitors import MONITOR_TOOL_NAMES, MONITOR_TOOLS, NO_REPLY_TOKEN, is_silent, monitor_tool_status
 from cogs.scheduler import SCHEDULER_TOOLS
 from cogs.summary import SUMMARIZE_CHANNEL_TOOL, summary_tool_status
 from cogs.tavily_tools import TOOLS as TAVILY_TOOLS
@@ -71,6 +72,7 @@ from config import (
     DOCS_BASE_URL,
     HISTORY_SQL_TOOL_ENABLED,
     MEMORY_ENABLED,
+    MONITORS_ENABLED,
     OPENAI_API_KEY,
     OPENAI_BASE_URL,
     REACTION_TOOL_ENABLED,
@@ -122,6 +124,20 @@ _SCHEDULER_INSTRUCTIONS = (
     "em ping real fora do embed. Nunca use @everyone, @here ou menções de cargo.\n"
 ) if SCHEDULER_ENABLED else ""
 
+_MONITOR_INSTRUCTIONS = (
+    "- Você pode criar monitores: gatilhos permanentes que chamam você "
+    "automaticamente quando uma mensagem do servidor bate com filtros (canais, "
+    "autores, menções a usuários, regex no texto). Use-os para pedidos do tipo "
+    "\"sempre que…\", \"quando alguém…\", \"fique de olho em…\"; para algo "
+    "baseado em horário, use o agendador.\n"
+    "  - `monitor_create`, `monitor_list`, `monitor_update` (editar, pausar, "
+    "retomar) e `monitor_delete`. Criar, editar e remover exige a permissão "
+    "Gerenciar Servidor de quem pede.\n"
+    "  - Uma mensagem que chega por monitor começa com [Monitor disparado]: "
+    "ninguém chamou você. Siga a instrução do monitor e, se ela não pedir "
+    f"resposta, responda exatamente {NO_REPLY_TOKEN} para não enviar nada.\n"
+) if MONITORS_ENABLED else ""
+
 _SUMMARY_INSTRUCTIONS = (
     "- Para pedidos de resumo (\"o que perdi?\", \"resume a conversa de hoje\", "
     "\"do que falaram no #canal desde ontem?\"), use `summarize_channel` — "
@@ -152,6 +168,7 @@ GENERAL_SYSTEM_PROMPT = (
     + _MEMORY_INSTRUCTIONS
     + (_WEB_SEARCH_INSTRUCTIONS if TAVILY_AVAILABLE else '')
     + _SCHEDULER_INSTRUCTIONS
+    + _MONITOR_INSTRUCTIONS
     + _SUMMARY_INSTRUCTIONS +
     "- Seja honesto quando não souber a resposta — não invente informações.\n"
     "</instructions>\n\n"
@@ -794,6 +811,8 @@ class Commands(commands.Cog):
             base_tools.extend([MEMORY_SEARCH_TOOL, MEMORY_WRITE_TOOL, MEMORY_ABOUT_TOOL])
         if SCHEDULER_ENABLED:
             base_tools.extend(SCHEDULER_TOOLS)
+        if MONITORS_ENABLED:
+            base_tools.extend(MONITOR_TOOLS)
         if SUMMARY_ENABLED:
             base_tools.append(SUMMARIZE_CHANNEL_TOOL)
         if REACTION_TOOL_ENABLED:
@@ -833,6 +852,15 @@ class Commands(commands.Cog):
                     name, args, guild=g, actor_name=actor_name,
                     requester=user, channel=fallback_channel,
                 )
+            if name in MONITOR_TOOL_NAMES:
+                monitors_cog = self.bot.get_cog('Monitors')
+                if not monitors_cog:
+                    return 'Monitores não disponíveis.', []
+                if not fallback_guild:
+                    return 'Monitores requerem estar em um servidor.', []
+                return await monitors_cog.exec_tool(
+                    name, args, guild=fallback_guild, requester=user,
+                )
             if name == 'summarize_channel':
                 summary_cog = self.bot.get_cog('Summary')
                 if not summary_cog:
@@ -867,6 +895,8 @@ class Commands(commands.Cog):
                 return '⏰ Listando tarefas agendadas…'
             if name == 'schedule_delete':
                 return f'⏰ Removendo tarefa #{args.get("id", "?")}'
+            if name in MONITOR_TOOL_NAMES:
+                return monitor_tool_status(name, args)
             if name == 'summarize_channel':
                 return summary_tool_status(args, fallback_guild)
             if name == 'add_reaction':
@@ -988,6 +1018,73 @@ class Commands(commands.Cog):
                 except Exception:
                     logger.exception("Failed to build ref context")
         return ref_context, ref_image_urls
+
+    async def _message_question(self, message: discord.Message) -> tuple[str, list[str], str]:
+        """Question text, persisted image URLs and reply context for answering *message* directly.
+
+        Shared by @mentions and monitors: the bot mention is stripped, media
+        is described, and a replied-to message rides along as context.
+        """
+        # Strip bot mention to get clean question
+        clean_question = message.content
+        if self.bot.user:
+            clean_question = re.sub(rf'<@!?{self.bot.user.id}>', '', clean_question)
+        # Also strip any extra mention artifacts and whitespace
+        clean_question = re.sub(r'\s+', ' ', clean_question).strip()
+        clean_question = message_media.question_with_media(clean_question, message)
+        current_image_urls = await image_store.persist_images(message_media.visual_sources(message))
+        ref_context, ref_image_urls = await self._reply_context(message)
+        all_image_urls = current_image_urls + await image_store.persist_images(ref_image_urls)
+        if ref_context:
+            if clean_question:
+                clean_question = f"{ref_context}\n---\n{clean_question}"
+            else:
+                clean_question = f"{ref_context}\n---\nAnalise a mensagem e imagem(ns) respondida(s) acima."
+        return clean_question, all_image_urls, ref_context
+
+    async def answer_monitor(self, message: discord.Message, header: str) -> bool:
+        """Answer *message* for the monitors that matched it, like an @mention would.
+
+        *header* tells the model which monitors fired and that it may stay
+        silent. Returns whether a reply was sent; a silent run posts nothing
+        and stores no conversation (tools it used, like reactions, still ran).
+        No typing indicator and no error replies: nobody called the bot.
+        """
+        question, image_urls, _ = await self._message_question(message)
+        if not question:
+            question = 'Analise esta imagem.' if image_urls else '(mensagem sem texto)'
+        question = f'{header}\n---\n{question}'
+        participant_infos = await message_participant_infos(message)
+        answer, embeds, sources, capture = await self._run_chat(
+            question,
+            image_urls=image_urls or None,
+            user=message.author,
+            guild=message.guild,
+            channel=message.channel,
+            created_at=message.created_at,
+            participant_ids={p['id'] for p in participant_infos if p.get('id')},
+            origin=message.jump_url,
+            context_message=message,
+        )
+        if is_silent(answer):
+            return False
+        send_kwargs = ping_send_kwargs(answer, message.guild)
+        send_kwargs['embed'] = embeds[0]
+        if len(embeds) > 1:
+            send_kwargs['view'] = PaginatedEmbedView(embeds)
+        reply = await message.reply(mention_author=False, **send_kwargs)
+        await self._store_new_conversation(
+            reply, question, answer, sources,
+            user=message.author,
+            guild=message.guild,
+            channel=message.channel,
+            created_at=message.created_at,
+            images=capture.get('image_urls', image_urls),
+            message_id=message.id,
+            capture=capture,
+            participant_infos=participant_infos,
+        )
+        return True
 
     async def _continue_conversation(
         self,
@@ -1158,20 +1255,7 @@ class Commands(commands.Cog):
             except discord.HTTPException:
                 pass
             return
-        # Strip bot mention to get clean question
-        mention_pattern = re.compile(rf'<@!?{self.bot.user.id}>')
-        clean_question = mention_pattern.sub('', message.content).strip()
-        # Also strip any extra mention artifacts and whitespace
-        clean_question = re.sub(r'\s+', ' ', clean_question).strip()
-        clean_question = message_media.question_with_media(clean_question, message)
-        current_image_urls = await image_store.persist_images(message_media.visual_sources(message))
-        ref_context, ref_image_urls = await self._reply_context(message)
-        all_image_urls = current_image_urls + await image_store.persist_images(ref_image_urls)
-        if ref_context:
-            if clean_question:
-                clean_question = f"{ref_context}\n---\n{clean_question}"
-            else:
-                clean_question = f"{ref_context}\n---\nAnalise a mensagem e imagem(ns) respondida(s) acima."
+        clean_question, all_image_urls, ref_context = await self._message_question(message)
         if not clean_question and not all_image_urls:
             try:
                 await message.reply(

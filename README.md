@@ -34,6 +34,7 @@ Built with [discord.py](https://discordpy.readthedocs.io/) + RAG (Retrieval-Augm
 | **Plugin Search** | Concurrent search across Modrinth, Hangar, SpigotMC |
 | **Server Tools** | JVM flags, server status checks, docs changelog |
 | **Channel Summaries** | `/resumo` and natural-language "o que perdi?" — map-reduce summaries of a channel or thread over any period, with jump links and permission checks |
+| **Monitors** | Standing triggers (channels, authors, mentions of a user, a content regex) that call the bot on matching messages; it answers like a mention, knows a monitor sent it, and may stay silent. Managed with `/monitor` or by asking the bot |
 | **Persistent Memory** | The bot remembers: atomic facts about the server and its members, auto-injected into every conversation, with inline LLM writes, pinning, dedupe, full audit history and admin control |
 
 All AI responses are in **Brazilian Portuguese** and formatted for Discord embeds.
@@ -55,7 +56,7 @@ Ask any Minecraft server administration question. Uses an agentic RAG loop — t
 #### `/chat <question> [image]`
 General-purpose assistant (same agentic loop as `/ask` but with web search).
 
-- **Tools:** `web_search`, `web_extract` (via Tavily), plus the same context/history tools as `/ask`, the scheduler tools and `summarize_channel` (see `/resumo`)
+- **Tools:** `web_search`, `web_extract` (via Tavily), plus the same context/history tools as `/ask`, the scheduler tools, the monitor tools (see `/monitor`) and `summarize_channel` (see `/resumo`)
 - **Reactions:** `add_reaction` lets the model react with a Unicode emoji or a `:nome:` custom emoji of the server, only to messages in the current channel (the triggering message by default) and at most 3 per answer. `REACTION_TOOL_ENABLED=false` removes the tool
 - **Web search:** Supports `search_depth` (basic/advanced), `time_range`, domain filtering
 - **Reply follow-up** and **@mention mode:** Mention the bot (`@QuillBot <question>`) to chat without a slash command — same rate-limit and conversation handling as `/chat`
@@ -77,6 +78,18 @@ Summarize what happened in a channel or thread while you were away.
 - **Permissions:** only channels that *you* can view and read the history of (private threads also require membership or Manage Threads), in the current server
 - **Natural language:** the same engine is the `summarize_channel` tool in `/chat`, @mention, reply follow-ups and scheduled tasks. For example `@QuillBot o que perdi?`, `resume o que rolou no #suporte desde ontem` or a daily scheduled "resumo do #geral". The chat model turns "hoje"/"desde ontem" into timestamps using its clock context and receives a finished summary, not raw messages, so the 6000-char tool-result cap and conversation replay stay small
 - Set `SUMMARY_ENABLED=false` to remove the command and the tool
+
+#### `/monitor <subcommand>` — Monitors
+A monitor calls the bot on every message that matches **all** of its filters, as if the bot had been mentioned: same tool loop, the answer is a reply, and replying to it continues the conversation. The model is told which monitor fired and that nobody called it, and it may **not answer**: replying exactly `[NO_REPLY]` posts nothing (it can still react, write memories, schedule, etc. first).
+
+- **Filters** (at least one, combined with AND): `channels` (threads under them count), `authors` (the message was sent by…), `mentions` (the message mentions…), `regex` (case-insensitive search over the content; nested quantifiers like `(a+)+` are refused)
+- **Instruction:** what the bot should do on a match, including when to stay silent
+- **Never fires on:** bot messages, and messages the bot already answers (an @mention of it, a reply to one of its conversations). Several monitors matching one message share one run
+- **Cooldown:** per monitor, `MONITORS_DEFAULT_COOLDOWN` seconds by default (min `MONITORS_MIN_COOLDOWN`), so a busy channel doesn't cost one LLM call per message
+- **Commands:** `create`, `list`, `show`, `edit` (a slash option replaces that filter with one value; `clear` removes a filter), `pause`, `resume`, `delete`
+- **LLM tools:** `monitor_create`, `monitor_list`, `monitor_update` (lists, clearing, pause/resume) and `monitor_delete` — "sempre que alguém mencionar a staff em #suporte, veja se precisa de ajuda" works from `/chat` or a mention
+- Creating, editing and removing needs **Manage Server** (checked against whoever asks the bot); anyone can list
+- Set `MONITORS_ENABLED=false` to remove the command, the tools and the listener
 
 #### `/analyze [log_link] [log_file] [image]`
 AI-powered log/crash-report analysis.
@@ -157,7 +170,7 @@ The bot maintains long-term memories: atomic one-sentence facts about the server
 
 ## Passive Features
 
-The bot monitors every non-bot message via `on_message` listeners (load order: `log_analyzer` → `history_rag` → `commands` → `spark` → `docs_rag`).
+The bot monitors every non-bot message via `on_message` listeners (load order: `log_analyzer` → `history_rag` → `commands` → `spark` → `docs_rag` → `monitors`).
 
 ### 1. Paste Service Link Detection (`log_analyzer`)
 - **Triggers on:** `https://mclo.gs/<id>` and `https://pastebin.com/<id>`
@@ -194,7 +207,10 @@ Reply to any `/ask`, `/chat`, or `/spark` bot response to continue the thread. T
 ### 6. @Mention Chat (`commands`)
 Mention the bot with a question (`@QuillBot como otimizar meu servidor?`) — equivalent to `/chat` with the same tool loop and conversation storage.
 
-### 7. Server History Indexing (`history_rag`)
+### 7. Monitors (`monitors`)
+Messages matching a monitor's filters run the bot on them like a mention, and it may choose not to answer — see [`/monitor`](#monitor-subcommand--monitors).
+
+### 8. Server History Indexing (`history_rag`)
 Background RAG over the entire Discord server's message history:
 - **Backfill** on startup: reads all accessible text channels/threads (oldest-first, configurable limit)
 - **Live ingestion:** Every new message is chunked with a 5-message sliding window for local context, embedded, and persisted per-guild (`data/history/<guild_id>.json + .npy`)
@@ -286,6 +302,7 @@ QuillBot/
 │   ├── docs_rag.py       # RAG pipeline — indexing, search, reranking, /ask, /reindex, agentic loop + Spark diagnosis
 │   ├── history_rag.py    # Server-wide history RAG — backfill, live ingestion, per-guild vector stores
 │   ├── log_analyzer.py   # Passive log detection, pattern matching, /analyze, file upload to mclo.gs
+│   ├── monitors.py       # /monitor + monitor_* tools — standing message triggers that run the chat pipeline and may stay silent
 │   ├── memory.py         # Persistent memory — auto-injection, LLM write tools, admin commands, audit history, log channel, lore migration
 │   ├── plugins.py        # /plugin, /status, /changelog — plugin search & server status
 │   ├── summary.py        # /resumo + summarize_channel tool — period parsing, fetch, map-reduce summary, permission checks
@@ -437,6 +454,17 @@ cp .env.example .env   # if available, otherwise create .env manually
 | `SUMMARY_MAX_DAYS` | `7` | Max lookback in days |
 | `SUMMARY_SEGMENT_CHARS` | `24000` | Rendered message chars per LLM call; longer ranges are summarized map-reduce style |
 
+### Monitors
+
+| Variable | Default | Description |
+|---|---|---|
+| `MONITORS_ENABLED` | `true` | Enable `/monitor`, the `monitor_*` tools and the listener (cog not loaded when false) |
+| `MONITORS_DB_PATH` | `data/monitors.db` | SQLite store for monitors |
+| `MONITORS_MAX_PER_GUILD` | `25` | Max monitors (active or paused) per server |
+| `MONITORS_MAX_PROMPT` | `500` | Max instruction length |
+| `MONITORS_DEFAULT_COOLDOWN` | `60` | Seconds a monitor waits after firing before it can fire again |
+| `MONITORS_MIN_COOLDOWN` | `10` | Lowest cooldown a monitor can be given |
+
 ### Docs / RAG Indexing
 
 | Variable | Default | Description |
@@ -537,6 +565,7 @@ pytest -k reindex              # tests whose name matches
 | `test_history_sql.py` | The read-only `sql_history` tool and its sandbox |
 | `test_mentions.py` | Which mentions in a reply become real pings |
 | `test_message_media.py` | Stickers, GIFs, custom emojis, reactions and the `add_reaction` tool |
+| `test_monitors.py` | Monitor validation, filter matching, store, cooldowns, skipping messages the bot already answers, tools and permissions, silent vs. reply runs |
 | `test_scheduler.py` | Cron job firing and rescheduling |
 | `test_summary.py` | `/resumo`: period parsing, fetching, map-reduce, permissions |
 | `test_tool_loop.py` | Tool errors reported to the model instead of aborting the turn |

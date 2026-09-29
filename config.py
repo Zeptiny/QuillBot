@@ -153,6 +153,15 @@ SCHEDULER_LOOP_INTERVAL: Final[int] = int(os.getenv('SCHEDULER_LOOP_INTERVAL', '
 SCHEDULER_MAX_JOBS_PER_GUILD: Final[int] = int(os.getenv('SCHEDULER_MAX_JOBS_PER_GUILD', '50'))
 SCHEDULER_MAX_PROMPT: Final[int] = int(os.getenv('SCHEDULER_MAX_PROMPT', '500'))
 
+# --- Monitors (standing triggers that run the bot on matching messages) ---
+MONITORS_ENABLED: Final[bool] = os.getenv('MONITORS_ENABLED', 'true').strip().lower() in ('1', 'true', 'yes')
+MONITORS_DB_PATH: Final[str] = os.getenv('MONITORS_DB_PATH', 'data/monitors.db')
+MONITORS_MAX_PER_GUILD: Final[int] = int(os.getenv('MONITORS_MAX_PER_GUILD', '25'))
+MONITORS_MAX_PROMPT: Final[int] = int(os.getenv('MONITORS_MAX_PROMPT', '500'))
+# Seconds a monitor waits after firing before it can fire again (per monitor).
+MONITORS_DEFAULT_COOLDOWN: Final[int] = int(os.getenv('MONITORS_DEFAULT_COOLDOWN', '60'))
+MONITORS_MIN_COOLDOWN: Final[int] = int(os.getenv('MONITORS_MIN_COOLDOWN', '10'))
+
 # --- Channel summaries (/resumo + summarize_channel tool) ---
 SUMMARY_ENABLED: Final[bool] = os.getenv('SUMMARY_ENABLED', 'true').strip().lower() in ('1', 'true', 'yes')
 # Model for the summary calls; a cheaper model is usually fine here.
