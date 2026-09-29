@@ -1287,6 +1287,10 @@ def extract_text_tool_calls(
     return _TEXT_TOOL_CALL_RE.sub('', content).strip(), calls, True
 
 
+# What run_tool_loop answers when the model produced nothing usable.
+EMPTY_ANSWER_FALLBACK = 'Não foi possível gerar uma resposta.'
+
+
 async def run_tool_loop(
     client: AsyncOpenAI,
     model: str,
@@ -1526,7 +1530,7 @@ async def run_tool_loop(
             finish_reasons,
             _usage_summary(response),
         )
-        answer = 'Não foi possível gerar uma resposta.'
+        answer = EMPTY_ANSWER_FALLBACK
     messages.append({'role': 'assistant', 'content': answer})
     trajectory = serialize_trajectory(messages[capture_start:])
     prompt_total = usage_totals['prompt_tokens']
