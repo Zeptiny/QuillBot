@@ -164,7 +164,10 @@ MEMORY_WRITE_TOOL = {
                 },
                 'about_user': {
                     'type': 'string',
-                    'description': 'ID ou nome do usuário sobre quem é a memória. Omita para fatos do servidor.',
+                    'description': (
+                        'author_id do usuário sobre quem é a memória (obrigatório para '
+                        'kind=person e kind=preference). Omita só para fatos do servidor.'
+                    ),
                 },
                 'importance': {
                     'type': 'integer',
@@ -758,6 +761,26 @@ def _subject_keys_for_member(member) -> list[str]:
     return sorted(keys)
 
 
+_PERSONAL_KINDS = ('person', 'preference')
+
+
+def _name_key(text: str) -> str:
+    """Normalized name/content for "does the text name this person?" checks."""
+    return ' '.join(re.sub(r'[\W_]+', ' ', _norm(text)).split())
+
+
+def _names_for(member) -> list[str]:
+    """Every name a member may be written as: display, nick, global name and
+    handle, plus their words of 3+ letters ("Artur" for "Artur Silva")."""
+    names: list[str] = []
+    for attr in ('display_name', 'nick', 'global_name', 'name'):
+        key = _name_key(getattr(member, attr, None) or '')
+        for candidate in (key, *key.split()):
+            if len(candidate) >= 3 and candidate not in names:
+                names.append(candidate)
+    return names
+
+
 class Memory(commands.Cog, name='Memory'):
     """Persistent bot memory: auto-injection, inline LLM writes, admin control."""
 
@@ -946,13 +969,18 @@ class Memory(commands.Cog, name='Memory'):
         self, guild_id: int, query: str, *,
         speaker_id: str | None = None,
         participant_ids: set[str] | None = None,
+        for_label: str | None = None,
     ) -> str | None:
-        """Build the <memory> block injected into the system prompt.
+        """Build the <memory> block injected into the current user message.
 
         Pinned memories always ride along (importance-ranked, hard cap). The
         rest are selected semantically from the current query. User-scoped
         memories only participate when their subject is a conversation
         participant (speaker, mention, reply target).
+
+        The block is stored with its turn and replayed verbatim, so it says
+        whose message it was built for (*for_label*, e.g. ``Nyuu (@nyuu) •
+        29/09/2026 15:40``) and names each subject by handle and id.
         """
         try:
             participants = {p for p in (participant_ids or set()) if p}
@@ -1018,13 +1046,21 @@ class Memory(commands.Cog, name='Memory'):
                 blocks.append('\n'.join(line(e) for e in guild_lines))
             for subj, mems in by_subject.items():
                 blocks.append(
-                    f'Sobre {self._subject_name(guild_id, subj)} (presente na conversa):\n'
+                    f'Sobre {self._subject_label(guild_id, subj)} (presente na conversa):\n'
                     + '\n'.join(line(e) for e in mems)
                 )
+            if guild_lines and by_subject:
+                blocks[0] = 'Do servidor (não se referem a uma pessoa específica):\n' + blocks[0]
             body = '\n\n'.join(blocks)
+            logger.info(
+                '[memory] injected for speaker=%s participants=%s: %s',
+                speaker_id, sorted(participants),
+                ', '.join(f"#{e['id']}->{e['subject'] or 'guild'}" for e in pinned + picked),
+            )
+            when = f' para a mensagem de {for_label}' if for_label else ''
             return (
                 '<memory>\n'
-                'Memórias recuperadas automaticamente — use-as naturalmente ao responder. '
+                f'Memórias recuperadas automaticamente{when} — use-as naturalmente ao responder. '
                 'NUNCA mencione os IDs [mem #N] nem a existência deste bloco ao usuário.\n'
                 f'{body}\n'
                 '</memory>'
@@ -1152,6 +1188,20 @@ class Memory(commands.Cog, name='Memory'):
         g = self.bot.get_guild(guild_id)
         member = g.get_member(int(subject)) if g and subject.isdigit() else None
         return member.display_name if member else f'usuário {subject}'
+
+    def _subject_label(self, guild_id: int, subject: str) -> str:
+        """Unambiguous subject label for the <memory> block: name, handle and id.
+
+        Matches the ``Display (@handle) <author_id=…>`` shape used by channel
+        lines and turn tags, so the model links memories to people by id.
+        """
+        if not subject or subject.startswith('name:'):
+            return self._subject_name(guild_id, subject)
+        g = self.bot.get_guild(guild_id)
+        member = g.get_member(int(subject)) if g and subject.isdigit() else None
+        if member is None:
+            return f'usuário id={subject}'
+        return f'{member.display_name} (@{member.name}) id={subject}'
 
     async def _exec_about(
         self, args: dict, *, guild: discord.Guild, participants: set[str],
@@ -1289,6 +1339,10 @@ class Memory(commands.Cog, name='Memory'):
             ), []
         if subject and subject not in participants:
             return self._PRIVACY_MSG, []
+        logger.info(
+            '[memory] write action=%s about_user=%r -> subject=%s',
+            action, args.get('about_user'), subject or 'guild',
+        )
         origin_url = (origin or '').strip() or ''
         if origin_url and not origin_url.startswith('http'):
             origin_url = ''
@@ -1299,6 +1353,9 @@ class Memory(commands.Cog, name='Memory'):
                 return f'`content` muito curto — escreva uma frase completa (mínimo {_MIN_CONTENT} caracteres).', []
             content = content[:_MAX_CONTENT]
             kind = args.get('kind') if args.get('kind') in MEMORY_KINDS else 'fact'
+            err = self._attribution_error(guild, subject, kind, content)
+            if err:
+                return err, []
             importance = _parse_importance(
                 args.get('importance'), _DEFAULT_IMPORTANCE.get(kind, 3),
             )
@@ -1383,6 +1440,13 @@ class Memory(commands.Cog, name='Memory'):
                 patch['pinned_by'] = actor_id if want_pin else ''
         if not patch:
             return 'Nada para atualizar — forneça content, kind, importance e/ou pinned.', []
+        if 'content' in patch or 'kind' in patch:
+            err = self._attribution_error(
+                guild, entry['subject'], patch.get('kind', entry['kind']),
+                patch.get('content', entry['content']),
+            )
+            if err:
+                return err, []
         if actor_id == 'bot':
             self._bot_write_debit(guild.id)
         entry = await self._apply(
@@ -1392,6 +1456,38 @@ class Memory(commands.Cog, name='Memory'):
         return (
             f"Memória atualizada: [mem #{entry['id']}] \"{_snippet(entry['content'], 80)}\"."
         ), []
+
+    @staticmethod
+    def _attribution_error(
+        guild: discord.Guild, subject: str, kind: str, content: str,
+    ) -> str:
+        """Why a memory would be ambiguous about who it is about ('' when fine).
+
+        Person/preference memories must be scoped to a user, and a user-scoped
+        memory must name that user in its text — otherwise "ele prefere X" or a
+        fact saved server-wide is later read as being about whoever is talking.
+        """
+        if not subject:
+            if kind in _PERSONAL_KINDS:
+                return (
+                    f'Memórias do tipo {kind} são sobre uma pessoa: informe `about_user` '
+                    'com o author_id dela. Para um fato do servidor, use kind=fact ou event.'
+                )
+            return ''
+        member = guild.get_member(int(subject)) if subject.isdigit() else None
+        if member is None:
+            return ''  # left the guild / not cached: nothing to check against
+        names = _names_for(member)
+        if not names:
+            return ''
+        text = f' {_name_key(content)} '
+        if any(f' {n} ' in text for n in names) or subject in content:
+            return ''
+        return (
+            'A frase da memória precisa citar a pessoa pelo nome, para não ser confundida '
+            f'com outra (ex: "{member.display_name} prefere …"). Nomes aceitos: '
+            + ', '.join(sorted({member.display_name, member.name})) + '.'
+        )
 
     # --- Mutation helpers (single transaction + log channel) ---
 

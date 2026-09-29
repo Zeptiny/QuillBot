@@ -397,6 +397,31 @@ def _author_label(author: dict | None) -> str:
     return f'{display} (@{name})' if name else display
 
 
+def author_tag(
+    author: dict | None, ts: float | None, *, reply_to: str | int | None = None,
+) -> str:
+    """``[Por Autor (@handle) • author_id=… • data hora]`` or ``''`` without an author.
+
+    Used on every user message sent to the LLM. It never says "now", so the
+    stored copy stays accurate when replayed byte-identically in later turns.
+    """
+    a = author or {}
+    if not (a.get('id') or a.get('name') or a.get('display')):
+        return ''
+    meta = [f'Por {_author_label(a)}']
+    if a.get('id'):
+        meta.append(f"author_id={a['id']}")
+    meta.append(_fmt_ts(ts))
+    if reply_to:
+        meta.append(f'↩ reply_to={reply_to}')
+    return f"[{' • '.join(meta)}]"
+
+
+def author_stamp(author: dict | None, ts: float | None) -> str:
+    """Short ``Autor (@handle) • data hora`` label for per-turn blocks."""
+    return f'{_author_label(author)} • {_fmt_ts(ts)}'
+
+
 # ---------------------------------------------------------------------------
 # LLM message builders (author-attributed history)
 # ---------------------------------------------------------------------------
@@ -612,13 +637,12 @@ def build_current_message(
     ts: float | None,
     image_urls: list[str] | None = None,
     reply_to: str | int | None = None,
-    in_conversation: bool = False,
     prior_context: list[str] | None = None,
     channel_id: str | int | None = None,
     context_blocks: str | None = None,
     context_image_urls: list[str] | None = None,
 ) -> dict:
-    """Build the current user message, attributed when part of a conversation.
+    """Build the current user message, attributed to its author (:func:`author_tag`).
 
     ``context_blocks`` carries per-request context (current time/place, memory
     selection, recent channel window), while ``context_image_urls`` carries
@@ -633,14 +657,13 @@ def build_current_message(
         [l for l in (prior_context or []) if l], channel_id
     )
     text = question
-    if in_conversation:
-        meta = [f'Agora — {_author_label(author)}']
-        if (author or {}).get('id'):
-            meta.append(f"author_id={author['id']}")
-        meta.append(_fmt_ts(ts))
-        if reply_to:
-            meta.append(f'↩ reply_to={reply_to}')
-        text = f"{head}[{' • '.join(meta)}]\n{question}"
+    tag = author_tag(author, ts, reply_to=reply_to)
+    if tag:
+        # The tag sits right above the question — also on the first turn — so
+        # the asker is never inferred from the last channel line above it. It
+        # is timeless ("Por", never "Agora") because this exact text is stored
+        # and replayed verbatim in later turns, where it must still be true.
+        text = f"{head}{tag}\n{question}"
     elif head:
         text = f"{head}{question}"
     if current_images or context_images:
@@ -686,8 +709,12 @@ def build_conversation_block(history: list[dict]) -> str:
     if last_channel_id:
         lines.append(f'Canal atual da conversa: channel_id={last_channel_id} (use com get_message_context).')
     lines.extend([
-        'Cada pergunta do histórico aparece prefixada com [Por Autor (@usuário) • author_id=… • data hora] —',
-        'use esses prefixos para saber quem perguntou o quê, e de qual resposta do bot.',
+        'Cada mensagem de usuário traz, logo acima do texto, a marca [Por Autor (@usuário) • author_id=… • data hora] —',
+        'use essas marcas para saber quem perguntou o quê, e de qual resposta do bot.',
+        'A mensagem a que você deve responder agora é sempre a ÚLTIMA mensagem de usuário; as anteriores são histórico.',
+        'Cada mensagem pode trazer seus próprios blocos <contexto> e <memory>: eles descrevem o momento em que AQUELA',
+        'mensagem foi enviada (autor, horário, memórias da época). Se blocos de mensagens diferentes divergirem,',
+        'vale o da mensagem mais recente. Marcas antigas "[Agora — …]" também se referem ao momento da própria mensagem.',
         'Mensagens do canal (ferramentas de histórico) usam o mesmo author_id/msg_id —',
         'correlacione-as para saber quem disse o quê na conversa do canal.',
         f'Blocos "[{PRIOR_CONTEXT_HEADER}]" trazem a conversa do canal',

@@ -470,7 +470,7 @@ cp .env.example .env   # if available, otherwise create .env manually
 
 ### API Request Logging
 
-Implemented in [`api_logger.py`](api_logger.py) — patches the `aiohttp`/`httpx` transports so every outbound HTTP request (Discord REST, LLM API, Tavily, GitHub, plugin APIs) and every inbound Discord interaction is appended as one JSON line to a rotating file. See [SETUP.md](SETUP.md) for sample lines and privacy notes.
+Implemented in [`api_logger.py`](api_logger.py) — patches the `aiohttp`/`httpx`/`httpx2` transports so every outbound HTTP request (Discord REST, LLM API, Tavily, GitHub, plugin APIs) and every inbound Discord interaction is appended as one JSON line to a rotating file. See [SETUP.md](SETUP.md) for sample lines and privacy notes.
 
 | Variable | Default | Description |
 |---|---|---|
@@ -526,7 +526,8 @@ pytest -k reindex              # tests whose name matches
 
 | File | Covers |
 |---|---|
-| `test_api_logger.py` | Request logging for aiohttp/httpx, redaction, body capture, inbound interactions (runs in its own process) |
+| `test_api_logger.py` | Request logging for aiohttp/httpx/httpx2, redaction, body capture, inbound interactions (runs in its own process) |
+| `test_attribution.py` | Author tags on every question, byte-identical replay of per-turn blocks, memory block labels and person-memory rules |
 | `test_channel_context_images.py` | Images from automatically fetched channel context |
 | `test_conversation_participants.py` | Participant scope for shared conversations and memory writes |
 | `test_docs_rag.py` | Docs `/reindex`: partial and full reindex, failed sources kept |

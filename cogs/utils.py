@@ -542,8 +542,10 @@ def render_search_results(results: list[dict], *, window_chars: int = 1200, incl
 
 def build_user_context(member: discord.abc.User | discord.Member | None) -> str:
     if not member:
-        return "Usuário: desconhecido"
-    lines = [f"- Usuário: {getattr(member, 'display_name', str(member))} (@{member.name}) id={member.id}"]
+        return "- Autor desta mensagem: desconhecido"
+    # "Autor desta mensagem", not "Usuário": this block is stored with its turn
+    # and replayed verbatim, so it must stay true once newer messages follow.
+    lines = [f"- Autor desta mensagem: {getattr(member, 'display_name', str(member))} (@{member.name}) id={member.id}"]
     created = getattr(member, 'created_at', None)
     if created:
         lines.append(f"  Conta criada: {_fmt_dt(created)}")
@@ -607,7 +609,7 @@ def build_temporal_context(now: datetime.datetime | None = None, created_at: dat
     now = now or datetime.datetime.now(datetime.timezone.utc)
     br_now = now.astimezone(BR_TZ)
     lines = [
-        f"- Agora: {br_now.strftime('%d/%m/%Y %H:%M:%S BRT')} ({now.strftime('%Y-%m-%d %H:%M UTC')})",
+        f"- Data/hora desta mensagem: {br_now.strftime('%d/%m/%Y %H:%M:%S BRT')} ({now.strftime('%Y-%m-%d %H:%M UTC')})",
     ]
     if created_at:
         lines.append(f"  Mensagem enviada em: {_fmt_dt(created_at)} UTC={created_at.strftime('%Y-%m-%d %H:%M UTC') if hasattr(created_at, 'strftime') else created_at}")

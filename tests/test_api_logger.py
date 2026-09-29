@@ -1,6 +1,6 @@
 """api_logger: both transports, redaction, body capture, error path, inbound hook.
 
-install() patches aiohttp and httpx for the whole process and config reads the
+install() patches aiohttp, httpx and httpx2 for the whole process and config reads the
 log settings at import, so the scenario runs in its own interpreter: pytest
 collects test_api_logger(), which re-runs this file as a script.
 """
@@ -31,9 +31,19 @@ async def handler(request):
     return web.json_response({'choices': [{'message': {'content': 'resposta'}}], 'usage': {'prompt_tokens': 42}})
 
 
+async def completions_handler(request):
+    await request.json()
+    return web.json_response({
+        'id': 'c1', 'object': 'chat.completion', 'created': 0, 'model': 'm',
+        'choices': [{'index': 0, 'finish_reason': 'stop', 'message': {'role': 'assistant', 'content': 'ok'}}],
+        'usage': {'prompt_tokens': 7, 'completion_tokens': 1, 'total_tokens': 8},
+    })
+
+
 async def main():
     app = web.Application()
     app.router.add_post('/chat', handler)
+    app.router.add_post('/v1/chat/completions', completions_handler)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, '127.0.0.1', 0)
@@ -52,6 +62,15 @@ async def main():
             await c.get('http://127.0.0.1:1/nope')
         except Exception:
             pass
+
+    # The real OpenAI SDK: openai>=2 sends through httpx2, not httpx.
+    from openai import AsyncOpenAI
+    client = AsyncOpenAI(base_url=base + '/v1', api_key='test-key')
+    done = await client.chat.completions.create(
+        model='sdk/model', messages=[{'role': 'user', 'content': 'via sdk'}],
+    )
+    assert done.choices[0].message.content == 'ok'
+    await client.close()
 
     await runner.cleanup()
 
@@ -90,6 +109,21 @@ async def main():
     assert hx[0]['model'] == 'qwen/qwen3.6-plus', 'model extraction failed'
     assert hx[0]['request_body']['messages'][0]['content'] == 'oi', 'request body capture failed'
     assert hx[0]['response_body']['usage']['prompt_tokens'] == 42, 'response body capture failed'
+
+    sdk = [l for l in lines if l['dir'] == 'outbound' and l['url'].endswith('/v1/chat/completions')]
+    assert len(sdk) == 1 and sdk[0]['status'] == 200, 'OpenAI SDK request not logged'
+    assert sdk[0]['request_body']['messages'][0]['content'] == 'via sdk', 'SDK request body capture failed'
+    assert 'test-key' not in json.dumps(sdk[0]), 'API key leaked into the log'
+
+    # Bodies: inline images shrink to their size; long bodies keep both ends.
+    b64 = 'A' * 5000
+    shrunk = api_logger._body_value(json.dumps({'u': f'data:image/png;base64,{b64}'}))
+    assert shrunk == {'u': 'data:image/png;base64,<5000 chars>'}, shrunk
+    limit = api_logger.API_REQUEST_LOG_BODY_MAX_CHARS
+    long_body = 'HEAD' + 'x' * (limit * 2) + 'TAIL'
+    cut = api_logger._body_value(long_body)
+    assert cut.startswith('HEAD') and cut.endswith('TAIL') and 'truncated' in cut
+    assert len(cut) < limit + 100
 
     errs = [l for l in lines if 'error' in l]
     assert len(errs) == 1 and errs[0]['url'].startswith('http://127.0.0.1:1'), 'error path line missing'
