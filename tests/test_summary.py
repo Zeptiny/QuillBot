@@ -16,6 +16,7 @@ from cogs.summary import (
     split_segments,
 )
 from cogs.utils import BR_TZ
+from helpers import as_stream
 
 UTC = datetime.timezone.utc
 NOW = datetime.datetime(2026, 9, 24, 15, 0, tzinfo=UTC)  # 12:00 BRT
@@ -93,16 +94,16 @@ class FakeClient:
         self.reduce_answer = reduce_answer
         self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
 
-    async def _create(self, *, model, messages, max_tokens):
+    async def _create(self, *, model, messages, max_tokens, **kwargs):
         self.calls.append(messages)
         if messages[0]['content'].startswith(summary.MAP_SYSTEM_PROMPT[:40]):
             content = f'- notas do trecho ({len(messages[1]["content"])} chars)'
         else:
             content = self.reduce_answer
-        return SimpleNamespace(
+        return as_stream(SimpleNamespace(
             choices=[SimpleNamespace(message=SimpleNamespace(content=content), finish_reason='stop')],
             usage=None,
-        )
+        ))
 
 
 def run(coro):

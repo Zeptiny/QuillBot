@@ -8,7 +8,7 @@ from discord.ext import commands
 from openai import AsyncOpenAI, RateLimitError
 
 from cogs import image_store
-from cogs.utils import PaginatedEmbedView, _usage_summary, split_response
+from cogs.utils import PaginatedEmbedView, _usage_summary, create_chat_completion, split_response
 from config import (
     CHAT_MODEL,
     COOLDOWN_PER,
@@ -391,7 +391,8 @@ class LogAnalyzer(commands.Cog):
         else:
             messages.append({'role': 'user', 'content': user_parts[0]['text']})
 
-        response = await self.ai_client.chat.completions.create(
+        response = await create_chat_completion(
+            self.ai_client,
             model=CHAT_MODEL,
             messages=messages,
             max_tokens=1500,

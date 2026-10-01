@@ -23,7 +23,7 @@ from cogs.conversation_store import (
 )
 from cogs.utils import SQL_HISTORY_TOOL, extract_text_tool_calls, run_tool_loop, serialize_trajectory
 
-from helpers import check
+from helpers import as_stream, check
 
 
 def fake_assistant(content=None, tool_calls=None, reasoning='chain-of-thought'):
@@ -274,7 +274,7 @@ class _FakeCompletions:
 
     async def create(self, **kwargs):
         self.calls.append(kwargs)
-        return self._responses.pop(0)
+        return as_stream(self._responses.pop(0))
 
 
 def _fake_client(responses):
