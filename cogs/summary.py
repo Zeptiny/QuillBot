@@ -42,6 +42,7 @@ from openai import AsyncOpenAI, RateLimitError
 from cogs.utils import (
     BR_TZ,
     _usage_summary,
+    create_chat_completion,
     format_message_line,
     message_content_text,
     truncate_safe,
@@ -449,8 +450,8 @@ class Summarizer:
             {'role': 'system', 'content': system},
             {'role': 'user', 'content': user},
         ]
-        response = await self.client.chat.completions.create(
-            model=self.model, messages=messages, max_tokens=LLM_MAX_TOKENS,
+        response = await create_chat_completion(
+            self.client, model=self.model, messages=messages, max_tokens=LLM_MAX_TOKENS,
         )
         answer = response.choices[0].message.content or ''
         logger.debug('Summary completion usage=[%s]', _usage_summary(response))
@@ -467,8 +468,8 @@ class Summarizer:
                 'role': 'user',
                 'content': user + '\n\nResponda agora, direto e conciso, no formato pedido.',
             }
-            response = await self.client.chat.completions.create(
-                model=self.model, messages=messages, max_tokens=LLM_MAX_TOKENS,
+            response = await create_chat_completion(
+                self.client, model=self.model, messages=messages, max_tokens=LLM_MAX_TOKENS,
             )
             answer = response.choices[0].message.content or ''
         return answer.strip()

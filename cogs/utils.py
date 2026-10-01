@@ -1115,6 +1115,97 @@ def _cached_tokens(usage: Any) -> int | None:
     return cached
 
 
+async def create_chat_completion(client: Any, **kwargs: Any) -> Any:
+    """``client.chat.completions.create`` over a stream, returned as one completion.
+
+    Some providers behind the gateway (e.g. zai) reject non-streaming chat
+    completions with ``streaming_only``, so every call streams and the chunks
+    are folded back into a ``ChatCompletion``-shaped object: callers keep
+    reading ``response.choices[0].message`` / ``finish_reason`` / ``usage``.
+    The request parameters (``messages`` included) are passed through as given,
+    so the prompt prefix the provider caches is unchanged.
+
+    The assembled message carries only what the stream delivered (role,
+    content, tool calls, plus any provider string extras such as
+    ``reasoning_content``), and it is a real ``ChatCompletionMessage`` so it
+    can be appended to ``messages`` and replayed like before.
+    """
+    from openai.types.chat import ChatCompletion, ChatCompletionMessage
+    from openai.types.chat.chat_completion import Choice
+
+    stream = await client.chat.completions.create(
+        **kwargs, stream=True, stream_options={'include_usage': True},
+    )
+    content: list[str] = []
+    extras: dict[str, list[str]] = {}
+    calls: dict[int, dict] = {}
+    finish_reason = None
+    usage = None
+    meta: dict[str, Any] = {}
+    try:
+        async for chunk in stream:
+            for key in ('id', 'model', 'created'):
+                if not meta.get(key) and _get(chunk, key, None):
+                    meta[key] = _get(chunk, key)
+            if _get(chunk, 'usage', None) is not None:
+                usage = chunk.usage
+            for choice in _get(chunk, 'choices', None) or []:
+                if _get(choice, 'index', 0):
+                    continue  # only n=1 is ever requested
+                if _get(choice, 'finish_reason', None):
+                    finish_reason = choice.finish_reason
+                delta = _get(choice, 'delta', None)
+                if delta is None:
+                    continue
+                if _get(delta, 'content', None):
+                    content.append(delta.content)
+                for key, value in (getattr(delta, 'model_extra', None) or {}).items():
+                    if isinstance(value, str) and value:
+                        extras.setdefault(key, []).append(value)
+                for tc in _get(delta, 'tool_calls', None) or []:
+                    index = _get(tc, 'index', None)
+                    if index is None:  # some providers send whole calls without an index
+                        index = len(calls)
+                    call = calls.setdefault(index, {'id': None, 'name': '', 'arguments': ''})
+                    if _get(tc, 'id', None):
+                        call['id'] = tc.id
+                    fn = _get(tc, 'function', None)
+                    if fn is not None:
+                        if _get(fn, 'name', None):
+                            call['name'] += fn.name
+                        if _get(fn, 'arguments', None):
+                            call['arguments'] += fn.arguments
+    finally:
+        close = getattr(stream, 'close', None) or getattr(stream, 'aclose', None)
+        if close is not None:
+            await close()
+
+    message_fields: dict[str, Any] = {
+        'role': 'assistant',
+        'content': ''.join(content) if content else None,
+    }
+    if calls:
+        message_fields['tool_calls'] = [
+            {
+                'id': call['id'] or f'call_{uuid.uuid4().hex[:24]}',
+                'type': 'function',
+                'function': {'name': call['name'], 'arguments': call['arguments']},
+            }
+            for _, call in sorted(calls.items())
+        ]
+    for key, parts in extras.items():
+        message_fields.setdefault(key, ''.join(parts))
+    message = ChatCompletionMessage(**message_fields)
+    return ChatCompletion.model_construct(
+        id=meta.get('id') or '',
+        object='chat.completion',
+        created=meta.get('created') or 0,
+        model=meta.get('model') or kwargs.get('model') or '',
+        choices=[Choice.model_construct(index=0, finish_reason=finish_reason, message=message)],
+        usage=usage,
+    )
+
+
 def _usage_summary(response: Any) -> str:
     """Format token usage (incl. cached prefix tokens) for log lines."""
     usage = _get(response, 'usage', None)
@@ -1351,7 +1442,8 @@ async def run_tool_loop(
 
     for round_num in range(1, max_rounds + 1):
         rounds_used = round_num
-        response = await client.chat.completions.create(
+        response = await create_chat_completion(
+            client,
             model=model,
             messages=messages,
             max_tokens=LLM_MAX_TOKENS,
@@ -1482,7 +1574,8 @@ async def run_tool_loop(
             max_rounds,
             finish_reasons,
         )
-        response = await client.chat.completions.create(
+        response = await create_chat_completion(
+            client,
             model=model,
             messages=messages,
             max_tokens=LLM_MAX_TOKENS,
@@ -1512,7 +1605,8 @@ async def run_tool_loop(
                 'usar nenhuma ferramenta. Use apenas as informações já coletadas.'
             ),
         })
-        response = await client.chat.completions.create(
+        response = await create_chat_completion(
+            client,
             model=model,
             messages=messages,
             max_tokens=LLM_MAX_TOKENS,

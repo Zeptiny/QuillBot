@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 from cogs.utils import run_tool_loop
 
-from helpers import check
+from helpers import as_stream, check
 
 
 class _Completions:
@@ -15,7 +15,7 @@ class _Completions:
 
     async def create(self, **kwargs):
         self.calls.append([dict(m) if isinstance(m, dict) else m for m in kwargs['messages']])
-        return self._responses.pop(0)
+        return as_stream(self._responses.pop(0))
 
 
 def _response(content=None, tool_calls=None):

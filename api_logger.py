@@ -8,7 +8,9 @@ as one JSON line to a rotating file. An inbound listener logs every Discord
 interaction (slash commands, buttons, modals, autocomplete).
 
 Request/response bodies are captured only for services listed in
-``API_REQUEST_LOG_BODY`` (httpx-based services: openai, tavily). Headers and
+``API_REQUEST_LOG_BODY`` (httpx-based services: openai, tavily); a streamed
+chat completion is logged when its stream closes, folded into one response
+value instead of its raw chunks. Headers and
 authorization credentials are never logged; sensitive query-string values
 are redacted.
 """
@@ -20,6 +22,7 @@ import logging.handlers
 import os
 import re
 import time
+from collections.abc import Callable
 from typing import Any, Final
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -186,18 +189,102 @@ async def _patched_aiohttp_request(
 async def _patched_httpx_send(
     self: httpx.AsyncClient, request: httpx.Request, **kwargs: Any
 ) -> httpx.Response:
-    return await _logged_httpx_send(_ORIG_HTTPX_SEND, self, request, **kwargs)
+    return await _logged_httpx_send(_ORIG_HTTPX_SEND, httpx, self, request, **kwargs)
 
 
 async def _patched_httpx2_send(self: Any, request: Any, **kwargs: Any) -> Any:
-    return await _logged_httpx_send(_ORIG_HTTPX2_SEND, self, request, **kwargs)
+    return await _logged_httpx_send(_ORIG_HTTPX2_SEND, httpx2, self, request, **kwargs)
 
 
-async def _logged_httpx_send(orig: Any, self: Any, request: Any, **kwargs: Any) -> Any:
+def _fold_sse(raw: bytes) -> Any:
+    """Fold a streamed chat completion (SSE) into one compact log value.
+
+    Logging every ``data:`` chunk would bury the answer in hundreds of
+    one-token deltas, so string delta fields (``content``, ``reasoning_content``
+    …) are concatenated, tool calls are merged by index, and the last
+    ``finish_reason``/``usage`` win. A body that isn't SSE (an error answered
+    as plain JSON) is logged as is.
+    """
+    text = raw.decode('utf-8', 'replace')
+    chunks = 0
+    folded: dict[str, Any] = {}
+    deltas: dict[str, str] = {}
+    calls: dict[int, dict[str, str]] = {}
+    for line in text.splitlines():
+        if not line.startswith('data:'):
+            continue
+        data = line[5:].strip()
+        if not data or data == '[DONE]':
+            continue
+        try:
+            chunk = json.loads(data)
+        except ValueError:
+            continue
+        if not isinstance(chunk, dict):
+            continue
+        chunks += 1
+        for key in ('id', 'model'):
+            if chunk.get(key) and key not in folded:
+                folded[key] = chunk[key]
+        for key in ('usage', 'error'):
+            if chunk.get(key):
+                folded[key] = chunk[key]
+        for choice in chunk.get('choices') or []:
+            if not isinstance(choice, dict):
+                continue
+            if choice.get('finish_reason'):
+                folded['finish_reason'] = choice['finish_reason']
+            delta = choice.get('delta') or {}
+            for key, value in delta.items():
+                if isinstance(value, str) and key != 'role':
+                    deltas[key] = deltas.get(key, '') + value
+            for i, tc in enumerate(delta.get('tool_calls') or []):
+                if not isinstance(tc, dict):
+                    continue
+                call = calls.setdefault(tc.get('index', i), {'id': '', 'name': '', 'arguments': ''})
+                call['id'] = call['id'] or tc.get('id') or ''
+                fn = tc.get('function') or {}
+                call['name'] += fn.get('name') or ''
+                call['arguments'] += fn.get('arguments') or ''
+    if not chunks:
+        return _body_value(raw)
+    folded['stream_chunks'] = chunks
+    for key, value in deltas.items():
+        folded[key] = _body_value(value) if len(value) > API_REQUEST_LOG_BODY_MAX_CHARS else value
+    if calls:
+        folded['tool_calls'] = [calls[k] for k in sorted(calls)]
+    return folded
+
+
+def _tee_stream(module: Any, inner: Any, on_close: Callable[[bytes], None]) -> Any:
+    """Wrap a response byte stream: pass chunks through, hand the body to *on_close*."""
+
+    class _Tee(module.AsyncByteStream):
+        def __init__(self) -> None:
+            self._buf = bytearray()
+            self._done = False
+
+        async def __aiter__(self) -> Any:
+            async for part in inner:
+                self._buf.extend(part)
+                yield part
+
+        async def aclose(self) -> None:
+            try:
+                await inner.aclose()
+            finally:
+                if not self._done:
+                    self._done = True
+                    on_close(bytes(self._buf))
+
+    return _Tee()
+
+
+async def _logged_httpx_send(orig: Any, module: Any, self: Any, request: Any, **kwargs: Any) -> Any:
     """Shared by httpx and httpx2 (same Request/Response API)."""
     url = str(request.url)
     service = _service(url)
-    capture = _should_capture(service) and not kwargs.get('stream')
+    capture = _should_capture(service)
     start = time.monotonic()
     raw_request_body: bytes | None = None
     if capture:
@@ -225,12 +312,29 @@ async def _logged_httpx_send(orig: Any, self: Any, request: Any, **kwargs: Any) 
         'status': response.status_code,
         'duration_ms': round((time.monotonic() - start) * 1000, 1),
     }
+    if capture and raw_request_body is not None:
+        request_body = _body_value(raw_request_body)
+        record['request_body'] = request_body
+        if isinstance(request_body, dict) and isinstance(request_body.get('model'), str):
+            record['model'] = request_body['model']
+    if capture and kwargs.get('stream'):
+        # A streamed body can't be read here without consuming it for the
+        # caller: tee it and write the line once the caller closes the
+        # response (the SDK does when the stream ends or errors).
+        def finish(body: bytes) -> None:
+            record['duration_ms'] = round((time.monotonic() - start) * 1000, 1)
+            try:
+                record['response_body'] = _fold_sse(body)
+            except Exception:
+                record['response_body'] = None
+            _emit(record)
+
+        try:
+            response.stream = _tee_stream(module, response.stream, finish)
+        except Exception:
+            _emit(record)
+        return response
     if capture:
-        if raw_request_body is not None:
-            request_body = _body_value(raw_request_body)
-            record['request_body'] = request_body
-            if isinstance(request_body, dict) and isinstance(request_body.get('model'), str):
-                record['model'] = request_body['model']
         try:
             record['response_body'] = _body_value(await response.aread())
         except Exception:
