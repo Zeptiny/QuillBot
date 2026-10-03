@@ -25,6 +25,7 @@ from config import (
     CONVERSATIONS_GAP_MESSAGES,
     HISTORY_SQL_TOOL_ENABLED,
     LLM_MAX_TOKENS,
+    chat_priority_extra_body,
 )
 
 logger = logging.getLogger(__name__)
@@ -1129,10 +1130,17 @@ async def create_chat_completion(client: Any, **kwargs: Any) -> Any:
     content, tool calls, plus any provider string extras such as
     ``reasoning_content``), and it is a real ``ChatCompletionMessage`` so it
     can be appended to ``messages`` and replayed like before.
+
+    Unless the caller passed its own ``extra_body``, the Merge Gateway vendor
+    priority (``config.chat_priority_extra_body``) is attached when the base
+    URL points at merge.dev.
     """
     from openai.types.chat import ChatCompletion, ChatCompletionMessage
     from openai.types.chat.chat_completion import Choice
 
+    priority_extra = chat_priority_extra_body(str(kwargs.get('model') or ''))
+    if priority_extra is not None:
+        kwargs.setdefault('extra_body', priority_extra)
     stream = await client.chat.completions.create(
         **kwargs, stream=True, stream_options={'include_usage': True},
     )

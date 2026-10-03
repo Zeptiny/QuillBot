@@ -38,6 +38,33 @@ SPARK_MODEL: Final[str] = os.getenv('SPARK_MODEL', 'google/gemini-2.5-pro')
 EMBEDDING_MODEL: Final[str] = os.getenv('EMBEDDING_MODEL', 'qwen/qwen3-embedding-8b')
 RERANK_MODEL: Final[str] = os.getenv('RERANK_MODEL', 'cohere/rerank-4-fast')
 
+# --- Merge Gateway vendor priority ---
+# When OPENAI_BASE_URL points at the Merge Gateway (merge.dev), chat completions
+# carry an inline `priority_order` (docs.merge.dev/merge-gateway/routing/
+# using-policies) so the gateway tries those vendors in order — failing over on
+# throttles, outages and timeouts — instead of its own vendor selection.
+# Comma-separated vendor slugs, highest priority first; empty disables.
+IS_MERGE_GATEWAY: Final[bool] = 'merge.dev' in OPENAI_BASE_URL
+MERGE_PRIORITY_ORDER: Final[tuple[str, ...]] = tuple(
+    v.strip()
+    for v in os.getenv('MERGE_PRIORITY_ORDER', 'particle,wafer,fireworks,modal,zai').split(',')
+    if v.strip()
+)
+
+
+def chat_priority_extra_body(model: str) -> dict | None:
+    """`extra_body` routing `model` through the configured Merge vendor priority.
+
+    Returns None unless the base URL points at the Merge Gateway and a priority
+    order is set; callers pass the result straight into
+    ``chat.completions.create(..., extra_body=...)``. The single entry means
+    "try these vendors, in order, for `model`", and the top-level `model` is
+    already equal to it, as the gateway requires on compatible endpoints.
+    """
+    if not IS_MERGE_GATEWAY or not MERGE_PRIORITY_ORDER:
+        return None
+    return {'priority_order': [{'model': model, 'vendors': list(MERGE_PRIORITY_ORDER)}]}
+
 # --- Embeddings (local vs remote) ---
 EMBEDDING_PROVIDER: Final[str] = os.getenv('EMBEDDING_PROVIDER', 'openai').strip().lower()
 LOCAL_EMBEDDING_MODEL: Final[str] = os.getenv(
