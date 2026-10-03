@@ -31,6 +31,9 @@ LLM_BASE_URL: Final[str] = OPENAI_BASE_URL
 # Reasoning models (GLM, Qwen3, etc.) count hidden reasoning tokens against
 # max_tokens; keep this high enough that thinking + answer both fit.
 LLM_MAX_TOKENS: Final[int] = int(os.getenv('LLM_MAX_TOKENS', '8192'))
+# Reasoning effort sent on every chat completion (minimal | low | medium | high).
+# Empty omits the parameter — providers/models that don't accept it 400 otherwise.
+LLM_REASONING_EFFORT: Final[str] = os.getenv('LLM_REASONING_EFFORT', '').strip().lower()
 
 # --- AI Models ---
 CHAT_MODEL: Final[str] = os.getenv('CHAT_MODEL', 'qwen/qwen3.6-plus')

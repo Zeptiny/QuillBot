@@ -25,6 +25,7 @@ from config import (
     CONVERSATIONS_GAP_MESSAGES,
     HISTORY_SQL_TOOL_ENABLED,
     LLM_MAX_TOKENS,
+    LLM_REASONING_EFFORT,
     chat_priority_extra_body,
 )
 
@@ -1133,7 +1134,9 @@ async def create_chat_completion(client: Any, **kwargs: Any) -> Any:
 
     Unless the caller passed its own ``extra_body``, the Merge Gateway vendor
     priority (``config.chat_priority_extra_body``) is attached when the base
-    URL points at merge.dev.
+    URL points at merge.dev. Likewise the configured ``reasoning_effort``
+    (``config.LLM_REASONING_EFFORT``) is sent unless the caller passed its own;
+    empty omits the parameter entirely.
     """
     from openai.types.chat import ChatCompletion, ChatCompletionMessage
     from openai.types.chat.chat_completion import Choice
@@ -1141,6 +1144,8 @@ async def create_chat_completion(client: Any, **kwargs: Any) -> Any:
     priority_extra = chat_priority_extra_body(str(kwargs.get('model') or ''))
     if priority_extra is not None:
         kwargs.setdefault('extra_body', priority_extra)
+    if LLM_REASONING_EFFORT:
+        kwargs.setdefault('reasoning_effort', LLM_REASONING_EFFORT)
     stream = await client.chat.completions.create(
         **kwargs, stream=True, stream_options={'include_usage': True},
     )
