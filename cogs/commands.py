@@ -56,6 +56,7 @@ from cogs.utils import (
     ping_send_kwargs,
     run_tool_loop,
     split_response,
+    strip_bot_mention,
 )
 from config import (
     CHANNEL_CONTEXT_MESSAGES,
@@ -1028,7 +1029,7 @@ class Commands(commands.Cog):
         # Strip bot mention to get clean question
         clean_question = message.content
         if self.bot.user:
-            clean_question = re.sub(rf'<@!?{self.bot.user.id}>', '', clean_question)
+            clean_question = strip_bot_mention(clean_question, self.bot.user, message.guild)
         # Also strip any extra mention artifacts and whitespace
         clean_question = re.sub(r'\s+', ' ', clean_question).strip()
         clean_question = message_media.question_with_media(clean_question, message)
@@ -1113,7 +1114,7 @@ class Commands(commands.Cog):
         self._followup_cd[user_id] = True
         follow_up_question = message.content.strip()
         if self.bot.user:
-            follow_up_question = re.sub(rf'<@!?{self.bot.user.id}>', '', follow_up_question)
+            follow_up_question = strip_bot_mention(follow_up_question, self.bot.user, message.guild)
             follow_up_question = re.sub(r'\s+', ' ', follow_up_question).strip()
         if not follow_up_question and not message.attachments and not ref_context:
             return
@@ -1232,7 +1233,7 @@ class Commands(commands.Cog):
         # if the user had replied to the bot's latest message in the window.
         # A reply to someone else's message joins it too, with that message as context.
         if CHAT_MENTION_CONTINUE_ENABLED:
-            typed = re.sub(rf'<@!?{self.bot.user.id}>', '', message.content).strip()
+            typed = strip_bot_mention(message.content, self.bot.user, message.guild).strip()
             ref_id = message.reference.message_id if message.reference else None
             if typed or message.attachments or ref_id:
                 recent = await find_recent_conversation(

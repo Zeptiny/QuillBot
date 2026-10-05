@@ -18,6 +18,7 @@ def msg(mid, author_id, content='', *, reference=None):
         reference=reference,
         attachments=[],
         mentions=[],
+        guild=None,
     )
 
 
