@@ -3,7 +3,7 @@ from types import SimpleNamespace as NS
 
 import pytest
 
-from cogs.utils import extract_pingable_mentions
+from cogs.utils import extract_pingable_mentions, strip_bot_mention
 
 
 class FakeGuild:
@@ -50,3 +50,26 @@ def test_extract_pingable_mentions(text, guild, expected):
 def test_limit():
     r = extract_pingable_mentions('@nyuu @joao @John Doe', g, limit=2)
     assert r == '<@111111111111111111> <@333333333333333333>'
+
+
+BOT = NS(id=900000000000000001, display_name='Quill')
+BOT_GUILD = NS(me=NS(display_name='Quill Nick'))
+BM = '<@900000000000000001>'
+
+STRIP_CASES = [
+    # addressing mentions are dropped
+    (f'{BM} como otimizar?', None, 'como otimizar?'),
+    (f'<@!900000000000000001>, como otimizar?', None, 'como otimizar?'),
+    (f'como otimizar? {BM}', None, 'como otimizar?'),
+    (BM, None, ''),
+    # in-sentence mentions keep their place as @name (the reported bug)
+    (f'Tbm pode usar o {BM}, mas seria menos prático', None, 'Tbm pode usar o @Quill, mas seria menos prático'),
+    (f'pode usar o {BM}', None, 'pode usar o @Quill'),
+    (f'{BM} e o {BM}?', None, 'e o @Quill?'),
+    (f'Tbm pode usar o {BM}', BOT_GUILD, 'Tbm pode usar o @Quill Nick'),
+]
+
+
+@pytest.mark.parametrize('text, guild, expected', STRIP_CASES)
+def test_strip_bot_mention(text, guild, expected):
+    assert strip_bot_mention(text, BOT, guild).strip() == expected

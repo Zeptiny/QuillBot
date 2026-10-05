@@ -45,6 +45,21 @@ _AT_MENTION_RE = re.compile(r'(?<![\w@])@([\w][\w.\-]{0,31})')
 _PING_BLACKLIST = {'here', 'everyone', 'all', 'todos', 'todo'}
 
 
+def strip_bot_mention(text: str, bot_user: discord.abc.User, guild: discord.Guild | None = None) -> str:
+    """Remove the bot's *addressing* mention from *text*, keeping in-sentence ones.
+
+    A leading mention ("@Bot como...") and a trailing one that follows a
+    sentence end ("...? @Bot") only address the bot and are dropped. Any other
+    mention is part of the sentence ("pode usar o @Bot") and becomes
+    ``@<name>`` so the model still sees the word instead of a hole.
+    """
+    mention = rf'<@!?{bot_user.id}>'
+    text = re.sub(rf'\A\s*(?:{mention}[\s,;:]*)+', '', text)
+    text = re.sub(rf'(?<=[.!?…,;:])\s*(?:{mention}\s*)+\Z', '', text)
+    name = (guild.me.display_name if guild and guild.me else None) or bot_user.display_name
+    return re.sub(mention, f'@{name}', text)
+
+
 def _norm_name(text: str) -> str:
     text = unicodedata.normalize('NFKD', text or '')
     text = ''.join(c for c in text if not unicodedata.combining(c))

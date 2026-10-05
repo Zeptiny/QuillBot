@@ -42,7 +42,7 @@ from cogs.spark_parser import (
     build_detail as _spark_build_detail,
     build_summary as _spark_build_summary,
 )
-from cogs.utils import PaginatedEmbedView, build_source_pages, run_tool_loop, split_response
+from cogs.utils import PaginatedEmbedView, build_source_pages, run_tool_loop, split_response, strip_bot_mention
 from cogs.utils import (
     CHANNEL_HISTORY_TOOL as _CHANNEL_HISTORY_TOOL,
     COUNT_MENTIONS_TOOL as _COUNT_MENTIONS_TOOL,
@@ -1586,7 +1586,7 @@ class DocsRAG(commands.Cog):
 
         follow_up_question = message.content.strip()
         if self.bot.user:
-            follow_up_question = re.sub(rf'<@!?{self.bot.user.id}>', '', follow_up_question)
+            follow_up_question = strip_bot_mention(follow_up_question, self.bot.user, message.guild)
             follow_up_question = re.sub(r'\s+', ' ', follow_up_question).strip()
         if not follow_up_question and not message.attachments:
             return
