@@ -53,6 +53,7 @@ from cogs.utils import (
     SEARCH_HISTORY_TOOL as _SEARCH_HISTORY_TOOL,
     SQL_HISTORY_TOOL as _SQL_HISTORY_TOOL,
     build_full_context_block as _build_full_context_block,
+    build_identity_block as _build_identity_block,
     exec_history_tool as _exec_history_tool,
     fetch_recent_channel_context as _fetch_recent_channel_context,
     fetch_turn_gap as _fetch_turn_gap,
@@ -1301,6 +1302,9 @@ class DocsRAG(commands.Cog):
                     'Não sugira otimizações gerais de desempenho como resposta primária.\n'
                     '</lag_spike_warning>'
                 )
+        identity = _build_identity_block(self.bot.user, guild)
+        if identity:
+            system_content += '\n\n' + identity
         history = history or []
         if history:
             # Full history (not the replay window): the block must only change

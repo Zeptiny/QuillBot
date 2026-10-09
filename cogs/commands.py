@@ -46,6 +46,7 @@ from cogs.utils import (
     SEARCH_HISTORY_TOOL,
     SQL_HISTORY_TOOL,
     build_full_context_block,
+    build_identity_block,
     build_source_pages,
     build_temporal_context,
     build_user_context,
@@ -728,6 +729,11 @@ class Commands(commands.Cog):
         # a conversation, while per-request blocks (clock/context, memory
         # selection, recent channel window) ride on the final user message.
         system_content = GENERAL_SYSTEM_PROMPT
+        identity = build_identity_block(
+            self.bot.user, guild or (interaction.guild if interaction else None),
+        )
+        if identity:
+            system_content += '\n\n' + identity
         history = history or []
         if history:
             # Built from the FULL history (not the replay window) so it only
