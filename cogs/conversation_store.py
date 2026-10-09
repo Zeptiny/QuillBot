@@ -710,7 +710,7 @@ def build_conversation_block(history: list[dict]) -> str:
         lines.append(f'Canal atual da conversa: channel_id={last_channel_id} (use com get_message_context).')
     lines.extend([
         'Cada mensagem de usuário traz, logo acima do texto, a marca [Por Autor (@usuário) • author_id=… • data hora] —',
-        'use essas marcas para saber quem perguntou o quê, e de qual resposta do bot.',
+        'use essas marcas para saber quem perguntou o quê, e a qual resposta SUA (do bot) se referem.',
         'A mensagem a que você deve responder agora é sempre a ÚLTIMA mensagem de usuário; as anteriores são histórico.',
         'Cada mensagem pode trazer seus próprios blocos <contexto> e <memory>: eles descrevem o momento em que AQUELA',
         'mensagem foi enviada (autor, horário, memórias da época). Se blocos de mensagens diferentes divergirem,',
@@ -719,7 +719,7 @@ def build_conversation_block(history: list[dict]) -> str:
         'correlacione-as para saber quem disse o quê na conversa do canal.',
         f'Blocos "[{PRIOR_CONTEXT_HEADER}]" trazem a conversa do canal',
         'que aconteceu entre as perguntas direcionadas ao bot.',
-        'Nos blocos de mensagens do canal, respostas do bot e perguntas já registradas como '
+        'Nos blocos de mensagens do canal, as suas respostas (do bot) e perguntas já registradas como '
         'turnos são omitidas; use get_channel_history para vê-las.',
         '</conversa_em_andamento>',
     ])

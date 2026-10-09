@@ -60,6 +60,40 @@ def strip_bot_mention(text: str, bot_user: discord.abc.User, guild: discord.Guil
     return re.sub(mention, f'@{name}', text)
 
 
+def build_identity_block(bot_user: discord.abc.User | None, guild: discord.Guild | None = None) -> str:
+    """System-prompt block telling the model who *it* is and where it is.
+
+    Without it the bot's own earlier replies show up in channel context as a
+    third-party ``Nome (@handle) <author_id=…>`` line and ``@<nome>`` in a
+    question reads like another participant.  Only stable fields (no member
+    counts, no clock) so the system prompt stays prefix-cacheable.
+    """
+    if bot_user is None:
+        return ''
+    name = (guild.me.display_name if guild and guild.me else None) or bot_user.display_name
+    handle = getattr(bot_user, 'name', None)
+    who = f'{name} (@{handle})' if handle and handle != name else name
+    lines = [
+        '<identidade>',
+        f'Você é o bot do Discord "{who}", id={bot_user.id}. Quando alguém diz "{name}" ou "@{name}", '
+        f'ou menciona <@{bot_user.id}>, está falando com você ou sobre você.',
+        f'Mensagens com author_id={bot_user.id} (nos blocos de mensagens do canal e no histórico) '
+        'são SUAS respostas anteriores — não as trate como de outro usuário ou outro bot.',
+    ]
+    if guild is not None:
+        lines.append(f'Servidor atual: {guild.name} (id={guild.id}).')
+        description = _clip(_flatten(getattr(guild, 'description', None) or ''), 300)
+        if description:
+            lines.append(f'Descrição do servidor: {description}')
+        owner_id = getattr(guild, 'owner_id', None)
+        if owner_id:
+            lines.append(f'Dono do servidor: <@{owner_id}> (id={owner_id}).')
+    else:
+        lines.append('Conversa em mensagem direta (sem servidor).')
+    lines.append('</identidade>')
+    return '\n'.join(lines)
+
+
 def _norm_name(text: str) -> str:
     text = unicodedata.normalize('NFKD', text or '')
     text = ''.join(c for c in text if not unicodedata.combining(c))
