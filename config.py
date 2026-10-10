@@ -68,6 +68,23 @@ def chat_priority_extra_body(model: str) -> dict | None:
         return None
     return {'priority_order': [{'model': model, 'vendors': list(MERGE_PRIORITY_ORDER)}]}
 
+
+# --- Prompt-cache breakpoints ---
+# Explicit `cache_control` markers on message parts let OpenRouter and the Merge
+# Gateway cache prompt prefixes for Anthropic/Gemini models. Strict
+# OpenAI-compatible APIs (e.g. Mistral) reject the unknown field with a 422, so
+# `auto` sends them only to those two gateways; true/false forces it either way.
+def _cache_control_enabled(setting: str, base_url: str) -> bool:
+    setting = setting.strip().lower()
+    if setting in ('', 'auto'):
+        return 'openrouter.ai' in base_url or 'merge.dev' in base_url
+    return setting in ('1', 'true', 'yes')
+
+
+LLM_CACHE_CONTROL: Final[bool] = _cache_control_enabled(
+    os.getenv('LLM_CACHE_CONTROL', 'auto'), OPENAI_BASE_URL,
+)
+
 # --- Embeddings (local vs remote) ---
 EMBEDDING_PROVIDER: Final[str] = os.getenv('EMBEDDING_PROVIDER', 'openai').strip().lower()
 LOCAL_EMBEDDING_MODEL: Final[str] = os.getenv(

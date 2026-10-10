@@ -364,6 +364,7 @@ cp .env.example .env   # if available, otherwise create .env manually
 | `CHAT_MODEL` | `qwen/qwen3.6-plus` | Used for `/ask`, `/chat`, `/analyze` |
 | `LLM_MAX_TOKENS` | `8192` | Max completion tokens for the tool loop. Reasoning models count thinking tokens against this |
 | `LLM_REASONING_EFFORT` | *(unset)* | Reasoning effort sent on every chat completion: `minimal`, `low`, `medium` or `high`. Unset omits the parameter entirely (providers/models that don't accept it reject the request) |
+| `LLM_CACHE_CONTROL` | `auto` | Explicit `cache_control` prompt-cache breakpoints on the system prompt and conversation tail. `auto` sends them only when `OPENAI_BASE_URL` is OpenRouter or the Merge Gateway (they forward them to Anthropic/Gemini); strict providers such as Mistral reject the field with a 422. `true`/`false` forces it on or off |
 | `MERGE_PRIORITY_ORDER` | `particle,wafer,fireworks,modal,zai` | When `OPENAI_BASE_URL` points at the Merge Gateway (merge.dev), every chat completion carries an inline `priority_order` so the gateway tries these vendors in order (failing over on throttles, outages and timeouts). Comma-separated vendor slugs, highest priority first; empty disables |
 | `SPARK_MODEL` | `google/gemini-2.5-pro` | Used only during active Spark sessions |
 | `EMBEDDING_MODEL` | `qwen/qwen3-embedding-8b` | Doc/history embedding model |
