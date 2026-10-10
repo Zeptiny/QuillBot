@@ -779,9 +779,9 @@ class Commands(commands.Cog):
                     context_images.extend(chan_ctx.images)
             except Exception:
                 logger.exception('Failed to build recent channel context')
-        # Content-array format with an explicit cache_control breakpoint
-        # (Anthropic/Gemini via OpenRouter); OpenAI-compatible endpoints ignore
-        # the extra field. Same layout DocsRAG already uses.
+        # Explicit cache_control breakpoint (Anthropic/Gemini via OpenRouter or
+        # the Merge Gateway); omitted for other providers, which may reject the
+        # field (see LLM_CACHE_CONTROL). Same layout DocsRAG uses.
         messages: list[dict] = [apply_cache_control({'role': 'system', 'content': system_content})]
 
         if history:

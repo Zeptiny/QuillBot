@@ -1350,22 +1350,10 @@ class DocsRAG(commands.Cog):
             except Exception:
                 logger.exception('Failed to build recent channel context for _run_agent')
 
-        messages: list[dict] = [
-            {
-                'role': 'system',
-                # Content-array format enables per-message cache_control breakpoints
-                # supported by both Gemini (SPARK_MODEL) and Anthropic providers via
-                # OpenRouter. The breakpoint is placed after the full system prompt so
-                # the entire static instruction block is cached (5-min TTL by default).
-                'content': [
-                    {
-                        'type': 'text',
-                        'text': system_content,
-                        'cache_control': {'type': 'ephemeral'},
-                    }
-                ],
-            }
-        ]
+        # Cache breakpoint after the full system prompt so the entire static
+        # instruction block is cached (Gemini/Anthropic via OpenRouter or the
+        # Merge Gateway; omitted elsewhere, see LLM_CACHE_CONTROL).
+        messages: list[dict] = [_apply_cache_control({'role': 'system', 'content': system_content})]
 
         # Inject user/guild/channel/temporal awareness ---------------------------
         # This block carries the current clock, so it rides on the final user
@@ -1386,18 +1374,9 @@ class DocsRAG(commands.Cog):
                 '[Relatório Spark carregado]\n\n'
                 + _spark_build_summary(spark_report)
             )
-            messages.append({
-                'role': 'user',
-                # Cache the report summary so the agentic tool-call loop reuses
-                # it from cache on every subsequent round without re-billing.
-                'content': [
-                    {
-                        'type': 'text',
-                        'text': summary_text,
-                        'cache_control': {'type': 'ephemeral'},
-                    }
-                ],
-            })
+            # Cache the report summary so the agentic tool-call loop reuses
+            # it from cache on every subsequent round without re-billing.
+            messages.append(_apply_cache_control({'role': 'user', 'content': summary_text}))
             messages.append({
                 'role': 'assistant',
                 'content': (

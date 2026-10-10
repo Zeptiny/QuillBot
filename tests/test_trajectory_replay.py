@@ -259,12 +259,20 @@ def test_verbatim_image_budget():
 def test_apply_cache_control():
     """apply_cache_control."""
     msg = {'role': 'user', 'content': 'hello'}
-    marked = apply_cache_control(msg)
+    marked = apply_cache_control(msg, enabled=True)
     check('str wrapped with breakpoint', marked['content'][-1]['cache_control'] == {'type': 'ephemeral'})
     check('original untouched', msg['content'] == 'hello')
-    check('idempotent', apply_cache_control(marked) == marked)
+    check('idempotent', apply_cache_control(marked, enabled=True) == marked)
     tool_like = {'role': 'assistant', 'content': None, 'tool_calls': []}
-    check('non-text content passthrough', apply_cache_control(tool_like) is tool_like)
+    check('non-text content passthrough', apply_cache_control(tool_like, enabled=True) is tool_like)
+
+
+def test_apply_cache_control_disabled():
+    """Providers that reject cache_control (e.g. Mistral) get the message unchanged."""
+    msg = {'role': 'system', 'content': 'hello'}
+    check('str left as is', apply_cache_control(msg, enabled=False) is msg)
+    parts = {'role': 'user', 'content': [{'type': 'text', 'text': 'hi'}]}
+    check('parts left as is', apply_cache_control(parts, enabled=False) is parts)
 
 
 class _FakeCompletions:

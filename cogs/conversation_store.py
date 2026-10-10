@@ -36,6 +36,7 @@ from config import (
     CONVERSATIONS_TRAJECTORY_MAX_CHARS,
     CONVERSATIONS_TRAJECTORY_STEP,
     CONVERSATIONS_TRAJECTORY_TURNS,
+    LLM_CACHE_CONTROL,
 )
 
 logger = logging.getLogger(__name__)
@@ -81,14 +82,18 @@ def message_text(message: dict | None) -> str:
     return ''
 
 
-def apply_cache_control(message: dict) -> dict:
+def apply_cache_control(message: dict, *, enabled: bool = LLM_CACHE_CONTROL) -> dict:
     """Return a copy of *message* with an ephemeral cache breakpoint on its tail.
 
-    Anthropic/Gemini behind OpenRouter need explicit ``cache_control`` markers
-    to cache a prefix; OpenAI-compatible endpoints ignore the extra field.  The
-    breakpoint is metadata only — it never changes the tokens of the message it
-    marks, so adding/moving it does not invalidate an already-warm cache.
+    Anthropic/Gemini behind OpenRouter or the Merge Gateway need explicit
+    ``cache_control`` markers to cache a prefix.  Strict OpenAI-compatible APIs
+    (e.g. Mistral) reject the unknown field, so when *enabled* is false
+    (``LLM_CACHE_CONTROL``) the message is returned unchanged.  The breakpoint
+    is metadata only — it never changes the tokens of the message it marks, so
+    adding/moving it does not invalidate an already-warm cache.
     """
+    if not enabled:
+        return message
     content = message.get('content')
     if isinstance(content, str):
         return {
