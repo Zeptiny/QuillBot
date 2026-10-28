@@ -70,7 +70,7 @@ General-purpose assistant (same agentic loop as `/ask` but with web search).
 - The thread is opened on the asker's message (for `/chat`, on the command's response) and named after the conversation's first question, or the title the model picked. The channel keeps only that message; the answer goes into the thread and pings the asker, which also adds them to it. Threads archive after `CHAT_THREAD_ARCHIVE_MINUTES` idle
 - A conversation that moved keeps answering in its thread, also when someone continues it from the channel (an archived thread is reopened)
 - Inside a thread the bot opened, every message is for the bot — no mention needed, and an expired conversation just starts a new one there. The model is told the message didn't mention it and may answer `[NO_REPLY]` to stay silent when people are talking among themselves; cooldowns skip those messages quietly instead of posting "⏳ Aguarde"
-- No thread is opened where Discord has none (threads, forum posts, voice-channel chats, DMs) or without the Create Public Threads and Send Messages in Threads permissions; the answer stays in place. `CHAT_THREADS_ENABLED=false` turns all of this off
+- No thread is opened where Discord has none (threads, forum posts, voice-channel chats, DMs) or without the Create Public Threads and Send Messages in Threads permissions; the answer stays in place. A missing permission is logged once per channel (`[threads] cannot open threads in #… the bot lacks …`), and `open_thread` tells the model which one, so it can say so instead of guessing. `CHAT_THREADS_ENABLED=false` turns all of this off
 
 #### `/resumo [canal] [periodo] [foco]`
 Summarize what happened in a channel or thread while you were away.

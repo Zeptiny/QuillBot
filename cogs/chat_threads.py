@@ -42,6 +42,17 @@ _TITLE_MAX = 90  # Discord allows 100
 _MARKUP_RE = re.compile(r'<a?(:\w+:)\d+>|<(?:@[!&]?|#)\d+>')
 _FORMAT_RE = re.compile(r'[*`]|~~|\|\|')
 
+# (Permissions flag, its name in Discord's pt-BR settings) needed to answer in a new thread.
+_THREAD_PERMISSIONS = (
+    ('create_public_threads', '"Criar threads públicas"'),
+    ('send_messages_in_threads', '"Enviar mensagens em threads"'),
+)
+_warned_channels: set[int] = set()  # missing permissions are logged once per channel
+
+# Why an answer can't move: it never does (monitors, scheduled tasks), or it already has a thread.
+ANSWERS_IN_PLACE = 'esta resposta fica no canal'
+HAS_THREAD = 'esta conversa já tem uma thread, e sua resposta vai para ela'
+
 OPEN_THREAD_TOOL = {
     'type': 'function',
     'function': {
@@ -67,16 +78,36 @@ OPEN_THREAD_TOOL = {
 }
 
 
-def can_open_thread(channel: Any) -> bool:
-    """Whether the bot can open a thread for an answer in *channel*.
+def thread_blocker(channel: Any) -> str | None:
+    """Why the bot can't open a thread for an answer in *channel*; ``None`` when it can.
 
     Only text (and announcement) channels have message threads; threads, forum
-    posts, voice-channel chats and DMs answer in place.
+    posts, voice-channel chats and DMs answer in place. The reason is told to
+    the model when it asks for a thread, so it can tell people what's wrong.
     """
-    if not CHAT_THREADS_ENABLED or not isinstance(channel, discord.TextChannel):
-        return False
+    if not CHAT_THREADS_ENABLED:
+        return 'as threads estão desativadas na configuração do bot'
+    if isinstance(channel, discord.Thread):
+        return 'a conversa já está numa thread'
+    if not isinstance(channel, discord.TextChannel):
+        return 'este tipo de canal não tem threads'
     perms = channel.permissions_for(channel.guild.me)
-    return perms.create_public_threads and perms.send_messages_in_threads
+    missing = [(flag, name) for flag, name in _THREAD_PERMISSIONS if not getattr(perms, flag)]
+    if not missing:
+        return None
+    if channel.id not in _warned_channels:
+        _warned_channels.add(channel.id)
+        logger.warning(
+            '[threads] cannot open threads in #%s (%s): the bot lacks %s there',
+            getattr(channel, 'name', '?'), channel.id, ', '.join(flag for flag, _ in missing),
+        )
+    names = ' e '.join(name for _, name in missing)
+    return f'falta ao bot a permissão {names} neste canal (um admin precisa conceder)'
+
+
+def can_open_thread(channel: Any) -> bool:
+    """Whether the bot can open a thread for an answer in *channel*."""
+    return thread_blocker(channel) is None
 
 
 def thread_due(channel: Any, turn: int) -> bool:
@@ -119,20 +150,17 @@ class ThreadRequest:
     """Per-answer executor for ``open_thread``: records the thread the model asked for.
 
     The thread itself is opened once the answer is ready, so a failed or
-    silent run never leaves an empty thread behind. *available* is whether
-    this answer can still go to a new thread.
+    silent run never leaves an empty thread behind. *blocker* is why this
+    answer can't go to a new thread (see ``thread_blocker``), ``None`` when it can.
     """
 
-    def __init__(self, available: bool):
-        self.available = available
+    def __init__(self, blocker: str | None):
+        self.blocker = blocker
         self.title: str | None = None
 
     def __call__(self, args: dict) -> str:
-        if not self.available:
-            return (
-                'Não dá para abrir uma thread aqui (já é uma thread, o canal não permite '
-                'ou a conversa já tem uma). Responda normalmente.'
-            )
+        if self.blocker:
+            return f'Não dá para abrir uma thread aqui: {self.blocker}. Responda normalmente.'
         title = thread_title(str(args.get('title') or ''), '')
         if not title:
             return 'Informe um título curto para a thread.'

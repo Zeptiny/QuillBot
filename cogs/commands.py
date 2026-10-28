@@ -623,7 +623,7 @@ class Commands(commands.Cog):
         )
 
         try:
-            thread_available = chat_threads.can_open_thread(interaction.channel)
+            thread_blocker = chat_threads.thread_blocker(interaction.channel)
             answer, embeds, sources, capture = await self._run_chat(
                 question,
                 image_url=image_url,
@@ -632,11 +632,11 @@ class Commands(commands.Cog):
                 guild=interaction.guild,
                 channel=interaction.channel,
                 created_at=interaction.created_at,
-                thread_available=thread_available,
+                thread_blocker=thread_blocker,
             )
             thread = None
             title = capture.get('thread_title')
-            if thread_available and (title or chat_threads.thread_due(interaction.channel, 1)):
+            if thread_blocker is None and (title or chat_threads.thread_due(interaction.channel, 1)):
                 thread = await self._interaction_thread(
                     interaction,
                     title or chat_threads.thread_title(question, f'Conversa com {interaction.user.display_name}'),
@@ -819,14 +819,15 @@ class Commands(commands.Cog):
         context_message: discord.Message | None = None,
         prior_context: list[str] | None = None,
         context_image_urls: list[str] | None = None,
-        thread_available: bool = False,
+        thread_blocker: str | None = chat_threads.ANSWERS_IN_PLACE,
     ) -> tuple[str, list[discord.Embed], list[dict], dict]:
         """Run one chat answer through the tool loop.
 
-        *thread_available* is whether this answer can still move to a new
-        thread; the ``open_thread`` tool is always offered (a stable tool list
-        keeps the prompt prefix cacheable) but only works then. The title the
-        model asked for comes back as ``capture['thread_title']``.
+        *thread_blocker* is why this answer can't move to a new thread, or
+        ``None`` when it can; the ``open_thread`` tool is always offered (a
+        stable tool list keeps the prompt prefix cacheable) but only works
+        then, and otherwise tells the model why. The title the model asked
+        for comes back as ``capture['thread_title']``.
         """
         # Message layout is ordered for provider prefix caching: the system
         # prompt and replayed history stay byte-identical across follow-ups of
@@ -936,7 +937,7 @@ class Commands(commands.Cog):
         reaction_tool = message_media.ReactionTool(
             fallback_channel, guild=fallback_guild, default_message=context_message,
         )
-        thread_request = chat_threads.ThreadRequest(thread_available)
+        thread_request = chat_threads.ThreadRequest(thread_blocker)
 
         async def _exec(name: str, args: dict) -> tuple[str, list[dict]]:
             if name in ('web_search', 'web_extract'):
@@ -1283,8 +1284,9 @@ class Commands(commands.Cog):
                     context_message=message,
                     prior_context=prior_context,
                     context_image_urls=prior_context_images,
-                    thread_available=(
-                        not data.get('thread_id') and chat_threads.can_open_thread(message.channel)
+                    thread_blocker=(
+                        chat_threads.HAS_THREAD if data.get('thread_id')
+                        else chat_threads.thread_blocker(message.channel)
                     ),
                 )
                 if unprompted and is_silent(answer):
@@ -1439,7 +1441,7 @@ class Commands(commands.Cog):
                     participant_ids={p['id'] for p in participant_infos if p.get('id')},
                     origin=message.jump_url,
                     context_message=message,
-                    thread_available=chat_threads.can_open_thread(message.channel),
+                    thread_blocker=chat_threads.thread_blocker(message.channel),
                 )
                 if unprompted and is_silent(answer):
                     return

@@ -55,17 +55,17 @@ class Guild:
 class TextChannel(discord.TextChannel):
     """A text channel that passes isinstance checks without a gateway."""
 
-    def __init__(self, guild, *, cid=10, can_thread=True):
+    def __init__(self, guild, *, cid=10, can_thread=True, missing=()):
         self.id = cid
         self.name = 'geral'
         self.guild = guild
-        self.can_thread = can_thread
+        self.missing = set(missing) if can_thread else {'create_public_threads', 'send_messages_in_threads'}
         self.messages = []
 
     def permissions_for(self, member):
-        return discord.Permissions(
-            create_public_threads=self.can_thread, send_messages_in_threads=self.can_thread,
-        )
+        return discord.Permissions(**{
+            flag: flag not in self.missing for flag in ('create_public_threads', 'send_messages_in_threads')
+        })
 
     def history(self, *, limit, before=None):
         return history_of(self.messages)(limit=limit, before=before)
@@ -206,16 +206,16 @@ def test_thread_due_on_long_conversations_and_listed_channels(monkeypatch):
 
 
 def test_thread_request_only_records_when_available():
-    req = chat_threads.ThreadRequest(True)
+    req = chat_threads.ThreadRequest(None)
     result = req({'title': 'Receita de **bolo**'})
     check('title recorded without markup', req.title == 'Receita de bolo', req.title)
     check('model told its answer goes there', 'Receita de bolo' in result, result)
-    req = chat_threads.ThreadRequest(True)
+    req = chat_threads.ThreadRequest(None)
     req({'title': '  '})
     check('an empty title is refused', req.title is None)
-    req = chat_threads.ThreadRequest(False)
+    req = chat_threads.ThreadRequest('a conversa já está numa thread')
     result = req({'title': 'x'})
-    check('unavailable here', req.title is None and 'Não dá' in result, result)
+    check('unavailable here, with the reason', req.title is None and 'numa thread' in result, result)
 
 
 def test_can_open_thread_needs_a_text_channel_and_permissions(monkeypatch):
@@ -225,6 +225,22 @@ def test_can_open_thread_needs_a_text_channel_and_permissions(monkeypatch):
     check('no thread permissions', not chat_threads.can_open_thread(TextChannel(guild, can_thread=False)))
     check('threads answer in place', not chat_threads.can_open_thread(Thread(guild)))
     check('DMs and the like answer in place', not chat_threads.can_open_thread(NS(id=5)))
+
+
+def test_thread_blocker_names_the_missing_permission(monkeypatch, caplog):
+    monkeypatch.setattr(chat_threads, 'CHAT_THREADS_ENABLED', True)
+    monkeypatch.setattr(chat_threads, '_warned_channels', set())
+    guild = Guild()
+    check('nothing blocks a channel with both permissions', chat_threads.thread_blocker(TextChannel(guild)) is None)
+    reason = chat_threads.thread_blocker(TextChannel(guild, missing={'send_messages_in_threads'}))
+    check('names the missing permission', 'Enviar mensagens em threads' in reason, reason)
+    check('only the missing one', 'Criar threads públicas' not in reason, reason)
+    check('a thread says so', 'numa thread' in chat_threads.thread_blocker(Thread(guild)))
+    check('other channels say so', 'tipo de canal' in chat_threads.thread_blocker(NS(id=5)))
+    chat_threads.thread_blocker(TextChannel(guild, missing={'send_messages_in_threads'}))
+    warnings = [r for r in caplog.records if 'cannot open threads' in r.getMessage()]
+    check('logged once per channel', len(warnings) == 1, [r.getMessage() for r in warnings])
+    check('the log names the flag', 'send_messages_in_threads' in warnings[0].getMessage(), warnings[0].getMessage())
 
 
 def test_answers_unprompted_only_in_the_bot_threads(monkeypatch):
@@ -250,7 +266,7 @@ async def test_second_follow_up_moves_the_conversation_to_a_thread(tmp_path, mon
     first = Message(80, channel, 'e o simulation-distance?')
     await cog._continue_conversation(first, 60, conv, reply_to=60)
     check('turn 2 replies in the channel', len(first.replies) == 1 and first.opened == [], first.opened)
-    check('the model may still open one itself', cog.runs[-1][1]['thread_available'] is True)
+    check('the model may still open one itself', cog.runs[-1][1]['thread_blocker'] is None)
 
     cog._followup_cd.clear()
     conv = await cog.store.get_by_handle(81)
@@ -276,7 +292,7 @@ async def test_moved_conversation_answers_in_its_thread_from_the_channel(tmp_pat
     msg = Message(80, TextChannel(guild), 'mais uma coisa')
     await cog._continue_conversation(msg, 60, conv, reply_to=60)
     check('no second thread', msg.opened == [], msg.opened)
-    check('no new thread offered to the model', cog.runs[0][1]['thread_available'] is False)
+    check('the model is told the conversation has one', cog.runs[0][1]['thread_blocker'] == chat_threads.HAS_THREAD)
     check('archived thread revived and used', not thread.archived and len(thread.sent) == 1, thread.sent)
     check('nothing in the channel', msg.replies == [])
 
@@ -297,7 +313,7 @@ async def test_quick_mention_answers_in_place(tmp_path, monkeypatch):
     channel = TextChannel(Guild())
     msg = Message(80, channel, f'<@{BOT_ID}> qual a versão do paper?')
     await cog.on_message(msg)
-    check('the tool is offered', cog.runs[0][1]['thread_available'] is True)
+    check('the tool is offered', cog.runs[0][1]['thread_blocker'] is None)
     check('first answer replies in the channel', len(msg.replies) == 1 and msg.opened == [], msg.opened)
     conv = await cog.store.get_by_handle(81)
     check('no thread stored', conv and 'thread_id' not in conv['data'], conv)
@@ -328,7 +344,7 @@ async def test_channel_without_thread_permission_answers_in_place(tmp_path, monk
     monkeypatch.setattr(chat_threads, 'CHAT_THREAD_CHANNELS', frozenset({10}))
     msg = Message(80, TextChannel(Guild(), can_thread=False), f'<@{BOT_ID}> oi')
     await cog.on_message(msg)
-    check('tool not offered', cog.runs[0][1]['thread_available'] is False)
+    check('the model is told the permission is missing', 'Criar threads públicas' in cog.runs[0][1]['thread_blocker'])
     check('reply in place', len(msg.replies) == 1 and msg.opened == [], msg.opened)
 
 
@@ -429,7 +445,7 @@ async def _run_chat_with_tool(monkeypatch, available):
     cog.bot = NS(user=NS(id=BOT_ID, name='QuillBot', display_name='QuillBot'), get_cog=lambda name: None)
     cog.client = NS(chat=NS(completions=completions))
     monkeypatch.setattr(commands_mod, 'CHANNEL_CONTEXT_MESSAGES', 0)
-    result = await cog._run_chat('me passa uma receita de bolo', user=ASKER, thread_available=available)
+    result = await cog._run_chat('me passa uma receita de bolo', user=ASKER, thread_blocker=None if available else chat_threads.ANSWERS_IN_PLACE)
     return result, completions
 
 
@@ -445,7 +461,7 @@ async def test_open_thread_tool_refuses_when_unavailable(monkeypatch):
     check('tool list stays the same for prompt caching', 'open_thread' in completions.tools[0], completions.tools)
     check('no thread requested', capture['thread_title'] is None, capture)
     tool_msgs = [m for m in completions.calls[1] if isinstance(m, dict) and m.get('role') == 'tool']
-    check('the model is told why', tool_msgs and 'Não dá' in tool_msgs[0]['content'], tool_msgs)
+    check('the model is told why', tool_msgs and chat_threads.ANSWERS_IN_PLACE in tool_msgs[0]['content'], tool_msgs)
 
 
 async def test_cooldown_skips_quietly_in_bot_thread(tmp_path, monkeypatch):
