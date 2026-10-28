@@ -124,6 +124,19 @@ CHAT_MENTION_ENABLED: Final[bool] = os.getenv('CHAT_MENTION_ENABLED', 'true').st
 # the last CHANNEL_CONTEXT_MESSAGES channel messages (like replying to it).
 CHAT_MENTION_CONTINUE_ENABLED: Final[bool] = os.getenv('CHAT_MENTION_CONTINUE_ENABLED', 'true').strip().lower() in ('1', 'true', 'yes')
 
+# --- Chat threads (move long or off-topic conversations out of the channel) ---
+CHAT_THREADS_ENABLED: Final[bool] = os.getenv('CHAT_THREADS_ENABLED', 'true').strip().lower() in ('1', 'true', 'yes')
+# A conversation moves into a thread on this turn (3 = the second follow-up); 0 never moves it.
+CHAT_THREAD_AFTER_TURNS: Final[int] = int(os.getenv('CHAT_THREAD_AFTER_TURNS', '3'))
+# Channel IDs (comma-separated) where every conversation opens a thread on its first answer.
+CHAT_THREAD_CHANNELS: Final[frozenset[int]] = frozenset(
+    int(v) for v in os.getenv('CHAT_THREAD_CHANNELS', '').replace(',', ' ').split() if v.isdigit()
+)
+# Let the chat model open a thread itself (open_thread tool): off-topic questions, casual chat.
+CHAT_THREAD_TOOL_ENABLED: Final[bool] = os.getenv('CHAT_THREAD_TOOL_ENABLED', 'true').strip().lower() in ('1', 'true', 'yes')
+# Bot threads archive after this many idle minutes; Discord accepts 60, 1440, 4320 or 10080.
+CHAT_THREAD_ARCHIVE_MINUTES: Final[int] = int(os.getenv('CHAT_THREAD_ARCHIVE_MINUTES', '60'))
+
 # --- Channel context (recent messages auto-injected into /ask, /chat, @mention and follow-ups) ---
 # Number of latest channel messages sent to the LLM as conversation context; 0 disables.
 CHANNEL_CONTEXT_MESSAGES: Final[int] = int(os.getenv('CHANNEL_CONTEXT_MESSAGES', '10'))

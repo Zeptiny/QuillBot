@@ -88,10 +88,12 @@ def make_cog(store, monkeypatch):
     cog._followup_cd = {}
     cog.continued = []
     cog.ref_contexts = []
+    cog.unprompted = []
 
-    async def fake_continue(message, handle_id, conv, *, reply_to, ref_context='', ref_image_urls=None):
+    async def fake_continue(message, handle_id, conv, *, reply_to, ref_context='', ref_image_urls=None, unprompted=False):
         cog.continued.append((message.id, handle_id, conv['conv_id'], reply_to))
         cog.ref_contexts.append(ref_context)
+        cog.unprompted.append(unprompted)
     cog._continue_conversation = fake_continue
     monkeypatch.setattr(commands_mod, 'CHAT_MENTION_ENABLED', True)
     monkeypatch.setattr(commands_mod, 'CHANNEL_CONTEXT_MESSAGES', 10)

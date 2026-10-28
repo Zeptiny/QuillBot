@@ -10,7 +10,7 @@ from discord import app_commands
 from discord.ext import commands
 from openai import AsyncOpenAI, RateLimitError
 
-from cogs import image_store, message_media
+from cogs import chat_threads, image_store, message_media
 from cogs.conversation_store import (
     ConversationStore,
     add_participants,
@@ -64,6 +64,8 @@ from config import (
     CHAT_MENTION_CONTINUE_ENABLED,
     CHAT_MENTION_ENABLED,
     CHAT_MODEL,
+    CHAT_THREAD_TOOL_ENABLED,
+    CHAT_THREADS_ENABLED,
     CONVERSATIONS_DB_PATH,
     CONVERSATIONS_HISTORY_TURNS,
     CONVERSATIONS_MAX_STORED,
@@ -149,6 +151,21 @@ _SUMMARY_INSTRUCTIONS = (
     "sem @ (um resumo não deve notificar ninguém).\n"
 ) if SUMMARY_ENABLED else ""
 
+_THREAD_INSTRUCTIONS = (
+    "- Para não poluir canais movimentados, você pode levar a conversa para uma thread "
+    "com `open_thread`: chame-a antes de responder quando a pergunta não tem relação com "
+    "o assunto atual do canal (veja <mensagens_recentes_do_canal>), for papo casual ou "
+    "tende a virar um vai-e-volta longo. Perguntas rápidas sobre o assunto do canal "
+    "ficam no canal.\n"
+) if CHAT_THREADS_ENABLED and CHAT_THREAD_TOOL_ENABLED else ""
+
+_THREAD_SILENCE_INSTRUCTIONS = (
+    "- Numa thread aberta por você, toda mensagem chega a você mesmo sem menção — essas "
+    f"começam com {chat_threads.UNPROMPTED_HEADER}. Responda quando falarem com você ou "
+    "do assunto da conversa; se for conversa entre outras pessoas que não pede nada a "
+    f"você, responda exatamente {NO_REPLY_TOKEN} para não enviar nada.\n"
+) if CHAT_THREADS_ENABLED else ""
+
 _DISCORD_FORMAT = (
     "A resposta será exibida no Discord (embed description) — use APENAS sintaxe que o Discord renderiza:\n"
     "- Permitido: **negrito**, *itálico*, __sublinhado__, ~~tachado~~, `código inline`, "
@@ -171,7 +188,9 @@ GENERAL_SYSTEM_PROMPT = (
     + (_WEB_SEARCH_INSTRUCTIONS if TAVILY_AVAILABLE else '')
     + _SCHEDULER_INSTRUCTIONS
     + _MONITOR_INSTRUCTIONS
-    + _SUMMARY_INSTRUCTIONS +
+    + _SUMMARY_INSTRUCTIONS
+    + _THREAD_INSTRUCTIONS
+    + _THREAD_SILENCE_INSTRUCTIONS +
     "- Seja honesto quando não souber a resposta — não invente informações.\n"
     "</instructions>\n\n"
     "<response_format>\n"
@@ -604,6 +623,7 @@ class Commands(commands.Cog):
         )
 
         try:
+            thread_available = chat_threads.can_open_thread(interaction.channel)
             answer, embeds, sources, capture = await self._run_chat(
                 question,
                 image_url=image_url,
@@ -612,19 +632,30 @@ class Commands(commands.Cog):
                 guild=interaction.guild,
                 channel=interaction.channel,
                 created_at=interaction.created_at,
+                thread_available=thread_available,
             )
-            # Clear any in-progress status message before sending the final embed.
-            try:
-                await interaction.edit_original_response(content=None)
-            except discord.HTTPException:
-                pass
-            ping_kwargs = ping_send_kwargs(answer, interaction.guild)
-            if len(embeds) == 1:
-                msg = await interaction.followup.send(wait=True, **ping_kwargs, embed=embeds[0])
-            else:
-                msg = await interaction.followup.send(
-                    wait=True, **ping_kwargs, embed=embeds[0], view=PaginatedEmbedView(embeds)
+            thread = None
+            title = capture.get('thread_title')
+            if thread_available and (title or chat_threads.thread_due(interaction.channel, 1)):
+                thread = await self._interaction_thread(
+                    interaction,
+                    title or chat_threads.thread_title(question, f'Conversa com {interaction.user.display_name}'),
                 )
+            if thread is not None:
+                msg = await self._send_in_thread(thread, interaction.user, answer, embeds)
+            else:
+                # Clear any in-progress status message before sending the final embed.
+                try:
+                    await interaction.edit_original_response(content=None)
+                except discord.HTTPException:
+                    pass
+                ping_kwargs = ping_send_kwargs(answer, interaction.guild)
+                if len(embeds) == 1:
+                    msg = await interaction.followup.send(wait=True, **ping_kwargs, embed=embeds[0])
+                else:
+                    msg = await interaction.followup.send(
+                        wait=True, **ping_kwargs, embed=embeds[0], view=PaginatedEmbedView(embeds)
+                    )
             await self._store_new_conversation(
                 msg, question, answer, sources,
                 user=interaction.user,
@@ -633,6 +664,7 @@ class Commands(commands.Cog):
                 created_at=interaction.created_at,
                 images=capture.get('image_urls', [image_url] if image_url else []),
                 capture=capture,
+                thread=thread,
             )
 
         except RateLimitError:
@@ -669,8 +701,12 @@ class Commands(commands.Cog):
         reply_to: str | int | None = None,
         capture: dict | None = None,
         participant_infos: list[dict] | None = None,
+        thread: discord.Thread | None = None,
     ) -> None:
-        """Persist a brand-new conversation anchored on the bot's reply message."""
+        """Persist a brand-new conversation anchored on the bot's reply message.
+
+        *thread* is the thread the conversation moved to, if it did.
+        """
         author = author_info(user)
         ts = created_at.timestamp() if created_at else time.time()
         turn = make_turn(
@@ -694,17 +730,77 @@ class Commands(commands.Cog):
         }
         participants = [author] if author.get('id') else []
         add_participants(participants, participant_infos or [])
+        data = {
+            'turns': [turn],
+            'participants': participants,
+            'origin': origin,
+            'started_ts': ts,
+        }
+        if thread is not None:
+            data['thread_id'] = str(thread.id)
         await self.store.create(
             str(reply_msg.id),
             guild_id=origin['guild_id'] or None,
             channel_id=origin['channel_id'] or None,
-            data={
-                'turns': [turn],
-                'participants': participants,
-                'origin': origin,
-                'started_ts': ts,
-            },
+            data=data,
         )
+
+    async def _interaction_thread(
+        self, interaction: discord.Interaction, title: str,
+    ) -> discord.Thread | None:
+        """Open a thread for a /chat answer on the command's own response message."""
+        try:
+            await interaction.edit_original_response(content=f'🧵 Resposta na thread **{title}**')
+            anchor = await interaction.original_response()
+        except discord.HTTPException:
+            return None
+        return await chat_threads.open_thread(anchor, title)
+
+    async def _answer_thread(
+        self,
+        message: discord.Message,
+        data: dict,
+        *,
+        turn: int,
+        title: str | None,
+        topic: str,
+    ) -> discord.Thread | None:
+        """Thread the answer to *message* goes to, or ``None`` to reply in place.
+
+        *data* is the conversation (``{}`` for a new one) and *turn* the number
+        of this turn in it. A conversation that already moved keeps its thread.
+        Otherwise one is opened on *message* when the model asked for it
+        (*title*) or the turn is due one, named *title* or after *topic* (the
+        conversation's first question).
+        """
+        if isinstance(message.channel, discord.Thread):
+            return None
+        thread = await chat_threads.conversation_thread(message.guild, data.get('thread_id'))
+        if thread is not None:
+            return thread
+        if not (title or chat_threads.thread_due(message.channel, turn)):
+            return None
+        if not chat_threads.can_open_thread(message.channel):
+            return None
+        name = title or chat_threads.thread_title(topic, f'Conversa com {message.author.display_name}')
+        return await chat_threads.open_thread(message, name)
+
+    async def _send_in_thread(
+        self, thread: discord.Thread, asker, answer: str, embeds: list[discord.Embed],
+    ) -> discord.Message:
+        """Post an answer in *thread*, pinging *asker* — which also adds them to it.
+
+        A reply can't point across channels, so the ping is how the asker finds
+        where their answer went.
+        """
+        kwargs = ping_send_kwargs(answer, thread.guild)
+        pings = kwargs.get('content', '')
+        if asker.mention not in pings:
+            kwargs['content'] = f'{asker.mention} {pings}'.strip()
+        kwargs['embed'] = embeds[0]
+        if len(embeds) > 1:
+            kwargs['view'] = PaginatedEmbedView(embeds)
+        return await thread.send(**kwargs)
 
     async def _run_chat(
         self,
@@ -723,7 +819,15 @@ class Commands(commands.Cog):
         context_message: discord.Message | None = None,
         prior_context: list[str] | None = None,
         context_image_urls: list[str] | None = None,
+        thread_available: bool = False,
     ) -> tuple[str, list[discord.Embed], list[dict], dict]:
+        """Run one chat answer through the tool loop.
+
+        *thread_available* is whether this answer can still move to a new
+        thread; the ``open_thread`` tool is always offered (a stable tool list
+        keeps the prompt prefix cacheable) but only works then. The title the
+        model asked for comes back as ``capture['thread_title']``.
+        """
         # Message layout is ordered for provider prefix caching: the system
         # prompt and replayed history stay byte-identical across follow-ups of
         # a conversation, while per-request blocks (clock/context, memory
@@ -824,12 +928,15 @@ class Commands(commands.Cog):
             base_tools.append(SUMMARIZE_CHANNEL_TOOL)
         if REACTION_TOOL_ENABLED:
             base_tools.append(message_media.ADD_REACTION_TOOL)
+        if CHAT_THREADS_ENABLED and CHAT_THREAD_TOOL_ENABLED:
+            base_tools.append(chat_threads.OPEN_THREAD_TOOL)
         active_tools = base_tools if base_tools else None
         fallback_channel = channel or (interaction.channel if interaction else None)
         fallback_guild = guild or (interaction.guild if interaction else None)
         reaction_tool = message_media.ReactionTool(
             fallback_channel, guild=fallback_guild, default_message=context_message,
         )
+        thread_request = chat_threads.ThreadRequest(thread_available)
 
         async def _exec(name: str, args: dict) -> tuple[str, list[dict]]:
             if name in ('web_search', 'web_extract'):
@@ -880,6 +987,8 @@ class Commands(commands.Cog):
                 )
             if name == 'add_reaction':
                 return await reaction_tool(args), []
+            if name == 'open_thread':
+                return thread_request(args), []
             result = await exec_history_tool(name, args, bot=self.bot, guild=fallback_guild, channel=fallback_channel)
             if result is not None:
                 return result
@@ -908,6 +1017,8 @@ class Commands(commands.Cog):
                 return summary_tool_status(args, fallback_guild)
             if name == 'add_reaction':
                 return message_media.reaction_tool_status(args)
+            if name == 'open_thread':
+                return chat_threads.thread_tool_status(args)
             label = history_tool_status(name, args)
             if label is not None:
                 return label
@@ -966,6 +1077,7 @@ class Commands(commands.Cog):
             'trajectory': trajectory,
             'image_urls': image_refs,
             'context_image_urls': context_image_refs,
+            'thread_title': thread_request.title,
         }
 
     async def cog_app_command_error(
@@ -1102,20 +1214,26 @@ class Commands(commands.Cog):
         reply_to: int | None,
         ref_context: str = '',
         ref_image_urls: list | None = None,
+        unprompted: bool = False,
     ) -> None:
         """Answer *message* as the next turn of the conversation behind *handle_id*.
 
         ``reply_to`` is the message the user actually replied to; ``None`` when
         an @mention picked up a recent conversation without a reply. When a
         mention replied to someone else's message, ``ref_context`` and
-        ``ref_image_urls`` carry that message into the turn.
+        ``ref_image_urls`` carry that message into the turn. ``unprompted``
+        marks a message in the bot's own thread that didn't mention it: the
+        model is told so and may stay silent.
         """
         user_id = message.author.id
         if user_id in self._followup_cd:
-            try:
-                await message.reply('⏳ Aguarde antes de enviar outra resposta.', delete_after=5)
-            except discord.HTTPException:
-                pass
+            # Unprompted messages skip quietly: people may be talking among
+            # themselves, and the next turn sees the skipped one as channel context.
+            if not unprompted:
+                try:
+                    await message.reply('⏳ Aguarde antes de enviar outra resposta.', delete_after=5)
+                except discord.HTTPException:
+                    pass
             return
         self._followup_cd[user_id] = True
         follow_up_question = message.content.strip()
@@ -1135,12 +1253,15 @@ class Commands(commands.Cog):
             )
         if not follow_up_question:
             follow_up_question = 'Analise esta imagem.'
+        if unprompted:
+            follow_up_question = f'{chat_threads.UNPROMPTED_HEADER}\n---\n{follow_up_question}'
         async with self.store.conversation_lock(conv['conv_id']), message.channel.typing():
             try:
                 fresh = await self.store.get_by_handle(handle_id)
                 if fresh:
                     conv = fresh
-                history = conv['data'].get('turns', []).copy()
+                data = conv['data']
+                history = data.get('turns', []).copy()
                 participant_infos = await message_participant_infos(message)
                 participant_ids = conversation_participant_ids(
                     conv['data'], participant_infos,
@@ -1162,8 +1283,22 @@ class Commands(commands.Cog):
                     context_message=message,
                     prior_context=prior_context,
                     context_image_urls=prior_context_images,
+                    thread_available=(
+                        not data.get('thread_id') and chat_threads.can_open_thread(message.channel)
+                    ),
                 )
-                if len(embeds) == 1:
+                if unprompted and is_silent(answer):
+                    return
+                thread = await self._answer_thread(
+                    message, data,
+                    turn=len(history) + 1,
+                    title=capture.get('thread_title'),
+                    topic=history[0].get('question', '') if history else follow_up_question,
+                )
+                if thread is not None:
+                    reply = await self._send_in_thread(thread, message.author, answer, embeds)
+                    data['thread_id'] = str(thread.id)
+                elif len(embeds) == 1:
                     reply = await message.reply(
                         **ping_send_kwargs(answer, message.guild), embed=embeds[0]
                     )
@@ -1187,7 +1322,6 @@ class Commands(commands.Cog):
                     trajectory=capture.get('trajectory'),
                     context_images=capture.get('context_image_urls'),
                 )
-                data = conv['data']
                 data['turns'] = cap_turns(history + [turn], CONVERSATIONS_MAX_TURNS)
                 add_participants(data.setdefault('participants', []), participant_infos)
                 await self.store.update(
@@ -1216,9 +1350,13 @@ class Commands(commands.Cog):
                 await self._continue_conversation(message, ref_id, conv, reply_to=ref_id)
                 return
         # --- 2) @mention chat mode (same as /chat) ---
-        if not CHAT_MENTION_ENABLED:
+        if not CHAT_MENTION_ENABLED or not self.bot.user:
             return
-        if not self.bot.user or not self.bot.user.mentioned_in(message):
+        # In a thread the bot opened every message is for it, mention or not;
+        # the model may stay silent when people there talk among themselves.
+        mentioned = self.bot.user.mentioned_in(message)
+        unprompted = not mentioned and chat_threads.answers_unprompted(message, self.bot.user.id)
+        if not mentioned and not unprompted:
             return
         if message.reference and message.reference.message_id:
             docs_cog = self.bot.get_cog('DocsRAG')
@@ -1230,6 +1368,8 @@ class Commands(commands.Cog):
                 if existing:
                     return
         if not self.client:
+            if unprompted:
+                return
             try:
                 await message.reply('⚠️ Chat indisponível: chave de API não configurada.', mention_author=False)
             except discord.HTTPException:
@@ -1238,7 +1378,8 @@ class Commands(commands.Cog):
         # A mention right after the bot talked continues that conversation, as
         # if the user had replied to the bot's latest message in the window.
         # A reply to someone else's message joins it too, with that message as context.
-        if CHAT_MENTION_CONTINUE_ENABLED:
+        # In the bot's own thread every message continues it.
+        if CHAT_MENTION_CONTINUE_ENABLED or unprompted:
             typed = strip_bot_mention(message.content, self.bot.user, message.guild).strip()
             ref_id = message.reference.message_id if message.reference else None
             if typed or message.attachments or ref_id:
@@ -1252,11 +1393,14 @@ class Commands(commands.Cog):
                     await self._continue_conversation(
                         message, handle_id, conv, reply_to=ref_id,
                         ref_context=ref_context, ref_image_urls=ref_image_urls,
+                        unprompted=unprompted,
                     )
                     return
         # Per-user cooldown for mentions (reuse followup cooldown)
         user_id = message.author.id
         if user_id in self._followup_cd:
+            if unprompted:
+                return
             try:
                 await message.reply('⏳ Aguarde antes de enviar outra pergunta.', delete_after=5)
             except discord.HTTPException:
@@ -1264,6 +1408,8 @@ class Commands(commands.Cog):
             return
         clean_question, all_image_urls, ref_context = await self._message_question(message)
         if not clean_question and not all_image_urls:
+            if unprompted:
+                return
             try:
                 await message.reply(
                     f'Olá {message.author.mention}! Me mencione com uma pergunta. Ex: @{self.bot.user.display_name} como otimizar meu servidor?',
@@ -1275,6 +1421,9 @@ class Commands(commands.Cog):
             return
         if not clean_question and all_image_urls:
             clean_question = 'Analise esta imagem.'
+        topic = clean_question
+        if unprompted:
+            clean_question = f'{chat_threads.UNPROMPTED_HEADER}\n---\n{clean_question}'
         self._followup_cd[user_id] = True
         participant_infos = await message_participant_infos(message)
         logger.info("Processing @mention chat user=%s guild=%s question=%r ref=%s images=%d", message.author.id, message.guild.id if message.guild else None, clean_question[:80], bool(ref_context), len(all_image_urls))
@@ -1290,8 +1439,16 @@ class Commands(commands.Cog):
                     participant_ids={p['id'] for p in participant_infos if p.get('id')},
                     origin=message.jump_url,
                     context_message=message,
+                    thread_available=chat_threads.can_open_thread(message.channel),
                 )
-                if len(embeds) == 1:
+                if unprompted and is_silent(answer):
+                    return
+                thread = await self._answer_thread(
+                    message, {}, turn=1, title=capture.get('thread_title'), topic=topic,
+                )
+                if thread is not None:
+                    reply = await self._send_in_thread(thread, message.author, answer, embeds)
+                elif len(embeds) == 1:
                     reply = await message.reply(
                         mention_author=False, **ping_send_kwargs(answer, message.guild), embed=embeds[0]
                     )
@@ -1309,6 +1466,7 @@ class Commands(commands.Cog):
                     images=capture.get('image_urls', all_image_urls),
                     message_id=message.id,
                     capture=capture,
+                    thread=thread,
                     participant_infos=participant_infos,
                 )
             except RateLimitError:

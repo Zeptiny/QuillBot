@@ -160,6 +160,7 @@ After adding a source, restart the bot or run `/reindex` (admin-only) to index i
 - **Read Message History** — follow-up conversations via replies
 - **Add Reactions** — the 👀 reaction on detected paste links
 - **Use Application Commands** — slash commands
+- **Create Public Threads** and **Send Messages in Threads** — move long or off-topic chats into threads (without them the bot answers in the channel)
 
 ### Required Intents
 

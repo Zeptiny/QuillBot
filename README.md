@@ -28,6 +28,7 @@ Built with [discord.py](https://discordpy.readthedocs.io/) + RAG (Retrieval-Augm
 |---|---|
 | **Q&A (RAG)** | Answers questions grounded in indexed docs (Miners' Refuge, PaperMC, PurpurMC, Spark) |
 | **General Chat** | Open-ended assistant with web search, server/history context awareness |
+| **Chat Threads** | Long or off-topic conversations move into a thread on the asker's message, so the channel keeps one message; inside it the bot answers without a mention and stays quiet when people talk among themselves |
 | **Log Analysis** | AI analysis of mclo.gs/pastebin links, file uploads, and screenshots |
 | **Error Detection** | Instant passive replies for 20+ known Minecraft error patterns |
 | **Spark Profiler** | Full report parsing, bottleneck diagnosis, platform-aware recommendations |
@@ -56,12 +57,20 @@ Ask any Minecraft server administration question. Uses an agentic RAG loop — t
 #### `/chat <question> [image]`
 General-purpose assistant (same agentic loop as `/ask` but with web search).
 
-- **Tools:** `web_search`, `web_extract` (via Tavily), plus the same context/history tools as `/ask`, the scheduler tools, the monitor tools (see `/monitor`) and `summarize_channel` (see `/resumo`)
+- **Tools:** `web_search`, `web_extract` (via Tavily), plus the same context/history tools as `/ask`, the scheduler tools, the monitor tools (see `/monitor`), `summarize_channel` (see `/resumo`) and `open_thread` (see threads below)
 - **Reactions:** `add_reaction` lets the model react with a Unicode emoji or a `:nome:` custom emoji of the server, only to messages in the current channel (the triggering message by default) and at most 3 per answer. `REACTION_TOOL_ENABLED=false` removes the tool
 - **Web search:** Supports `search_depth` (basic/advanced), `time_range`, domain filtering
 - **Reply follow-up** and **@mention mode:** Mention the bot (`@QuillBot <question>`) to chat without a slash command — same rate-limit and conversation handling as `/chat`
 - A mention continues the conversation when one of the bot's `/chat`/mention answers is among the last `CHANNEL_CONTEXT_MESSAGES` channel messages, just like replying to it; a mention that replies to someone else's message joins it too, with that message as context (`CHAT_MENTION_CONTINUE_ENABLED=false` always starts a new one)
 - Set `CHAT_MENTION_ENABLED=false` to disable mention mode
+- **Threads (`cogs/chat_threads.py`):** a quick question is answered in the channel, but a conversation moves into a thread when
+  - it reaches `CHAT_THREAD_AFTER_TURNS` turns (default 3, the second follow-up),
+  - it happens in one of `CHAT_THREAD_CHANNELS` (first answer already in a thread), or
+  - the model calls `open_thread` because the question has nothing to do with what the channel is discussing, or is casual chat (`CHAT_THREAD_TOOL_ENABLED=false` removes the tool)
+- The thread is opened on the asker's message (for `/chat`, on the command's response) and named after the conversation's first question, or the title the model picked. The channel keeps only that message; the answer goes into the thread and pings the asker, which also adds them to it. Threads archive after `CHAT_THREAD_ARCHIVE_MINUTES` idle
+- A conversation that moved keeps answering in its thread, also when someone continues it from the channel (an archived thread is reopened)
+- Inside a thread the bot opened, every message is for the bot — no mention needed, and an expired conversation just starts a new one there. The model is told the message didn't mention it and may answer `[NO_REPLY]` to stay silent when people are talking among themselves; cooldowns skip those messages quietly instead of posting "⏳ Aguarde"
+- No thread is opened where Discord has none (threads, forum posts, voice-channel chats, DMs) or without the Create Public Threads and Send Messages in Threads permissions; the answer stays in place. `CHAT_THREADS_ENABLED=false` turns all of this off
 
 #### `/resumo [canal] [periodo] [foco]`
 Summarize what happened in a channel or thread while you were away.
@@ -84,7 +93,7 @@ A monitor calls the bot on every message that matches **all** of its filters, as
 
 - **Filters** (at least one, combined with AND): `channels` (threads under them count), `authors` (the message was sent by…), `mentions` (the message mentions…), `regex` (case-insensitive search over the content; nested quantifiers like `(a+)+` are refused)
 - **Instruction:** what the bot should do on a match, including when to stay silent
-- **Never fires on:** bot messages, and messages the bot already answers (an @mention of it, a reply to one of its conversations). Several monitors matching one message share one run
+- **Never fires on:** bot messages, and messages the bot already answers (an @mention of it, a reply to one of its conversations, anything in a chat thread the bot opened). Several monitors matching one message share one run
 - **Cooldown:** per monitor, `MONITORS_DEFAULT_COOLDOWN` seconds by default (min `MONITORS_MIN_COOLDOWN`), so a busy channel doesn't cost one LLM call per message
 - **Commands:** `create`, `list`, `show`, `edit` (a slash option replaces that filter with one value; `clear` removes a filter), `pause`, `resume`, `delete`
 - **LLM tools:** `monitor_create`, `monitor_list`, `monitor_update` (lists, clearing, pause/resume) and `monitor_delete` — "sempre que alguém mencionar a staff em #suporte, veja se precisa de ajuda" works from `/chat` or a mention
@@ -205,7 +214,7 @@ Regex `https://spark.lucko.me/<code>` → replies "🔥 Relatório Spark detecta
 Reply to any `/ask`, `/chat`, or `/spark` bot response to continue the thread. The bot replays up to 16 history turns (for `/ask`/`/spark`) with the Spark report carried forward. Per-user cooldown enforced. Supports image attachments in follow-ups.
 
 ### 6. @Mention Chat (`commands`)
-Mention the bot with a question (`@QuillBot como otimizar meu servidor?`) — equivalent to `/chat` with the same tool loop and conversation storage.
+Mention the bot with a question (`@QuillBot como otimizar meu servidor?`) — equivalent to `/chat` with the same tool loop and conversation storage. In a thread the bot opened, no mention is needed (see [chat threads](#chat-question-image)).
 
 ### 7. Monitors (`monitors`)
 Messages matching a monitor's filters run the bot on them like a mention, and it may choose not to answer — see [`/monitor`](#monitor-subcommand--monitors).
@@ -299,6 +308,7 @@ QuillBot/
 ├── docker-compose.yml
 ├── cogs/
 │   ├── commands.py       # /chat, /docs, /help, /flags, /plov, /plano, /health, /sync + @mention & reply follow-ups
+│   ├── chat_threads.py   # When chat conversations move into threads, the open_thread tool, bot-thread detection
 │   ├── docs_rag.py       # RAG pipeline — indexing, search, reranking, /ask, /reindex, agentic loop + Spark diagnosis
 │   ├── history_rag.py    # Server-wide history RAG — backfill, live ingestion, per-guild vector stores
 │   ├── log_analyzer.py   # Passive log detection, pattern matching, /analyze, file upload to mclo.gs
@@ -385,6 +395,11 @@ cp .env.example .env   # if available, otherwise create .env manually
 | `TAVILY_API_KEY` | — | Required when web search is enabled |
 | `CHAT_MENTION_ENABLED` | `true` | Enable @mention chat mode |
 | `CHAT_MENTION_CONTINUE_ENABLED` | `true` | A mention continues the newest bot conversation within the last `CHANNEL_CONTEXT_MESSAGES` messages instead of starting a new one (a quoted message is added as context) |
+| `CHAT_THREADS_ENABLED` | `true` | Move long or off-topic chat conversations into threads; the bot answers un-mentioned messages in its threads |
+| `CHAT_THREAD_AFTER_TURNS` | `3` | Turn on which a conversation moves into a thread (`3` = the second follow-up; `0` never moves by length) |
+| `CHAT_THREAD_CHANNELS` | — | Comma-separated channel IDs where every conversation opens a thread on its first answer |
+| `CHAT_THREAD_TOOL_ENABLED` | `true` | Give the chat model the `open_thread` tool for off-topic questions and casual chat |
+| `CHAT_THREAD_ARCHIVE_MINUTES` | `60` | Idle minutes before a bot thread archives (Discord accepts `60`, `1440`, `4320`, `10080`; other values round up) |
 | `CHANNEL_CONTEXT_MESSAGES` | `10` | Latest channel messages auto-injected as text and vision context into `/ask`, `/chat`, @mention and reply follow-ups (`0` disables) |
 | `CHANNEL_CONTEXT_IMAGES_ENABLED` | `true` | Send images attached to channel-context and follow-up gap messages as vision parts (`false` for text-only models) |
 | `CHANNEL_CONTEXT_IMAGE_MAX_AGE_MINUTES` | `60` | Only channel-context images newer than this are sent (`0` = no age limit) |
@@ -560,6 +575,7 @@ pytest -k reindex              # tests whose name matches
 | `test_api_logger.py` | Request logging for aiohttp/httpx/httpx2, redaction, body capture, inbound interactions (runs in its own process) |
 | `test_attribution.py` | Author tags on every question, byte-identical replay of per-turn blocks, memory block labels and person-memory rules |
 | `test_channel_context_images.py` | Images from automatically fetched channel context |
+| `test_chat_threads.py` | When conversations move into threads, delivery and pings, reusing a moved conversation's thread, un-mentioned messages and silence in bot threads, the `open_thread` tool |
 | `test_conversation_participants.py` | Participant scope for shared conversations and memory writes |
 | `test_docs_rag.py` | Docs `/reindex`: partial and full reindex, failed sources kept |
 | `test_history_backfill.py` | History backfill watermarks and the duplicate-append guard |
