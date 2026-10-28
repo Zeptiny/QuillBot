@@ -16,7 +16,8 @@ Filters (all optional, combined with AND; at least one is required)
 - **regex**: the message content matches (``re.search``, case-insensitive)
 
 Messages from bots never trigger monitors, and neither do messages the bot
-already answers (an @mention of the bot, a reply to one of its conversations).
+already answers (an @mention of the bot, a reply to one of its conversations,
+anything posted in a chat thread the bot opened).
 When several monitors match one message they share a single run.  Each
 monitor has a cooldown so a busy channel can't turn into one LLM call per
 message.
@@ -41,6 +42,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+from cogs.chat_threads import answers_unprompted
 from cogs.utils import BR_TZ, EMPTY_ANSWER_FALLBACK, PaginatedEmbedView
 from config import (
     CHAT_MENTION_ENABLED,
@@ -494,7 +496,9 @@ class Monitors(commands.Cog, name='Monitors'):
 
     async def _answered_elsewhere(self, message: discord.Message) -> bool:
         """Whether the mention/reply handlers already answer *message*."""
-        if CHAT_MENTION_ENABLED and self.bot.user and self.bot.user.mentioned_in(message):
+        if CHAT_MENTION_ENABLED and self.bot.user and (
+            self.bot.user.mentioned_in(message) or answers_unprompted(message, self.bot.user.id)
+        ):
             return True
         ref_id = message.reference.message_id if message.reference else None
         if ref_id:
