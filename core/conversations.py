@@ -32,6 +32,7 @@ import logging
 import os
 import sqlite3
 import time
+from collections.abc import Callable
 from typing import Any
 
 from config import (
@@ -274,13 +275,15 @@ async def find_recent_conversation(
     *,
     before: Any,
     limit: int,
+    accept: Callable[[dict], bool] | None = None,
 ) -> tuple[int, dict] | None:
     """Newest conversation of *store* with a bot message among the last *limit* channel messages.
 
     Lets an @mention pick up the conversation the bot is already having in the
     channel, as if the user had replied to the bot's latest message. Returns
     ``(bot_message_id, conversation)`` or ``None`` (no window, no bot message
-    in it, or none of them belongs to a live conversation).
+    in it, or none of them belongs to a live conversation). Conversations
+    *accept* turns down are skipped.
     """
     if limit <= 0 or channel is None or not hasattr(channel, 'history'):
         return None
@@ -289,7 +292,7 @@ async def find_recent_conversation(
             if str(getattr(msg.author, 'id', '')) != str(bot_user_id):
                 continue
             conv = await store.get_by_handle(msg.id)
-            if conv:
+            if conv and (accept is None or accept(conv)):
                 return msg.id, conv
     except Exception:
         logger.debug('[conversation] could not scan channel for a recent conversation', exc_info=True)

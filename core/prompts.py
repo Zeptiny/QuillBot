@@ -125,12 +125,21 @@ WRAPPED_INSTRUCTIONS = (
 ) if WRAPPED_ENABLED else ""
 
 THREAD_INSTRUCTIONS = (
-    "- Para não poluir canais movimentados, você pode levar a conversa para uma thread "
-    "com `open_thread`: chame-a antes de responder quando a pergunta não tem relação com "
-    "o assunto atual do canal (veja <mensagens_recentes_do_canal>), for papo casual ou "
-    "tende a virar um vai-e-volta longo. Perguntas rápidas sobre o assunto do canal "
-    "ficam no canal.\n"
+    "- Você faz parte do chat: papo, brincadeira, perguntas rápidas e conversa com várias "
+    "pessoas ficam no canal. Só leve a conversa para uma thread com `open_thread` (chame "
+    "antes de responder) quando ela atrapalharia o canal: um assunto técnico que vai virar "
+    "um vai-e-volta longo (depurar um erro, configurar algo passo a passo) ou um assunto sem "
+    "relação com o que o canal está conversando (veja <mensagens_recentes_do_canal>) e que "
+    "vai render.\n"
 ) if CHAT_THREADS_ENABLED and CHAT_THREAD_TOOL_ENABLED else ""
+
+# Names a thread the bot opens on its own (a long back-and-forth, a channel that always uses threads).
+THREAD_TITLE_PROMPT = (
+    "Dê um título para a thread do Discord onde a conversa abaixo vai continuar. O título diz "
+    "o assunto, como alguém do servidor nomearia a thread: curto (até 60 caracteres), no idioma "
+    "da conversa, sem aspas, sem emoji, sem ponto final e sem citar o bot ou quem perguntou. "
+    "Responda só com o título."
+)
 
 TASK_INSTRUCTIONS = (
     "- Quando pedirem para pesquisar, procurar ou buscar algo, pesquise de verdade antes de "

@@ -12,7 +12,7 @@ from core.turn import TurnContext
 import core.runner as runner_mod
 
 from chat_fakes import (
-    ASKER, BOT_ID, Guild, Message, TextChannel, Thread, make_engine, make_services, reply_to, seed,
+    ASKER, BOT_ID, OTHER, Guild, Message, TextChannel, Thread, make_engine, make_services, reply_to, seed,
 )
 from helpers import as_stream, check
 
@@ -135,6 +135,105 @@ async def test_moved_conversation_answers_in_its_thread_from_the_channel(tmp_pat
     check('nothing in the channel', msg.replies == [])
 
 
+async def test_being_named_in_passing_does_not_move_the_conversation(tmp_path, monkeypatch):
+    engine = make_engine(tmp_path, monkeypatch)
+    channel = TextChannel(Guild())
+    channel.messages = [NS(id=60, author=NS(id=BOT_ID))]
+    await seed(engine, 2)
+    msg = Message(80, channel, 'só de citar o nome quill ele pode responder')
+    await engine.handle_message(msg)
+    check('third turn, but only named: answered in the channel', msg.opened == [] and len(msg.replies) == 1, msg.opened)
+    conv = await engine.store.get_by_trigger(80)
+    check('still the same conversation, not moved', conv['conv_id'] == '60' and 'thread_id' not in conv['data'], conv)
+
+
+async def test_a_group_chatting_with_the_bot_stays_in_the_channel(tmp_path, monkeypatch):
+    engine = make_engine(tmp_path, monkeypatch)
+    channel = TextChannel(Guild())
+    channel.messages = [NS(id=60, author=NS(id=BOT_ID))]
+    await seed(engine, 2, author_id=str(OTHER.id))
+    first = Message(80, channel, f'<@{BOT_ID}> as urnas são fraudadas?')
+    await engine.handle_message(first)
+    check("someone else's third turn stays in the channel", first.opened == [] and len(first.replies) == 1, first.opened)
+    second = Message(90, channel, 'e quem auditou?', reference=reply_to(81))
+    await engine.handle_message(second)
+    check('their second turn too', second.opened == [] and len(second.replies) == 1, second.opened)
+    third = Message(100, channel, 'e em 2022?', reference=reply_to(91))
+    await engine.handle_message(third)
+    check('their own third turn in a row moves it, named after their first question',
+          third.opened == [('as urnas são fraudadas?', chat_threads.ARCHIVE_MINUTES)], third.opened)
+
+
+async def test_moved_conversation_does_not_pull_new_calls_into_its_thread(tmp_path, monkeypatch):
+    """Ana and Nowzin calling the bot in the channel got answered in John's thread."""
+    engine = make_engine(tmp_path, monkeypatch)
+    guild = Guild()
+    thread = Thread(guild, tid=700)
+    channel = TextChannel(guild)
+    channel.messages = [NS(id=60, author=NS(id=BOT_ID))]
+    await seed(engine, 3, thread_id=700)
+    named = Message(80, channel, 'quill as urnas sao fraudadas?', author=OTHER)
+    await engine.handle_message(named)
+    mention = Message(90, channel, f'<@{BOT_ID}> me ignora não', author=OTHER)
+    await engine.handle_message(mention)
+    check('both answered in the channel', len(named.replies) == 1 and len(mention.replies) == 1, (named.replies, mention.replies))
+    check('nothing posted in the thread', thread.sent == [], thread.sent)
+    conv = await engine.store.get_by_trigger(80)
+    check('a new conversation, here', conv['conv_id'] == '81' and 'thread_id' not in conv['data'], conv)
+    check('the moved one is untouched', len((await engine.store.get_by_handle(60))['data']['turns']) == 3)
+
+
+async def test_follow_ups_in_the_channel_stay_there_after_a_move(tmp_path, monkeypatch):
+    from core.burst import Burst
+
+    engine = make_engine(tmp_path, monkeypatch)
+    guild = Guild()
+    thread = Thread(guild, tid=700)
+    channel = TextChannel(guild)
+    await seed(engine, 3, thread_id=700)
+    engine._last_answer[(10, ASKER.id)] = 60  # their last answer went to the thread
+    msg = Message(80, channel, 'hm')
+    await engine.answer_burst(Burst((10, ASKER.id), [msg], ['join']))
+    check('answered in the channel', len(msg.replies) == 1 and thread.sent == [], thread.sent)
+
+
+async def test_the_bot_names_the_threads_it_opens_on_its_own(tmp_path, monkeypatch):
+    from config import CHAT_THREAD_TITLE_MODEL
+    from core.prompts import THREAD_TITLE_PROMPT
+
+    engine = make_engine(tmp_path, monkeypatch, thread_name='Título: "Lag e view-distance no Paper".')
+    guild = Guild()
+    channel = TextChannel(guild)
+    await seed(engine, 1)
+    await engine.handle_message(Message(80, channel, 'e o simulation-distance?', reference=reply_to(60)))
+    check('no naming while the answer stays in the channel', engine.title_calls == [], engine.title_calls)
+    msg = Message(90, channel, 'e o view-distance?', reference=reply_to(81))
+    await engine.handle_message(msg)
+    check('named by the model, label and quotes dropped',
+          msg.opened == [('Lag e view-distance no Paper', chat_threads.ARCHIVE_MINUTES)], msg.opened)
+    call = engine.title_calls[0]
+    check('one cheap call with the title prompt', len(engine.title_calls) == 1 and call['system'] == THREAD_TITLE_PROMPT
+          and call['model'] == CHAT_THREAD_TITLE_MODEL, engine.title_calls)
+    check('it sees the whole back-and-forth, this answer included',
+          all(t in call['user'] for t in (FIRST_QUESTION, 'a0', 'e o simulation-distance?', 'e o view-distance?', 'Reduz o view-distance.')), call['user'])
+
+
+async def test_thread_name_falls_back_to_the_first_question(tmp_path, monkeypatch):
+    engine = make_engine(tmp_path, monkeypatch, thread_name=RuntimeError('model down'))
+    await seed(engine, 2)
+    msg = Message(90, TextChannel(Guild()), 'e o view-distance?', reference=reply_to(60))
+    await engine.handle_message(msg)
+    check('still opened, named after the first question', msg.opened == [(FIRST_QUESTION, chat_threads.ARCHIVE_MINUTES)], msg.opened)
+
+
+def test_open_thread_is_for_long_or_off_topic_subjects_only():
+    from core.prompts import CHAT_SYSTEM_PROMPT
+
+    description = chat_threads.OPEN_THREAD_TOOL['function']['description']
+    check('the tool keeps chat in the channel', 'papo casual' not in description and 'Não use para papo' in description, description)
+    check('and so does the prompt', 'papo casual ou' not in CHAT_SYSTEM_PROMPT and 'ficam no canal' in CHAT_SYSTEM_PROMPT)
+
+
 async def test_vanished_thread_opens_a_new_one(tmp_path, monkeypatch):
     engine = make_engine(tmp_path, monkeypatch)
     guild = Guild()
@@ -166,6 +265,7 @@ async def test_model_moves_an_off_topic_mention_to_a_thread(tmp_path, monkeypatc
     await engine.handle_message(msg)
     check('thread named by the model', msg.opened == [('Receita de bolo', chat_threads.ARCHIVE_MINUTES)], msg.opened)
     check('answer in the thread', len(guild.threads[180].sent) == 1 and msg.replies == [])
+    check('no second call to name it', engine.title_calls == [], engine.title_calls)
     conv = await engine.store.get_by_handle(181)
     check('the conversation starts in the thread', conv and conv['data']['thread_id'] == '180', conv)
 

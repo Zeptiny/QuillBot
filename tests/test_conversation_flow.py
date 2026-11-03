@@ -292,6 +292,17 @@ async def test_slash_chat_answers_and_starts_a_conversation(tmp_path, monkeypatc
     check('/ask uses the docs-first profile', engine.turns[-1].profile is ASK)
 
 
+async def test_slash_chat_in_a_thread_channel_names_the_thread(tmp_path, monkeypatch):
+    from chat_fakes import ASKER
+    engine = make_engine(tmp_path, monkeypatch, thread_name='Melhor versão do Paper')
+    engine.services.settings.write(1, 10, 'threads', 'always')
+    itx = FakeInteraction(TextChannel(Guild()), ASKER)
+    await engine.answer_interaction(itx, 'qual a melhor versão?')
+    check('status names the thread', ('edit', '🧵 Resposta na thread **Melhor versão do Paper**') in itx.events, itx.events)
+    check('from the question and the answer', 'qual a melhor versão?' in engine.title_calls[0]['user']
+          and 'Reduz o view-distance.' in engine.title_calls[0]['user'], engine.title_calls)
+
+
 async def test_slash_chat_over_budget_is_told_ephemerally(tmp_path, monkeypatch):
     from chat_fakes import ASKER
     engine = make_engine(tmp_path, monkeypatch, budget=Budget(user_limit=1, user_window=300, guild_limit=9, guild_window=300))

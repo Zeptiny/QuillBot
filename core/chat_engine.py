@@ -14,6 +14,7 @@ Other features reach it as ``bot.services.chat``.
 
 from __future__ import annotations
 
+import asyncio
 import datetime
 import logging
 import re
@@ -38,6 +39,7 @@ from config import (
     CHAT_MENTION_CONTINUE_WINDOW,
     CHAT_MENTION_ENABLED,
     CHAT_NAME_ALIASES,
+    CHAT_THREAD_TITLE_MODEL,
     CHAT_USER_BUDGET,
     CHAT_USER_BUDGET_WINDOW,
     CONVERSATIONS_MAX_TURNS,
@@ -60,6 +62,7 @@ from core.conversations import (
 from core.delivery import Outgoing, choose_style, deliver, render
 from core.discord_text import strip_bot_mention
 from core.profiles import CHAT, SPARK, Profile, profile_for
+from core.prompts import THREAD_TITLE_PROMPT
 from core.runner import run_turn
 from core.tool_loop import EMPTY_ANSWER_FALLBACK
 from core.turn import FOLLOW_HEADER, NAME_HEADER, UNPROMPTED_HEADER, TurnContext, TurnResult, is_silent
@@ -73,8 +76,28 @@ _SPARK_REPORT_CACHE_SIZE = 32
 # A burst of follow-ups sent while the bot answered continues that answer's
 # conversation if it comes within this many seconds.
 _FOLLOW_UP_SECONDS = 600
+# Naming a thread holds the answer back; past this the first question names it.
+_THREAD_TITLE_TIMEOUT = 8.0
+_TITLE_LABEL_RE = re.compile(r'^\W*(?:t[íi]tulo|title)\W*:\s*', re.IGNORECASE)
 RATE_LIMIT_TEXT = '⏳ Limite de requisições atingido. Tente novamente em alguns minutos.'
 ERROR_TEXT = 'Ocorreu um erro ao processar sua pergunta. Tente novamente.'
+
+
+def _stays_in(conv: dict, channel: Any) -> bool:
+    """Whether *conv* still talks in *channel*: it hasn't moved to a thread elsewhere."""
+    thread_id = ((conv or {}).get('data') or {}).get('thread_id')
+    return not thread_id or str(thread_id) == str(getattr(channel, 'id', ''))
+
+
+def _turns_in_a_row(history: list[dict], author: Any) -> int:
+    """How many turns in a row *author* has had with the bot, counting the one being answered."""
+    author_id = str(getattr(author, 'id', ''))
+    run = 1
+    for turn in reversed(history):
+        if str((turn.get('author') or {}).get('id', '')) != author_id:
+            break
+        run += 1
+    return run
 
 
 def _norm(text: str) -> str:
@@ -300,7 +323,15 @@ class ChatEngine:
     # ------------------------------------------------------------------
 
     async def _find_conversation(self, burst: Burst) -> tuple[dict | None, int | None, int | None]:
-        """(conversation, handle id, reply_to) the burst continues, if any."""
+        """(conversation, handle id, reply_to) the burst continues, if any.
+
+        A reply to one of a conversation's messages continues it wherever it
+        is. Being picked up by recency (the bot answered here a moment ago)
+        only joins a conversation still talking in this channel: one that moved
+        to a thread is over here, and pulling a new mention or name call into
+        it would answer people in a thread they never joined.
+        """
+        channel = burst.first.channel
         for m in burst.messages:
             ref_id = getattr(getattr(m, 'reference', None), 'message_id', None)
             if ref_id:
@@ -310,14 +341,15 @@ class ChatEngine:
         if all(t == 'join' for t in burst.triggers):
             handle_id = self._last_answer.get(burst.key)
             conv = await self.store.get_by_handle(handle_id) if handle_id else None
-            if conv:
+            if conv and _stays_in(conv, channel):
                 return conv, handle_id, None
         directed_mention = 'mention' in burst.triggers
         if directed_mention and not CHAT_MENTION_CONTINUE_ENABLED:
             return None, None, None
         recent = await find_recent_conversation(
-            self.store, burst.first.channel, self.bot_user.id,
+            self.store, channel, self.bot_user.id,
             before=burst.first, limit=CHAT_MENTION_CONTINUE_WINDOW,
+            accept=lambda conv: _stays_in(conv, channel),
         )
         if recent:
             handle_id, conv = recent
@@ -440,9 +472,8 @@ class ChatEngine:
             return
 
         thread = await self._answer_thread(
-            last, data, turn=len(history) + 1, title=result.thread_title,
-            topic=history[0].get('question', '') if history else prepared.topic,
-            mode=thread_mode,
+            last, data, history=history, directed=directed, title=result.thread_title,
+            topic=prepared.topic, answer=result.answer, mode=thread_mode,
         )
         out = self._outgoing(result, profile, settings, question=prepared.topic)
         try:
@@ -595,25 +626,61 @@ class ChatEngine:
         return conv_id
 
     async def _answer_thread(
-        self, message: Any, data: dict, *, turn: int, title: str | None, topic: str, mode: str | None,
+        self, message: Any, data: dict, *, history: list[dict], directed: bool,
+        title: str | None, topic: str, answer: str, mode: str | None,
     ) -> discord.Thread | None:
         """Thread the answer to *message* goes to, or ``None`` to reply in place.
 
         A conversation that already moved keeps its thread. Otherwise one is
-        opened on *message* when the model asked for it (*title*) or the turn
-        is due one, named *title* or after *topic* (the first question).
+        opened on *message* when the model asked for it (*title*), the channel
+        always uses threads, or *message*'s author has been going back and
+        forth with the bot for ``CHAT_THREAD_AFTER_TURNS`` turns in a row and
+        this one is addressed to it (a reply or mention). Being named in
+        passing, or a group chatting with the bot, moves nobody: that is the
+        channel's own conversation. The thread is named *title* (the model
+        asked for it), or by the model from that back-and-forth (*topic* and
+        *answer* being this turn), or after its first question.
         """
         if isinstance(message.channel, discord.Thread):
             return None
         thread = await chat_threads.conversation_thread(message.guild, data.get('thread_id'))
         if thread is not None:
             return thread
-        if not (title or chat_threads.thread_due(message.channel, turn, mode)):
+        run = _turns_in_a_row(history, message.author) if directed else 0
+        if not (title or chat_threads.thread_due(message.channel, run, mode)):
             return None
         if not chat_threads.can_open_thread(message.channel, mode):
             return None
-        name = title or chat_threads.thread_title(topic, f'Conversa com {message.author.display_name}')
-        return await chat_threads.open_thread(message, name)
+        if not title:
+            earlier = history[len(history) - (run - 1):] if run > 1 else []
+            first = (earlier[0].get('question', '') if earlier else '') or topic
+            exchanges = [(t.get('question', ''), t.get('answer', '')) for t in earlier] + [(topic, answer)]
+            title = await self.thread_name(
+                exchanges, chat_threads.thread_title(first, f'Conversa com {message.author.display_name}'),
+            )
+        return await chat_threads.open_thread(message, title)
+
+    async def thread_name(self, exchanges: list[tuple[str, str]], fallback: str) -> str:
+        """A title for a thread the bot opens on its own, written by the model from
+        the (question, answer) *exchanges* moving there; *fallback* when it can't."""
+        lines = []
+        for question, answer in exchanges[-4:]:
+            question = (question or '').rsplit('\n---\n', 1)[-1].strip()
+            lines.append(f'Pessoa: {question[:400]}\nBot: {(answer or "").strip()[:400]}')
+        try:
+            text = await asyncio.wait_for(
+                self.services.llm.text(
+                    model=CHAT_THREAD_TITLE_MODEL, system=THREAD_TITLE_PROMPT,
+                    user='\n\n'.join(lines), max_tokens=200,
+                ),
+                timeout=_THREAD_TITLE_TIMEOUT,
+            )
+        except Exception:
+            logger.info('[threads] could not name the thread; using the question', exc_info=True)
+            return fallback
+        text = next((line for line in (text or '').splitlines() if line.strip()), '')
+        text = _TITLE_LABEL_RE.sub('', text.strip()).strip('"\'“”`*#.').strip()
+        return chat_threads.thread_title(text, '') or fallback
 
     # ------------------------------------------------------------------
     # Monitors, scheduled tasks and anchored conversations
@@ -757,7 +824,9 @@ class ChatEngine:
             out.title = title
         thread = None
         if profile is CHAT and blocker is None and (result.thread_title or chat_threads.thread_due(channel, 1, thread_mode)):
-            name = result.thread_title or chat_threads.thread_title(question, f'Conversa com {user.display_name}')
+            name = result.thread_title or await self.thread_name(
+                [(question, result.answer)], chat_threads.thread_title(question, f'Conversa com {user.display_name}'),
+            )
             await self._status(interaction, f'🧵 Resposta na thread **{name}**')
             try:
                 anchor = await interaction.original_response()

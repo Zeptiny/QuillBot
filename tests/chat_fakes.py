@@ -238,9 +238,23 @@ def make_services(tmp_path):
 
 
 def make_engine(tmp_path, monkeypatch, *, answers=('Reduz o view-distance.',), thread_title=None,
-                structured=False, budget=None, mentioned=None):
-    """A ChatEngine on real stores whose turns answer from *answers* (the last one repeats)."""
+                structured=False, budget=None, mentioned=None, thread_name=''):
+    """A ChatEngine on real stores whose turns answer from *answers* (the last one repeats).
+
+    Threads the bot opens on its own are named *thread_name* ('' falls back to
+    the first question; an exception is raised); the naming calls are kept in
+    ``engine.title_calls``.
+    """
     services = make_services(tmp_path)
+    title_calls: list[dict] = []
+
+    async def fake_text(**kwargs):
+        title_calls.append(kwargs)
+        if isinstance(thread_name, Exception):
+            raise thread_name
+        return thread_name
+
+    services.llm.text = fake_text
     partial_log: list = []
     bot_user = NS(
         id=BOT_ID, name='quillbot', display_name='QuillBot',
@@ -257,6 +271,7 @@ def make_engine(tmp_path, monkeypatch, *, answers=('Reduz o view-distance.',), t
     )
     services.chat = engine
     engine.turns = []
+    engine.title_calls = title_calls
     engine.partial_log = partial_log
     script = list(answers)
 
@@ -292,12 +307,13 @@ def make_engine(tmp_path, monkeypatch, *, answers=('Reduz o view-distance.',), t
     return engine
 
 
-async def seed(engine, turns, *, handle=60, thread_id=None, channel_id='10', first_question='como reduzo o lag do servidor?'):
-    """A stored conversation of *turns* turns, continued through bot message *handle*."""
+async def seed(engine, turns, *, handle=60, thread_id=None, channel_id='10', first_question='como reduzo o lag do servidor?',
+               author_id='222'):
+    """A stored conversation of *turns* turns by *author_id*, continued through bot message *handle*."""
     data = {
         'turns': [
             {'question': first_question if i == 0 else f'q{i}', 'answer': f'a{i}',
-             'message_id': str(50 + i), 'channel_id': channel_id, 'author': {'id': '222'}}
+             'message_id': str(50 + i), 'channel_id': channel_id, 'author': {'id': author_id}}
             for i in range(turns)
         ],
         'participants': [],

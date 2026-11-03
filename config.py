@@ -187,14 +187,19 @@ CHAT_EDIT_WINDOW_SECONDS: Final[float] = float(os.getenv('CHAT_EDIT_WINDOW_SECON
 
 # --- Chat threads (move long or off-topic conversations out of the channel) ---
 CHAT_THREADS_ENABLED: Final[bool] = os.getenv('CHAT_THREADS_ENABLED', 'true').strip().lower() in ('1', 'true', 'yes')
-# A conversation moves into a thread on this turn (3 = the second follow-up); 0 never moves it.
+# One person's turn in a row with the bot that moves their conversation into a thread
+# (3 = the second follow-up; it must be a reply or mention); 0 never moves it.
 CHAT_THREAD_AFTER_TURNS: Final[int] = int(os.getenv('CHAT_THREAD_AFTER_TURNS', '3'))
 # Channel IDs (comma-separated) where every conversation opens a thread on its first answer.
 CHAT_THREAD_CHANNELS: Final[frozenset[int]] = frozenset(
     int(v) for v in os.getenv('CHAT_THREAD_CHANNELS', '').replace(',', ' ').split() if v.isdigit()
 )
-# Let the chat model open a thread itself (open_thread tool): off-topic questions, casual chat.
+# Let the chat model open a thread itself (open_thread tool): off-topic subjects that will go on,
+# long technical back-and-forths. Chat, jokes and quick questions stay in the channel.
 CHAT_THREAD_TOOL_ENABLED: Final[bool] = os.getenv('CHAT_THREAD_TOOL_ENABLED', 'true').strip().lower() in ('1', 'true', 'yes')
+# Model that names threads the bot opens on its own (the model names the ones it asks for);
+# falls back to SUMMARY_MODEL, then CHAT_MODEL. A cheap model is enough.
+CHAT_THREAD_TITLE_MODEL: Final[str] = os.getenv('CHAT_THREAD_TITLE_MODEL') or os.getenv('SUMMARY_MODEL') or CHAT_MODEL
 # Bot threads archive after this many idle minutes; Discord accepts 60, 1440, 4320 or 10080.
 CHAT_THREAD_ARCHIVE_MINUTES: Final[int] = int(os.getenv('CHAT_THREAD_ARCHIVE_MINUTES', '60'))
 

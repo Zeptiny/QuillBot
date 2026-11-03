@@ -4,13 +4,17 @@ Every chat answer is a reply in the channel, so a long back-and-forth, or a
 question unrelated to what the channel is discussing, buries everyone else's
 conversation. A conversation moves into a thread when
 
-- it reaches ``CHAT_THREAD_AFTER_TURNS`` turns,
+- one person has gone back and forth with the bot for ``CHAT_THREAD_AFTER_TURNS``
+  turns in a row, the last one addressed to it (a reply or mention; being
+  named in passing or a group chatting with the bot never moves anyone),
 - it happens in one of ``CHAT_THREAD_CHANNELS``, or
-- the model calls ``open_thread`` (off-topic question, casual chat).
+- the model calls ``open_thread`` (an off-topic subject that will go on, or a
+  long technical back-and-forth; chat, jokes and quick questions stay put).
 
 The thread is opened on the message that asked, so the channel keeps only that
 message with the thread under it. A conversation that moved keeps answering in
-its thread, even when someone continues it from the channel. Inside a thread
+its thread when someone replies to one of its messages from the channel; a
+mention or name call there starts a new conversation in the channel. Inside a thread
 the bot opened, every message reaches the bot without a mention (see
 ``core.chat_engine``); those carry ``UNPROMPTED_HEADER`` and the model may
 stay silent with ``[NO_REPLY]`` when people there talk among themselves.
@@ -59,10 +63,11 @@ OPEN_THREAD_TOOL = {
         'name': 'open_thread',
         'description': (
             'Abre uma thread na mensagem de quem perguntou e envia sua resposta (e o resto da '
-            'conversa) para ela, deixando o canal limpo. Use quando a pergunta não tem relação '
-            'com o assunto atual do canal, for papo casual ou tende a virar um vai-e-volta longo; '
-            'não use para perguntas rápidas sobre o assunto do canal. Depois de chamar, responda '
-            'normalmente — a resposta vai para a thread.'
+            'conversa) para ela. Use só quando a conversa atrapalharia o canal: um assunto técnico '
+            'que vai virar um vai-e-volta longo (depurar um erro, configurar algo passo a passo) ou '
+            'um assunto sem relação com o que o canal está conversando e que vai render. Não use '
+            'para papo, brincadeira, perguntas rápidas ou conversa com várias pessoas: isso fica '
+            'no canal. Depois de chamar, responda normalmente — a resposta vai para a thread.'
         ),
         'parameters': {
             'type': 'object',
@@ -114,10 +119,12 @@ def can_open_thread(channel: Any, mode: str | None = None) -> bool:
 
 
 def thread_due(channel: Any, turn: int, mode: str | None = None) -> bool:
-    """Whether turn number *turn* of a conversation in *channel* moves it to a thread.
+    """Whether an answer in *channel* moves its conversation to a thread.
 
-    *mode* is the channel's ``threads`` setting (``auto``/``always``/``never``);
-    without one, channels in ``CHAT_THREAD_CHANNELS`` count as ``always``.
+    *turn* is how many turns in a row the asker has had with the bot, this one
+    included (0 when this one doesn't count: the bot was only named). *mode* is
+    the channel's ``threads`` setting (``auto``/``always``/``never``); without
+    one, channels in ``CHAT_THREAD_CHANNELS`` count as ``always``.
     """
     if not CHAT_THREADS_ENABLED or mode == 'never':
         return False
