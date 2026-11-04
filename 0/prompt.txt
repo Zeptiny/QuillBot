@@ -1,0 +1,5 @@
+Can you make so link embeds are not shown when the bot sends one? It clutters the chat
+
+---
+
+commit, push and merge
