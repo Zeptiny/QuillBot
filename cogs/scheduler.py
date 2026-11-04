@@ -600,6 +600,7 @@ class Scheduler(commands.Cog, name='Scheduler'):
             elif answer:
                 await channel.send(
                     answer[:2000],
+                    suppress_embeds=True,
                     allowed_mentions=discord.AllowedMentions(
                         users=True, roles=False, everyone=False,
                     ),
