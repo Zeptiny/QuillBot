@@ -20,6 +20,7 @@ Built with [discord.py](https://discordpy.readthedocs.io/) + RAG (Retrieval-Augm
 - [Documentation Sources](#documentation-sources)
 - [Project Structure](#project-structure)
 - [Installation](#installation)
+- [Radar de Hardware MCP](#radar-de-hardware-via-mcp)
 - [Configuration](#configuration)
 - [Running the Bot](#running-the-bot)
 - [Docker](#docker)
@@ -777,6 +778,26 @@ ruff check .                   # lint (rules configured in pyproject.toml)
 | `test_wrapped.py` | Wrapped numbers, weekly/monthly schedule, automatic posts once per period, the tool |
 
 `tests/conftest.py` puts the repo root on the import path, runs `async def` tests without a plugin, and provides a `tmpdb` fixture. `tests/helpers.py` has `check(label, condition, detail)`, a labelled assert. `tests/chat_fakes.py` has fake Discord objects and `make_engine`, a real chat engine on temp stores whose turns answer from a script. New tests go in the file for the module they cover, or a new `test_<module>.py`.
+
+---
+
+## Radar de Hardware via MCP
+
+Optional integration with [Radar de Hardware](https://radardehardware.com.br)
+for current Brazilian prices, price history and specifications of GPUs, CPUs
+and RAM through its Streamable HTTP MCP endpoint.
+
+Install `requirements.txt`, set `RADAR_MCP_ENABLED=true` in `.env`, and restart
+the bot. No API key or Tavily configuration is required. Disabled by default.
+`RADAR_MCP_URL` defaults to `https://radardehardware.com.br/mcp`;
+`RADAR_MCP_TIMEOUT_SECONDS` limits each request (default: 30 seconds).
+
+In `/chat`, mentions and conversations, ask for example: “Quais placas de vídeo
+até R$ 2.000 estão disponíveis?” or “Como evoluiu o preço da RTX 5070 Ti?”.
+The model uses `radar_list_tools` to discover current schemas, then
+`radar_call_tool` to query the server. MCP links, structured content and error
+flags are preserved. Network failures are reported to the model so it can
+continue the conversation. `/ask` and Spark keep their documentation tools.
 
 ---
 

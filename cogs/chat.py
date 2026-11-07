@@ -16,7 +16,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from config import EPISODES_ENABLED, EPISODES_INTERVAL_SECONDS, MEMORY_ENABLED
-from core import context_tools
+from core import context_tools, radar_tools
 from core.chat_engine import ChatEngine
 from core.episodes import EpisodeWriter
 from core.profiles import ASK, CHAT
@@ -35,6 +35,7 @@ class Chat(commands.Cog):
         self.engine = ChatEngine(bot, self.services)
         self.services.chat = self.engine
         context_tools.register(self.services.tools)
+        radar_tools.register(self.services.tools)
         self._episode_task: asyncio.Task | None = None
 
     async def cog_load(self) -> None:
@@ -43,6 +44,7 @@ class Chat(commands.Cog):
             self._episode_task = asyncio.get_running_loop().create_task(self._episode_loop())
 
     async def cog_unload(self) -> None:
+        self.services.tools.unregister(*radar_tools.RADAR_TOOLS)
         self.services.router.remove(ROUTER_NAME)
         await self.engine.bursts.close()
         if self._episode_task is not None:

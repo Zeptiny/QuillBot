@@ -13,6 +13,7 @@ from dataclasses import dataclass
 
 from config import CHAT_MODEL, DOCS_BASE_URL, SPARK_MODEL
 from core.prompts import ASK_SYSTEM_PROMPT, CHAT_SYSTEM_PROMPT, SPARK_SYSTEM_PROMPT_SUFFIX
+from core.radar_tools import RADAR_TOOLS
 
 CONTEXT_TOOLS = (
     'get_channel_history',
@@ -59,6 +60,7 @@ CHAT = Profile(
     system_prompt=CHAT_SYSTEM_PROMPT,
     tools=(
         *WEB_TOOLS,
+        *RADAR_TOOLS,
         *DOCS_TOOLS,
         *CONTEXT_TOOLS,
         *MEMORY_TOOLS,

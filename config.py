@@ -23,6 +23,11 @@ BOT_TOKEN: Final[str | None] = os.getenv('BOT_TOKEN')
 OPENROUTER_API_KEY: Final[str | None] = os.getenv('OPENROUTER_API_KEY')
 TAVILY_API_KEY: Final[str | None] = os.getenv('TAVILY_API_KEY')
 
+# Optional Radar de Hardware MCP (Streamable HTTP, no API key required).
+RADAR_MCP_ENABLED: Final[bool] = _flag('RADAR_MCP_ENABLED', 'false')
+RADAR_MCP_URL: Final[str] = os.getenv('RADAR_MCP_URL', 'https://radardehardware.com.br/mcp').strip()
+RADAR_MCP_TIMEOUT_SECONDS: Final[float] = max(1.0, float(os.getenv('RADAR_MCP_TIMEOUT_SECONDS', '30')))
+
 # --- LLM (OpenAI-compatible) ---
 # OPENAI_* is the canonical name for any OpenAI-compatible endpoint.
 # OPENROUTER_* and LLM_* are kept as aliases for backward compatibility.
