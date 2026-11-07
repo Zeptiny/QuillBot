@@ -190,6 +190,19 @@ async def main():
     assert sdk[2]['response_body']['content'] == 'ok'
     assert 'test-key' not in json.dumps(sdk), 'API key leaked into the log'
 
+    # Mistral reasoning streams: list-shaped content folds into content + thinking.
+    mistral = _sse(
+        {'choices': [{'index': 0, 'delta': {'role': 'assistant', 'content': [
+            {'type': 'thinking', 'thinking': [{'type': 'text', 'text': 'hmm, '}]}]}}]},
+        {'choices': [{'index': 0, 'delta': {'content': [
+            {'type': 'thinking', 'thinking': [{'type': 'text', 'text': 'ok'}]}]}}]},
+        {'choices': [{'index': 0, 'delta': {'content': [{'type': 'text', 'text': 'Olá'}]}}]},
+        {'choices': [{'index': 0, 'delta': {'content': ', mundo'}, 'finish_reason': 'stop'}]},
+    )
+    folded = api_logger._fold_sse(mistral.encode())
+    assert folded['content'] == 'Olá, mundo' and folded['thinking'] == 'hmm, ok', folded
+    assert folded['finish_reason'] == 'stop' and folded['stream_chunks'] == 4
+
     # Bodies: inline images shrink to their size; long bodies keep both ends.
     b64 = 'A' * 5000
     shrunk = api_logger._body_value(json.dumps({'u': f'data:image/png;base64,{b64}'}))

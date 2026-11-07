@@ -98,6 +98,27 @@ def _retry_delay(error: BaseException, attempt: int) -> float:
     return base + random.uniform(0, base / 4)
 
 
+def _content_text(value: Any) -> str:
+    """The answer text in a delta's ``content``, whichever shape the provider sends.
+
+    Most providers stream ``content`` as a string, but Mistral's reasoning
+    models send a list of typed chunks (``{"type": "text", "text": ...}`` and
+    ``{"type": "thinking", "thinking": [...]}``). Only the ``text`` chunks are
+    the answer; thinking chunks are dropped, like a reasoning trace the bot
+    never shows or replays.
+    """
+    if value is None:
+        return ''
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (list, tuple)):
+        return ''.join(_content_text(part) for part in value)
+    if _get(value, 'type', None) == 'text':
+        text = _get(value, 'text', None)
+        return text if isinstance(text, str) else ''
+    return ''
+
+
 async def _stream_completion(client: Any, kwargs: dict) -> Any:
     from openai.types.chat import ChatCompletion, ChatCompletionMessage
     from openai.types.chat.chat_completion import Choice
@@ -126,8 +147,9 @@ async def _stream_completion(client: Any, kwargs: dict) -> Any:
                 delta = _get(choice, 'delta', None)
                 if delta is None:
                     continue
-                if _get(delta, 'content', None):
-                    content.append(delta.content)
+                text = _content_text(_get(delta, 'content', None))
+                if text:
+                    content.append(text)
                 for key, value in (getattr(delta, 'model_extra', None) or {}).items():
                     if isinstance(value, str) and value:
                         extras.setdefault(key, []).append(value)

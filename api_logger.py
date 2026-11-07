@@ -196,6 +196,30 @@ async def _patched_httpx2_send(self: Any, request: Any, **kwargs: Any) -> Any:
     return await _logged_httpx_send(_ORIG_HTTPX2_SEND, httpx2, self, request, **kwargs)
 
 
+def _content_parts(value: Any) -> tuple[str, str]:
+    """(text, thinking) in a delta's list-shaped ``content``.
+
+    Mistral's reasoning models stream ``content`` as typed chunks
+    (``{"type": "text", "text": ...}``, ``{"type": "thinking", "thinking": [...]}``)
+    rather than a string.
+    """
+    if isinstance(value, str):
+        return value, ''
+    text, thinking = [], []
+    if isinstance(value, list):
+        for part in value:
+            t, th = _content_parts(part)
+            text.append(t)
+            thinking.append(th)
+    elif isinstance(value, dict):
+        if value.get('type') == 'text' and isinstance(value.get('text'), str):
+            text.append(value['text'])
+        elif value.get('type') == 'thinking':
+            inner, nested = _content_parts(value.get('thinking') or [])
+            thinking.append(inner + nested)
+    return ''.join(text), ''.join(thinking)
+
+
 def _fold_sse(raw: bytes) -> Any:
     """Fold a streamed chat completion (SSE) into one compact log value.
 
@@ -236,7 +260,13 @@ def _fold_sse(raw: bytes) -> Any:
                 folded['finish_reason'] = choice['finish_reason']
             delta = choice.get('delta') or {}
             for key, value in delta.items():
-                if isinstance(value, str) and key != 'role':
+                if key == 'content' and isinstance(value, list):
+                    text, thinking = _content_parts(value)
+                    if text:
+                        deltas['content'] = deltas.get('content', '') + text
+                    if thinking:
+                        deltas['thinking'] = deltas.get('thinking', '') + thinking
+                elif isinstance(value, str) and key != 'role':
                     deltas[key] = deltas.get(key, '') + value
             for i, tc in enumerate(delta.get('tool_calls') or []):
                 if not isinstance(tc, dict):
