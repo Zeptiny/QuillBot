@@ -84,6 +84,11 @@ SETTINGS: dict[str, Setting] = {s.key: s for s in (
         'wrapped_channel', 'guild', 'channel', '', 'Canal do Wrapped',
         'Canal onde a retrospectiva automática é publicada.',
     ),
+    Setting(
+        'voice', 'guild', 'bool', False, 'Conversa por voz',
+        'Deixa o bot entrar nas calls com /voz entrar e conversar por voz. Enquanto ele está '
+        'na call, o áudio de quem fala vai para a IA de voz (Qwen, da Alibaba Cloud).',
+    ),
 )}
 
 

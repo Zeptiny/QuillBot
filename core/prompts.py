@@ -353,3 +353,60 @@ def lag_spike_warning(threshold_ms: float) -> str:
         'Não sugira otimizações gerais de desempenho como resposta primária.\n'
         '</lag_spike_warning>'
     )
+
+
+# --- Voice calls (/voz) ---
+# The realtime voice model gets one system prompt for the whole call; whatever it
+# writes is spoken, so the text rules are about speech, not Discord formatting.
+VOICE_ROLE = (
+    "<role>\n"
+    "Você é o bot deste servidor do Discord e entrou numa call de voz com a comunidade. "
+    "Fale sempre em português brasileiro.\n"
+    "Sua personalidade e seu jeito de falar são definidos pelo próprio servidor: siga o bloco "
+    "<personalidade> quando houver.\n"
+    "</role>"
+)
+
+VOICE_RULES = (
+    "<voz>\n"
+    "- Tudo o que você responde vira fala. Fale como numa conversa: frases curtas e naturais, "
+    "uma ou duas por vez, e deixe espaço para as pessoas responderem.\n"
+    "- Nada de markdown, listas, links, emojis ou blocos de código. Números, siglas e termos "
+    "técnicos do jeito que se falam.\n"
+    "- Várias pessoas podem estar na call, e às vezes conversam entre si. Se uma fala "
+    "claramente não foi para você, responda bem curto ou só concorde, sem puxar o assunto.\n"
+    "- Você ouve todo mundo num áudio só e não sabe quem está falando: não chame ninguém pelo "
+    "nome, a não ser que a pessoa diga quem é.\n"
+    "- Se pedirem uma explicação longa, explique falando: os pontos principais em poucas "
+    "frases, e pergunte se querem que você continue. Só mande para o chat de texto o que "
+    "precisa ser lido, como um comando longo, uma configuração ou um link.\n"
+    "- Responda com o que você sabe. Nesta call você não tem as memórias do servidor, o "
+    "histórico nem a documentação: quando a resposta depender disso, ou se não tiver certeza, "
+    "diga isso em vez de inventar.\n"
+    "</voz>"
+)
+
+
+def voice_instructions(
+    *, server: str, channel: str, caller: str, participants: list[str], now: str, persona: str = '',
+) -> str:
+    """The system prompt of a voice call."""
+    people = ', '.join(participants) if participants else caller
+    context = (
+        "<contexto>\n"
+        f"Servidor: {server}. Call: {channel}. Quem chamou você: {caller}. "
+        f"Na call quando você entrou: {people}. Agora: {now} (horário de Brasília).\n"
+        "</contexto>"
+    )
+    parts = [VOICE_ROLE, VOICE_RULES, context]
+    if persona:
+        parts.append(persona)
+    return '\n\n'.join(parts)
+
+
+def voice_greeting(caller: str) -> str:
+    """The turn that makes the bot say hello when it joins (so everyone knows it's listening)."""
+    return (
+        f"[{caller} acabou de chamar você para a call. Cumprimente a call numa frase curta e "
+        "diga que está ouvindo.]"
+    )

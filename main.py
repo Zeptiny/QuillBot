@@ -60,6 +60,7 @@ COGS = [
     'cogs.monitors',
     'cogs.summary',
     'cogs.wrapped',
+    'cogs.voice',
 ]
 
 

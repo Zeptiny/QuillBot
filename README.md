@@ -48,6 +48,7 @@ Built with [discord.py](https://discordpy.readthedocs.io/) + RAG (Retrieval-Augm
 | **Server Tools** | JVM flags, server status checks, docs changelog |
 | **Channel Summaries** | `/resumo` and natural-language "o que perdi?" — map-reduce summaries of a channel or thread over any period, with jump links and permission checks |
 | **Monitors** | Standing triggers (channels, authors, mentions of a user, a content regex) that call the bot on matching messages; it answers like a mention, knows a monitor sent it, and may stay silent. Managed with `/monitor` or by asking the bot |
+| **Voice Calls** | `/voz entrar`: the bot joins your voice channel and talks in real time (speech-to-speech with Qwen-Audio realtime) — hears everyone in the call, stops when talked over, optionally writes the conversation in the call's chat. Off unless configured, and each server opts in |
 | **Persistent Memory** | The bot remembers: atomic facts about the server and its members, auto-injected into every conversation, with inline LLM writes, pinning, dedupe, full audit history and admin control. Each memory records who said it — a fact about someone told by someone else is shown as a report ("segundo Fulano") |
 
 All AI responses are in **Brazilian Portuguese**.
@@ -245,8 +246,23 @@ A recap of the server over a period (`semana` = 7 days, default; `mes`; `ano`; o
 | `instructions` | channel | text the model follows in that channel ("seja direto e técnico", "aqui é papo livre") |
 | `aliases` | server | extra names the bot answers to, comma-separated |
 | `wrapped`, `wrapped_channel` | server | automatic Wrapped: `off`/`weekly`/`monthly` and where |
+| `voice` | server | allow `/voz entrar` (default off: a call's audio goes to the voice model) |
 
 Stored in `SETTINGS_DB_PATH`.
+
+#### `/voz entrar` · `/voz sair` — Voice calls
+The bot joins the voice channel you're in and talks with the call in real time. It's a speech-to-speech model ([Qwen-Audio realtime](https://www.alibabacloud.com/help/en/model-studio/qwen-audio-realtime-user-guides), Alibaba Cloud Model Studio): audio goes in, audio comes out, no separate speech-to-text and text-to-speech steps, so answers start a second or two after someone stops talking.
+
+- **Who it hears:** everyone in the call, mixed into one stream (other bots, like music bots, are left out). The model can't tell voices apart, so it doesn't call people by name unless they say who they are
+- **Turns:** the model decides when someone finished (`VOICE_TURN_DETECTION`; `smart_turn_v2` understands turns semantically and ignores most cross-talk and "uhum"s)
+- **Interrupting:** talking over the bot for ~0.7 s stops it mid-sentence and cancels the rest of its answer
+- **Personality:** the server's `<personalidade>` block, plus voice rules (short spoken sentences, no markdown or links). No tools in calls: memories, history and docs stay in the text chat, and the bot says so instead of guessing
+- **Transcripts** (`VOICE_TRANSCRIPTS`): what was heard (`🎙️ **Ana:** …`, attributed by who was talking when) and what the bot said (`🔊 …`, with `…` where it was cut off) go to the call's text chat
+- **Leaving:** `/voz sair` (anyone in the call, or Move Members / Manage Server), everyone leaving, `VOICE_IDLE_MINUTES` without anyone talking, or `VOICE_MAX_MINUTES` in the call
+- **Enabling:** `VOICE_ENABLED`, `VOICE_API_KEY` and `VOICE_REALTIME_URL` (see [Voice Calls](#voice-calls) under Configuration), libopus on the host, then per server `/config servidor opcao:Conversa por voz valor:sim`. When joining, the bot says it's listening and posts that the call's audio goes to the voice model
+- **Not supported:** stage channels; several calls in one server at once (one per server, `VOICE_MAX_CALLS` across all servers)
+
+discord.py has no voice receive, so `core/voice_receive.py` adds it on discord.py's own hooks: the voice websocket says which user sends each RTP stream, every UDP packet is unwrapped from the transport encryption, then from Discord's DAVE end-to-end encryption (with the MLS keys of discord.py's `davey` session), then decoded from opus.
 
 ---
 
@@ -441,6 +457,10 @@ QuillBot/
 │   ├── image_store.py    # Persisted, re-encoded images for vision
 │   ├── tavily_tools.py   # Tavily web_search / web_extract
 │   ├── local_inference.py# Single-thread executor for local models
+│   ├── voice_receive.py  # Voice receive for discord.py: RTP transport decryption, DAVE, opus, ListeningVoiceClient
+│   ├── voice_audio.py    # Resampling (48k↔16k/24k), the per-speaker mixer, the playback buffer/source
+│   ├── voice_call.py     # One live call: audio both ways, barge-in, transcripts, watchdog
+│   ├── realtime_voice.py # Qwen-Audio realtime WebSocket client
 │   └── ui.py             # PaginatedEmbedView, source pages
 ├── cogs/
 │   ├── chat.py           # /chat, /ask, the chat router handler, edit/delete events, the episode worker
@@ -448,6 +468,7 @@ QuillBot/
 │   ├── server_config.py  # /config — server and channel settings
 │   ├── persona.py        # /persona, the persona_update tool, change log with Revert
 │   ├── wrapped.py        # /wrapped, server_wrapped tool, automatic weekly/monthly recaps
+│   ├── voice.py          # /voz entrar | sair — real-time voice calls
 │   ├── docs_rag.py       # Docs RAG — indexing, search, reranking, /reindex, search_docs/search_plugins tools
 │   ├── history_rag.py    # Server-wide history RAG — backfill, live ingestion, reactions, history tools, Wrapped stats
 │   ├── log_analyzer.py   # Passive log detection, pattern matching, /analyze, file upload to mclo.gs
@@ -484,11 +505,13 @@ cd QuillBot
 pip install -r requirements.txt
 ```
 
+Voice calls (`/voz`) also need libopus: `apt install libopus0` (the Docker image has it).
+
 ### Discord Bot Setup
 
 1. Create a bot at https://discord.com/developers/applications
 2. Under **Bot → Privileged Gateway Intents** enable **Message Content Intent**
-3. Invite with scopes `bot` + `applications.commands` and permissions: Send Messages, Embed Links, Read Message History, Add Reactions, Use Application Commands
+3. Invite with scopes `bot` + `applications.commands` and permissions: Send Messages, Embed Links, Read Message History, Add Reactions, Use Application Commands (plus Connect and Speak for voice calls)
 
 ---
 
@@ -679,6 +702,26 @@ cp .env.example .env   # if available, otherwise create .env manually
 | `WRAPPED_ENABLED` | `true` | `/wrapped`, the `server_wrapped` tool and automatic recaps |
 | `WRAPPED_HOUR` | `10` | Brasília hour automatic recaps are posted (Mondays / the 1st) |
 
+### Voice Calls
+
+`/voz` exists only when `VOICE_ENABLED=true`, both `VOICE_API_KEY` and `VOICE_REALTIME_URL` are set, and libopus is installed (the startup log says which one is missing). Servers then opt in with the `voice` setting.
+
+| Variable | Default | Description |
+|---|---|---|
+| `VOICE_ENABLED` | `false` | Master switch |
+| `VOICE_API_KEY` | — | Model Studio key: pay-as-you-go (`sk-…`) or Token Plan (`sk-sp-…`) |
+| `VOICE_REALTIME_URL` | — | Realtime WebSocket endpoint for that key, without `?model=`. Pay-as-you-go: `wss://{WorkspaceId}.ap-southeast-1.maas.aliyuncs.com/api-ws/v1/realtime`. Token Plan: `wss://token-plan.ap-southeast-1.maas.aliyuncs.com/api-ws/v1/realtime` — but Token Plan *Personal* Edition is for one person's interactive use and forbids production services and sharing a key, which a community bot is |
+| `VOICE_MODEL` | `qwen-audio-3.0-realtime-plus` | Realtime model |
+| `VOICE_VOICE` | `longanqian` | 3.0 voices: `longanqian`, `longanlingxin`, `longanlingxi`, `longanxiaoxin`, `longanlufeng`, or a cloned `voice_id` |
+| `VOICE_TURN_DETECTION` | `smart_turn_v2` | `smart_turn_v2` (semantic, best with several people), `smart_turn`, or `server_vad` (silence only; answers faster, interrupts more easily) |
+| `VOICE_WEB_SEARCH` | `false` | Let the model search the web on its own |
+| `VOICE_TRANSCRIPTS` | `true` | Post what was heard and said in the call's text chat |
+| `VOICE_MAX_CALLS` | `1` | Simultaneous calls across all servers |
+| `VOICE_MAX_MINUTES` | `30` | A call ends after this long |
+| `VOICE_IDLE_MINUTES` | `2.5` | …or after this long with nobody talking. Keep it under 3: the model closes a session that goes 180 s without answering (`response_idle_timeout`) |
+
+Audio streams to the model the whole time the bot is in a call, silence included: its turn detection measures pauses on that stream (in testing, the usage the model reported covered the detected speech, not the silence). `davey` stays below 0.2 until discord.py supports it (see `requirements.txt`).
+
 ### Other
 
 | Variable | Default | Description |
@@ -775,6 +818,10 @@ ruff check .                   # lint (rules configured in pyproject.toml)
 | `test_summary.py` | `/resumo`: period parsing, fetching, map-reduce, permissions |
 | `test_tool_loop.py` | Tool errors reported to the model instead of aborting the turn |
 | `test_trajectory_replay.py` | Trajectory capture, verbatim replay, text tool-call recovery |
+| `test_realtime_voice.py` | The realtime voice client against a local fake server: handshake, auth, audio, events, refused keys and settings, timeouts |
+| `test_voice_audio.py` | Resampling (band kept, aliasing and imaging removed, seamless across chunks), the per-speaker mixer and its jitter buffer, the playback buffer |
+| `test_voice_call.py` | A call with Discord and the model faked: people (not bots) reach the model, playback, transcripts in order with who spoke, barge-in from both sides, cut lines edited, the watchdog, ending |
+| `test_voice_receive.py` | RTP transport decryption (incl. discord.py's own packets), header extensions, the DAVE layer, opus decoding, the voice websocket hook |
 | `test_wrapped.py` | Wrapped numbers, weekly/monthly schedule, automatic posts once per period, the tool |
 
 `tests/conftest.py` puts the repo root on the import path, runs `async def` tests without a plugin, and provides a `tmpdb` fixture. `tests/helpers.py` has `check(label, condition, detail)`, a labelled assert. `tests/chat_fakes.py` has fake Discord objects and `make_engine`, a real chat engine on temp stores whose turns answer from a script. New tests go in the file for the module they cover, or a new `test_<module>.py`.
