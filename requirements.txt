@@ -1,7 +1,11 @@
 aiohttp>=3.11.0
 mcp>=1.10.0,<2
 cachetools>=5.5.0
-discord.py>=2.5.0
+discord.py[voice]>=2.7.1,<2.8
+# Receive API is experimental; core/voice_audio.py handles DAVE before Opus decoding.
+discord-ext-voice-recv==0.5.2a179
+websockets>=15,<17
+certifi>=2024.2.2
 numpy>=1.26.0
 openai>=1.30.0
 Pillow>=10.0.0

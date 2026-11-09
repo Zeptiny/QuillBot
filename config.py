@@ -62,6 +62,17 @@ SPARK_MODEL: Final[str] = os.getenv('SPARK_MODEL', 'google/gemini-2.5-pro')
 EMBEDDING_MODEL: Final[str] = os.getenv('EMBEDDING_MODEL', 'qwen/qwen3-embedding-8b')
 RERANK_MODEL: Final[str] = os.getenv('RERANK_MODEL', 'cohere/rerank-4-fast')
 
+# --- Real-time Discord voice (separate from the text LLM provider) ---
+VOICE_ENABLED: Final[bool] = _flag('VOICE_ENABLED')
+TOKEN_PLAN_API_KEY: Final[str | None] = os.getenv('TOKEN_PLAN_API_KEY') or os.getenv('ANTHROPIC_AUTH_TOKEN')
+QWEN_REALTIME_URL: Final[str] = os.getenv(
+    'QWEN_REALTIME_URL', 'wss://token-plan.ap-southeast-1.maas.aliyuncs.com/api-ws/v1/realtime',
+).strip()
+QWEN_REALTIME_MODEL: Final[str] = os.getenv('QWEN_REALTIME_MODEL', 'qwen-audio-3.0-realtime-plus')
+QWEN_REALTIME_VOICE: Final[str] = os.getenv('QWEN_REALTIME_VOICE', 'longanqian')
+VOICE_IDLE_TIMEOUT_SECONDS: Final[float] = max(10.0, float(os.getenv('VOICE_IDLE_TIMEOUT_SECONDS', '300')))
+VOICE_MAX_SESSION_SECONDS: Final[float] = max(30.0, float(os.getenv('VOICE_MAX_SESSION_SECONDS', '1800')))
+
 # --- Merge Gateway vendor priority ---
 # When OPENAI_BASE_URL points at the Merge Gateway (merge.dev), chat completions
 # carry an inline `priority_order` (docs.merge.dev/merge-gateway/routing/

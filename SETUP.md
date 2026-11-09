@@ -25,6 +25,8 @@ pip install -r requirements.txt
 | Package       | Purpose                               |
 |---------------|---------------------------------------|
 | `discord.py`  | Discord API wrapper                   |
+| `discord.py[voice]`, `discord-ext-voice-recv` | Voice transport, DAVE encryption and receiving audio |
+| `websockets`, `certifi` | TLS connection to Qwen's real-time audio API |
 | `aiohttp`     | Async HTTP requests                   |
 | `openai`      | OpenRouter API client (OpenAI compat) |
 | `cachetools`  | TTL cache for conversation history    |
@@ -55,7 +57,16 @@ cp .env.example .env
 | `EMBEDDING_MODEL`| `qwen/qwen3-embedding-8b`     | Model used to embed documentation chunks.    |
 | `RERANK_MODEL`   | `cohere/rerank-4-fast`         | Model used to rerank search results.         |
 
-> All models are routed through OpenRouter. You can swap to any model available there by changing the identifier.
+> Text and embedding models use the configured OpenAI-compatible provider. Voice connects directly to Token Plan.
+
+### Optional — Real-time Voice
+
+1. Install the updated `requirements.txt`. Local Linux installations also need Opus (`sudo apt-get install libopus0` on Debian/Ubuntu or `sudo dnf install opus` on Fedora); macOS uses `brew install opus`. The Docker image includes it, and discord.py bundles it on Windows.
+2. Set `TOKEN_PLAN_API_KEY` to your Token Plan subscription key in the bot environment. `ANTHROPIC_AUTH_TOKEN` is the fallback. The default endpoint is Singapore; set `QWEN_REALTIME_URL` for the subscription's region if different. Do not use the OpenRouter key for voice.
+3. Grant **View Channel**, **Connect**, **Speak**, and **Send Messages** in the voice channel, then restart the bot.
+4. Join a normal voice channel and run `/voice entrar`. The bot announces that channel audio goes to Qwen, then listens and speaks. Use `/voice sair` to stop or `/voice status` to check the session.
+
+The default model is `qwen-audio-3.0-realtime-plus`, with voice `longanqian`. All human participants can talk to it; use headphones and take turns. The bot leaves empty channels and disconnects on failures, after `VOICE_IDLE_TIMEOUT_SECONDS=300` of inactivity, or after `VOICE_MAX_SESSION_SECONDS=1800` total. `VOICE_ENABLED=false` disables the commands. It uses the server's personality, but does not access text tools or memory, or save audio/transcripts. See [voice configuration](README.md#real-time-voice) for all variables and behavior.
 
 ### Optional — Rate Limiting
 
@@ -163,11 +174,13 @@ After adding a source, restart the bot or run `/reindex` (admin-only) to index i
 - **Read Message History** — follow-up conversations via replies
 - **Add Reactions** — the 👀 reaction on detected paste links
 - **Use Application Commands** — slash commands
+- **View Channel**, **Connect**, **Speak** — real-time voice; **Send Messages** must also be allowed in the voice channel for its start notice
 - **Create Public Threads** and **Send Messages in Threads** — move long or off-topic chats into threads (without them the bot answers in the channel)
 
 ### Required Intents
 
 - **Message Content** — needed for passive log/error detection in chat
+- **Voice States** — enabled in code for voice sessions; not a privileged portal toggle
 
 Enable this in the Developer Portal under **Bot → Privileged Gateway Intents → Message Content Intent**.
 

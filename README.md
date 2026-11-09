@@ -13,6 +13,7 @@ Built with [discord.py](https://discordpy.readthedocs.io/) + RAG (Retrieval-Augm
 
 - [Features](#features)
 - [Conversations](#conversations)
+- [Real-time voice](#real-time-voice)
 - [Slash Commands](#slash-commands)
 - [Passive Features](#passive-features)
 - [Architecture](#architecture)
@@ -33,6 +34,7 @@ Built with [discord.py](https://discordpy.readthedocs.io/) + RAG (Retrieval-Augm
 | Category | Capability |
 |---|---|
 | **Conversation** | Answers @mentions, replies to its messages, messages in its threads and being called by name; plain messages like any member (embeds only for summaries, reports and long answers); quick consecutive messages answered as one; may just react or stay quiet |
+| **Real-time voice** | `/voice entrar` joins your voice channel for streaming Qwen audio conversation, with interruptions and the server's personality; `/voice sair` disconnects |
 | **Q&A (RAG)** | Answers questions grounded in indexed docs (Miners' Refuge, PaperMC, PurpurMC, Spark) — in any conversation, not only `/ask` |
 | **General Chat** | Web search, server/history context awareness, one voice across every entry point |
 | **Episodes** | When a conversation ends, the bot keeps a short summary of it per participant, so it can pick the subject up later ("e aí, deu certo o backup?") |
@@ -75,6 +77,30 @@ Everything below goes through one chat engine (`core/chat_engine.py`), so `/chat
 **Edits and deletes** — deleting a message the bot answered deletes the answer and drops that turn (part of a burst keeps the answer); editing it within `CHAT_EDIT_WINDOW_SECONDS` of the answer re-answers it, editing the old answer in place.
 
 **Threads** — see [`/chat`](#chat-question-image) below; per channel, `/config canal threads` is `auto`, `always` or `never`.
+
+---
+
+## Real-time voice
+
+Join a normal Discord voice channel, run `/voice entrar`, and start speaking. Qwen detects the end of each turn and streams its spoken reply into the channel. Speak again to interrupt it. `/voice status` shows the active channel; `/voice sair` ends the session. Anyone in that voice channel, or someone with **Manage Server**, can end it. There is one session per server; concurrent servers have separate sessions.
+
+Voice uses Alibaba Cloud's [Token Plan real-time API](https://www.alibabacloud.com/help/en/model-studio/token-plan-realtime-voice), with `qwen-audio-3.0-realtime-plus` and the `longanqian` voice by default. Add `TOKEN_PLAN_API_KEY` to the bot's environment (fallback: `ANTHROPIC_AUTH_TOKEN`), install the updated requirements, and restart. A missing voice key leaves text features available; `/voice entrar` explains what to configure. This uses Discord microphones and playback, so the server does not need a microphone, speakers, `sounddevice`, or FFmpeg.
+
+The bot needs **View Channel**, **Connect**, **Speak**, and **Send Messages** in the voice channel. Before listening, it posts a notice in that channel's text chat explaining that participants' audio goes to Qwen. All human speakers share the conversation; bots are ignored. Speak one at a time and use headphones to avoid echo. Stage channels are not supported.
+
+Voice includes the server's `/persona` at session start. Conversation context lives in the Qwen session; the bot does not save audio or transcripts. Text history, persistent memory and tools are not connected to voice. The bot leaves when the channel has no humans, when it is moved or disconnected, on a connection failure, after five minutes of inactivity, or after thirty minutes total. Run `/voice entrar` to start a fresh session. Text conversation budgets do not apply to voice; the duration limits below govern it.
+
+| Variable | Default | Description |
+|---|---|---|
+| `TOKEN_PLAN_API_KEY` | *(unset)* | Token Plan subscription key; takes priority over `ANTHROPIC_AUTH_TOKEN` |
+| `VOICE_ENABLED` | `true` | Set `false` to remove `/voice` |
+| `QWEN_REALTIME_URL` | `wss://token-plan.ap-southeast-1.maas.aliyuncs.com/api-ws/v1/realtime` | TLS WebSocket endpoint; must match the subscription's region. Set the Beijing Token Plan domain for a Beijing subscription |
+| `QWEN_REALTIME_MODEL` | `qwen-audio-3.0-realtime-plus` | Model query parameter |
+| `QWEN_REALTIME_VOICE` | `longanqian` | Voice supported by the chosen model |
+| `VOICE_IDLE_TIMEOUT_SECONDS` | `300` | Leave after this many seconds without detected speech or generated audio; minimum 10 |
+| `VOICE_MAX_SESSION_SECONDS` | `1800` | Maximum session duration; minimum 30 |
+
+The Docker image installs `libopus0`. For a local Linux installation, install the system Opus library (Debian/Ubuntu: `sudo apt-get install libopus0`; Fedora: `sudo dnf install opus`). On macOS use `brew install opus`; discord.py bundles Opus on Windows. Python requirements include PyNaCl, DAVE and voice receive support. The receive extension is pinned because its API is experimental; the audio sink decrypts incoming DAVE frames using discord.py's negotiated session before decoding Opus. Discord 2.7 is constrained because that integration uses its internal connection state.
 
 ---
 
@@ -488,7 +514,7 @@ pip install -r requirements.txt
 
 1. Create a bot at https://discord.com/developers/applications
 2. Under **Bot → Privileged Gateway Intents** enable **Message Content Intent**
-3. Invite with scopes `bot` + `applications.commands` and permissions: Send Messages, Embed Links, Read Message History, Add Reactions, Use Application Commands
+3. Invite with scopes `bot` + `applications.commands` and permissions: Send Messages, Embed Links, Read Message History, Add Reactions, Use Application Commands. For voice, also grant View Channel, Connect and Speak in the target voice channel.
 
 ---
 

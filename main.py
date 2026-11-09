@@ -25,6 +25,7 @@ from core.services import Services  # noqa: E402  (after the transport patch: bu
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
+intents.voice_states = True
 
 # Nothing in message content pings by default: several replies echo user or
 # LLM text, which could otherwise smuggle in @everyone / role / user pings.
@@ -47,6 +48,7 @@ bot.services.settings.load()
 # monitors, whatever order the cogs registered in.
 COGS = [
     'cogs.chat',
+    'cogs.voice',
     'cogs.commands',
     'cogs.server_config',
     'cogs.history_rag',
