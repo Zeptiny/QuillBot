@@ -90,12 +90,14 @@ async def test_full_exchange():
 
         await client.append_audio(b'\x02\x00' * 320)
         await client.add_message('user', '[cumprimente]')
+        await client.delete_item('item_9')
         await client.create_response()
         events = [e['type'] async for e in client.events()]
         check('server events, bad frames skipped', events == ['response.created', 'response.audio.delta', 'response.done'], events)
         check('audio arrived', bytes(fake.audio) == b'\x02\x00' * 320 and client.audio_bytes_sent == 640)
         item = next(e for e in fake.events if e['type'] == 'conversation.item.create')['item']
         check('text item', item == {'type': 'message', 'role': 'user', 'content': [{'type': 'input_text', 'text': '[cumprimente]'}]}, item)
+        check('item deleted', {'type': 'conversation.item.delete', 'item_id': 'item_9'} in fake.events)
 
         await client.close()
         check('closed', client.closed)

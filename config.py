@@ -354,6 +354,16 @@ VOICE_VOICE: Final[str] = os.getenv('VOICE_VOICE', 'longanqian').strip()
 # server_vad ends a turn on silence alone.
 VOICE_TURN_DETECTION: Final[str] = os.getenv('VOICE_TURN_DETECTION', 'smart_turn_v2').strip().lower()
 VOICE_WEB_SEARCH: Final[bool] = _flag('VOICE_WEB_SEARCH', 'false')  # the model's built-in web search
+# Someone talking over the bot this long (ms) makes it stop and listen; 0 = it always finishes.
+VOICE_BARGE_IN_MS: Final[int] = max(0, int(os.getenv('VOICE_BARGE_IN_MS', '700')))
+# Comma-separated: when set, the bot only answers a turn whose transcript says one of these
+# (its name, plus the spellings the transcription gives it, e.g. "Quill,Quil,Kill").
+VOICE_WAKE_WORDS: Final[tuple[str, ...]] = tuple(
+    w.strip() for w in os.getenv('VOICE_WAKE_WORDS', '').split(',') if w.strip()
+)
+# Let the model decide to say nothing when people are talking among themselves. It's a
+# tool call, and Qwen-Audio 3.0 can't have tools and web search on together: web search wins.
+VOICE_CAN_STAY_SILENT: Final[bool] = _flag('VOICE_CAN_STAY_SILENT')
 VOICE_TRANSCRIPTS: Final[bool] = _flag('VOICE_TRANSCRIPTS')  # post what was heard and said in the call's chat
 VOICE_MAX_CALLS: Final[int] = max(1, int(os.getenv('VOICE_MAX_CALLS', '1')))  # simultaneous calls, all servers
 VOICE_MAX_MINUTES: Final[float] = float(os.getenv('VOICE_MAX_MINUTES', '30'))
@@ -479,5 +489,11 @@ def validate_config() -> None:
         print(
             f'WARNING: VOICE_ENABLED is true but {", ".join(missing)} is not set. '
             'Voice calls will be disabled.',
+            file=sys.stderr,
+        )
+    if VOICE_ENABLED and VOICE_WEB_SEARCH and VOICE_CAN_STAY_SILENT:
+        print(
+            'WARNING: VOICE_WEB_SEARCH is on, so the voice model cannot choose to stay silent '
+            '(VOICE_CAN_STAY_SILENT needs a tool, and the model cannot use tools and web search together).',
             file=sys.stderr,
         )

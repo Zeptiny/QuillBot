@@ -367,14 +367,35 @@ VOICE_ROLE = (
     "</role>"
 )
 
-VOICE_RULES = (
-    "<voz>\n"
+# The tool a voice model calls to say nothing (VOICE_CAN_STAY_SILENT): a speech model
+# answers every turn it's given, so choosing silence has to be an action of its own.
+VOICE_SILENCE_TOOL_NAME = 'ficar_em_silencio'
+VOICE_SILENCE_TOOL = {
+    'type': 'function',
+    'function': {
+        'name': VOICE_SILENCE_TOOL_NAME,
+        'description': 'Não dizer nada desta vez, porque a fala não era para você ou não pede resposta.',
+        'parameters': {'type': 'object', 'properties': {}},
+    },
+}
+
+_VOICE_SPEECH = (
     "- Tudo o que você responde vira fala. Fale como numa conversa: frases curtas e naturais, "
     "uma ou duas por vez, e deixe espaço para as pessoas responderem.\n"
     "- Nada de markdown, listas, links, emojis ou blocos de código. Números, siglas e termos "
     "técnicos do jeito que se falam.\n"
+)
+_VOICE_GROUP = (
     "- Várias pessoas podem estar na call, e às vezes conversam entre si. Se uma fala "
     "claramente não foi para você, responda bem curto ou só concorde, sem puxar o assunto.\n"
+)
+_VOICE_GROUP_SILENT = (
+    "- Várias pessoas podem estar na call, e muitas vezes conversam entre si. Nem toda fala é "
+    f"para você: quando falarem com outra pessoa, comentarem algo entre si ou a fala não pedir "
+    f"resposta sua, chame {VOICE_SILENCE_TOOL_NAME} e não diga nada. Responda quando falarem "
+    "com você ou fizerem ao grupo uma pergunta em que você pode ajudar.\n"
+)
+_VOICE_THE_REST = (
     "- Você ouve todo mundo num áudio só e não sabe quem está falando: não chame ninguém pelo "
     "nome, a não ser que a pessoa diga quem é.\n"
     "- Se pedirem uma explicação longa, explique falando: os pontos principais em poucas "
@@ -383,30 +404,44 @@ VOICE_RULES = (
     "- Responda com o que você sabe. Nesta call você não tem as memórias do servidor, o "
     "histórico nem a documentação: quando a resposta depender disso, ou se não tiver certeza, "
     "diga isso em vez de inventar.\n"
-    "</voz>"
 )
 
 
+def voice_rules(*, can_stay_silent: bool = False) -> str:
+    group = _VOICE_GROUP_SILENT if can_stay_silent else _VOICE_GROUP
+    return f"<voz>\n{_VOICE_SPEECH}{group}{_VOICE_THE_REST}</voz>"
+
+
 def voice_instructions(
-    *, server: str, channel: str, caller: str, participants: list[str], now: str, persona: str = '',
+    *,
+    server: str,
+    channel: str,
+    caller: str,
+    participants: list[str],
+    now: str,
+    name: str = '',
+    persona: str = '',
+    can_stay_silent: bool = False,
 ) -> str:
-    """The system prompt of a voice call."""
+    """The system prompt of a voice call (*name*: what the bot is called on this server)."""
     people = ', '.join(participants) if participants else caller
+    you = f"Seu nome aqui: {name}. " if name else ''
     context = (
         "<contexto>\n"
-        f"Servidor: {server}. Call: {channel}. Quem chamou você: {caller}. "
+        f"{you}Servidor: {server}. Call: {channel}. Quem chamou você: {caller}. "
         f"Na call quando você entrou: {people}. Agora: {now} (horário de Brasília).\n"
         "</contexto>"
     )
-    parts = [VOICE_ROLE, VOICE_RULES, context]
+    parts = [VOICE_ROLE, voice_rules(can_stay_silent=can_stay_silent), context]
     if persona:
         parts.append(persona)
     return '\n\n'.join(parts)
 
 
-def voice_greeting(caller: str) -> str:
+def voice_greeting(caller: str, wake_word: str | None = None) -> str:
     """The turn that makes the bot say hello when it joins (so everyone knows it's listening)."""
-    return (
-        f"[{caller} acabou de chamar você para a call. Cumprimente a call numa frase curta e "
-        "diga que está ouvindo.]"
+    how = (
+        f"diga que só responde quando alguém chama você de \"{wake_word}\""
+        if wake_word else "diga que está ouvindo"
     )
+    return f"[{caller} acabou de chamar você para a call. Cumprimente a call numa frase curta e {how}.]"

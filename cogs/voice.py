@@ -25,6 +25,8 @@ from config import (
     BR_TZ,
     VOICE_API_KEY,
     VOICE_AVAILABLE,
+    VOICE_BARGE_IN_MS,
+    VOICE_CAN_STAY_SILENT,
     VOICE_ENABLED,
     VOICE_IDLE_MINUTES,
     VOICE_MAX_CALLS,
@@ -34,18 +36,24 @@ from config import (
     VOICE_TRANSCRIPTS,
     VOICE_TURN_DETECTION,
     VOICE_VOICE,
+    VOICE_WAKE_WORDS,
     VOICE_WEB_SEARCH,
 )
-from core.prompts import voice_greeting, voice_instructions
+from core.prompts import VOICE_SILENCE_TOOL, voice_greeting, voice_instructions
 from core.realtime_voice import RealtimeError, RealtimeVoiceClient
 from core.voice_call import VoiceCall
 
 logger = logging.getLogger(__name__)
 
 
+def can_stay_silent() -> bool:
+    """Whether the model gets the silence tool (Qwen-Audio 3.0 takes tools or web search, not both)."""
+    return VOICE_CAN_STAY_SILENT and not VOICE_WEB_SEARCH
+
+
 def session_config(instructions: str) -> dict:
     """The realtime session the bot asks for (``session.update``)."""
-    config = {
+    config: dict = {
         'modalities': ['audio', 'text'],
         'voice': VOICE_VOICE,
         'instructions': instructions,
@@ -55,6 +63,8 @@ def session_config(instructions: str) -> dict:
     }
     if VOICE_WEB_SEARCH:
         config['enable_search'] = True
+    elif can_stay_silent():
+        config['tools'] = [VOICE_SILENCE_TOOL]
     return config
 
 
@@ -114,9 +124,10 @@ class Voice(commands.Cog):
         finally:
             self._joining.discard(guild.id)
         transcribed = ' e eu escrevo a conversa no chat da call' if call.transcripts else ''
+        wake = f' Eu só respondo quando alguém me chama de “{VOICE_WAKE_WORDS[0]}”.' if VOICE_WAKE_WORDS else ''
         await interaction.followup.send(
             f'🎙️ Entrei em {channel.mention}. Enquanto eu estiver lá, o que vocês falarem vai para a '
-            f'IA de voz (Qwen, da Alibaba Cloud){transcribed}. Para me tirar: `/voz sair`.'
+            f'IA de voz (Qwen, da Alibaba Cloud){transcribed}.{wake} Para me tirar: `/voz sair`.'
         )
 
     @voz.command(name='sair', description='Tira o bot da call')
@@ -191,7 +202,9 @@ class Voice(commands.Cog):
             caller=member.display_name,
             participants=participants,
             now=datetime.datetime.now(BR_TZ).strftime('%d/%m/%Y %H:%M'),
+            name=VOICE_WAKE_WORDS[0] if VOICE_WAKE_WORDS else guild.me.display_name,
             persona=persona,
+            can_stay_silent=can_stay_silent(),
         )
         assert VOICE_API_KEY is not None
         realtime = RealtimeVoiceClient(VOICE_REALTIME_URL, VOICE_API_KEY, VOICE_MODEL)
@@ -216,13 +229,17 @@ class Voice(commands.Cog):
             is_bot=lambda uid: bool(getattr(guild.get_member(uid), 'bot', False)),
             name_of=lambda uid: getattr(guild.get_member(uid), 'display_name', None) or str(uid),
             transcripts=VOICE_TRANSCRIPTS,
+            barge_in_ms=VOICE_BARGE_IN_MS,
+            wake_words=VOICE_WAKE_WORDS,
             idle_seconds=VOICE_IDLE_MINUTES * 60,
             max_seconds=VOICE_MAX_MINUTES * 60,
             on_end=lambda ended: self._forget(guild.id, ended),
         )
         self.calls[guild.id] = call
         try:
-            await call.start(greeting=voice_greeting(member.display_name))
+            await call.start(greeting=voice_greeting(
+                member.display_name, VOICE_WAKE_WORDS[0] if VOICE_WAKE_WORDS else None,
+            ))
         except Exception:
             logger.exception('[voice] starting the call in #%s (%s) failed', channel.name, guild.id)
             await call.end('não consegui começar a conversa')

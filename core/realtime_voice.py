@@ -177,6 +177,10 @@ class RealtimeVoiceClient:
             'item': {'type': 'message', 'role': role, 'content': [{'type': 'input_text', 'text': text}]},
         })
 
+    async def delete_item(self, item_id: str) -> None:
+        """Take an item out of the conversation, so the model doesn't remember it."""
+        await self.send({'type': 'conversation.item.delete', 'item_id': item_id})
+
     async def create_response(self) -> None:
         await self.send({'type': 'response.create'})
 

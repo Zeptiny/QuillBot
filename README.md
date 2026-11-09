@@ -255,7 +255,9 @@ The bot joins the voice channel you're in and talks with the call in real time. 
 
 - **Who it hears:** everyone in the call, mixed into one stream (other bots, like music bots, are left out). The model can't tell voices apart, so it doesn't call people by name unless they say who they are
 - **Turns:** the model decides when someone finished (`VOICE_TURN_DETECTION`; `smart_turn_v2` understands turns semantically and ignores most cross-talk and "uhum"s)
-- **Interrupting:** talking over the bot for ~0.7 s stops it mid-sentence and cancels the rest of its answer
+- **Staying quiet:** people talking among themselves don't get an answer: `smart_turn_v2` already passes over most of it, and the model can also choose silence (`VOICE_CAN_STAY_SILENT`, a tool it calls instead of speaking)
+- **Wake word** (`VOICE_WAKE_WORDS`, optional): the bot answers only turns that call it by name; an answer waits (≈0.3 s) for its turn's transcript and is dropped, unheard and forgotten by the model, when the name isn't in it
+- **Interrupting:** talking over the bot for `VOICE_BARGE_IN_MS` (0.7 s) stops it mid-sentence and cancels the rest of its answer; so does a new answer starting while the last one is still playing
 - **Personality:** the server's `<personalidade>` block, plus voice rules (short spoken sentences, no markdown or links). No tools in calls: memories, history and docs stay in the text chat, and the bot says so instead of guessing
 - **Transcripts** (`VOICE_TRANSCRIPTS`): what was heard (`🎙️ **Ana:** …`, attributed by who was talking when) and what the bot said (`🔊 …`, with `…` where it was cut off) go to the call's text chat
 - **Leaving:** `/voz sair` (anyone in the call, or Move Members / Manage Server), everyone leaving, `VOICE_IDLE_MINUTES` without anyone talking, or `VOICE_MAX_MINUTES` in the call
@@ -459,7 +461,7 @@ QuillBot/
 │   ├── local_inference.py# Single-thread executor for local models
 │   ├── voice_receive.py  # Voice receive for discord.py: RTP transport decryption, DAVE, opus, ListeningVoiceClient
 │   ├── voice_audio.py    # Resampling (48k↔16k/24k), the per-speaker mixer, the playback buffer/source
-│   ├── voice_call.py     # One live call: audio both ways, barge-in, transcripts, watchdog
+│   ├── voice_call.py     # One live call: audio both ways, who gets an answer, barge-in, transcripts, watchdog
 │   ├── realtime_voice.py # Qwen-Audio realtime WebSocket client
 │   └── ui.py             # PaginatedEmbedView, source pages
 ├── cogs/
@@ -715,6 +717,9 @@ cp .env.example .env   # if available, otherwise create .env manually
 | `VOICE_VOICE` | `longanqian` | 3.0 voices: `longanqian`, `longanlingxin`, `longanlingxi`, `longanxiaoxin`, `longanlufeng`, or a cloned `voice_id` |
 | `VOICE_TURN_DETECTION` | `smart_turn_v2` | `smart_turn_v2` (semantic, best with several people), `smart_turn`, or `server_vad` (silence only; answers faster, interrupts more easily) |
 | `VOICE_WEB_SEARCH` | `false` | Let the model search the web on its own |
+| `VOICE_BARGE_IN_MS` | `700` | How long someone talks over the bot before it stops and listens; `0` = it always finishes what it's saying |
+| `VOICE_WAKE_WORDS` | — | Comma-separated. When set, the bot answers only turns whose transcript says one of them (case and accents ignored, whole words). List the spellings the transcription gives the name, e.g. `Quill,Quil,Kill`; the first one is what the bot tells people to call it |
+| `VOICE_CAN_STAY_SILENT` | `true` | Let the model decide to say nothing when the speech wasn't for it. It's a tool call, which Qwen-Audio 3.0 can't combine with `VOICE_WEB_SEARCH`, so web search turns it off |
 | `VOICE_TRANSCRIPTS` | `true` | Post what was heard and said in the call's text chat |
 | `VOICE_MAX_CALLS` | `1` | Simultaneous calls across all servers |
 | `VOICE_MAX_MINUTES` | `30` | A call ends after this long |
@@ -820,7 +825,7 @@ ruff check .                   # lint (rules configured in pyproject.toml)
 | `test_trajectory_replay.py` | Trajectory capture, verbatim replay, text tool-call recovery |
 | `test_realtime_voice.py` | The realtime voice client against a local fake server: handshake, auth, audio, events, refused keys and settings, timeouts |
 | `test_voice_audio.py` | Resampling (band kept, aliasing and imaging removed, seamless across chunks), the per-speaker mixer and its jitter buffer, the playback buffer |
-| `test_voice_call.py` | A call with Discord and the model faked: people (not bots) reach the model, playback, transcripts in order with who spoke, barge-in from both sides, cut lines edited, the watchdog, ending |
+| `test_voice_call.py` | A call with Discord and the model faked: people (not bots) reach the model, playback, transcripts in order with who spoke, barge-in (and its setting), a new answer cutting the last, the silence tool, wake words (held, released, dropped and deleted), cut lines edited, the watchdog, ending |
 | `test_voice_receive.py` | RTP transport decryption (incl. discord.py's own packets), header extensions, the DAVE layer, opus decoding, the voice websocket hook |
 | `test_wrapped.py` | Wrapped numbers, weekly/monthly schedule, automatic posts once per period, the tool |
 

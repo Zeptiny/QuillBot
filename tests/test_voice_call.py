@@ -8,9 +8,9 @@ from types import SimpleNamespace as NS
 import discord
 import numpy as np
 
-from core.prompts import voice_greeting, voice_instructions
+from core.prompts import VOICE_SILENCE_TOOL_NAME, voice_greeting, voice_instructions
 from core.settings import SETTINGS
-from core.voice_call import VoiceCall, user_line
+from core.voice_call import VoiceCall, mentions, user_line
 
 from helpers import check
 
@@ -25,6 +25,7 @@ class FakeRealtime:
         self.frames = 0
         self.sent = []
         self.cancels = 0
+        self.deleted = []
         self.closed = False
 
     async def events(self):
@@ -51,6 +52,9 @@ class FakeRealtime:
 
     async def cancel_response(self):
         self.cancels += 1
+
+    async def delete_item(self, item_id):
+        self.deleted.append(item_id)
 
     async def close(self):
         if not self.closed:
@@ -158,6 +162,12 @@ def speech(ms=20, freq=300):
     return np.repeat(mono, 2).tobytes()
 
 
+def talk(vc, who, ms):
+    """*who* talking for *ms*, as Discord delivers it (one packet per 20 ms)."""
+    for _ in range(ms // 20):
+        vc.on_audio(who, speech())
+
+
 def answer_audio(seconds=0.5):
     """A ``response.audio.delta`` payload: *seconds* of 24 kHz mono, base64."""
     pcm = (3000 * np.sin(np.arange(int(24000 * seconds)) / 5)).astype('<i2')
@@ -228,16 +238,14 @@ async def test_an_exchange_is_played_and_transcribed_in_order():
 
 
 async def test_talking_over_the_bot_cuts_it_off():
-    call, vc, rt, channel, _ = make_call()
-    call.BARGE_IN_MS = 80
+    call, vc, rt, channel, _ = make_call(barge_in_ms=80)
     await call.start()
     rt.emit('response.created', response={'id': 'r1'})
     rt.emit('response.audio.delta', delta=answer_audio(2.0))
     rt.emit('response.audio_transcript.done', transcript='Uma resposta bem comprida')
     await settle()
     check('the bot is talking', vc.playing and call.playback.has_audio)
-    for _ in range(15):  # 300 ms of Ana talking over it
-        vc.on_audio(ANA, speech())
+    talk(vc, ANA, 300)
     await wait_for(lambda: call.interruptions == 1)
     check('playback stopped and dropped', vc.stops == 1 and not call.playback.has_audio)
     check('the response is cancelled', rt.cancels == 1)
@@ -251,8 +259,7 @@ async def test_talking_over_the_bot_cuts_it_off():
 
 
 async def test_a_short_interjection_does_not_interrupt():
-    call, vc, rt, _, _ = make_call()
-    call.BARGE_IN_MS = 400
+    call, vc, rt, _, _ = make_call(barge_in_ms=400)
     await call.start()
     rt.emit('response.created', response={'id': 'r1'})
     rt.emit('response.audio.delta', delta=answer_audio(2.0))
@@ -264,29 +271,68 @@ async def test_a_short_interjection_does_not_interrupt():
     await call.end('fim')
 
 
-async def test_the_servers_speech_detection_also_interrupts():
+async def test_barge_in_can_be_turned_off():
+    call, vc, rt, _, _ = make_call(barge_in_ms=0)
+    await call.start()
+    rt.emit('response.created', response={'id': 'r1'})
+    rt.emit('response.audio.delta', delta=answer_audio(2.0))
+    await settle()
+    talk(vc, ANA, 1000)
+    await asyncio.sleep(0.3)
+    check('talked over for a second, still talking', call.interruptions == 0 and vc.stops == 0 and rt.cancels == 0)
+    await call.end('fim')
+
+
+async def test_the_servers_speech_detection_alone_does_not_interrupt():
+    # smart_turn reports speech it later finds wasn't a turn for the bot (people
+    # talking among themselves), so only the barge-in time or a new answer cuts.
     call, vc, rt, _, _ = make_call()
     await call.start()
     rt.emit('response.created', response={'id': 'r1'})
     rt.emit('response.audio.delta', delta=answer_audio(2.0))
-    rt.emit('response.done', response={'status': 'completed'})  # generated; still being spoken
+    rt.emit('response.done', response={'status': 'completed'})
     await settle()
     rt.emit('input_audio_buffer.speech_started', item_id='i2', audio_start_ms=100)
+    rt.emit('input_audio_buffer.speech_stopped', item_id='i2', audio_end_ms=900, reason='turn_invalid')
     await settle()
-    check('stopped', vc.stops == 1 and not call.playback.has_audio and call.interruptions == 1)
-    check('nothing to cancel on the server', rt.cancels == 0)
+    check('still talking', vc.stops == 0 and call.playback.has_audio and call.interruptions == 0)
+    await call.end('fim')
+
+
+async def test_a_new_answer_cuts_what_is_left_of_the_last_one():
+    call, vc, rt, channel, _ = make_call()
+    await call.start()
+    rt.emit('response.created', response={'id': 'r1'})
+    rt.emit('response.audio.delta', delta=answer_audio(3.0))
+    rt.emit('response.audio_transcript.done', transcript='Primeira resposta')
+    rt.emit('response.done', response={'status': 'completed'})
+    await wait_for(lambda: channel.posts == ['🔊 Primeira resposta'])
+    # Someone took a turn (a short "para!" the barge-in time doesn't catch).
+    rt.emit('input_audio_buffer.committed', item_id='i2')
+    rt.emit('conversation.item.input_audio_transcription.completed', item_id='i2', transcript='para')
+    rt.emit('response.created', response={'id': 'r2'})
+    await settle()
+    check('nothing cut before the new answer speaks', vc.stops == 0)
+    new_audio = answer_audio(0.3)
+    rt.emit('response.audio.delta', delta=new_audio)
+    await wait_for(lambda: vc.stops == 1)
+    queued = call.playback.queued_seconds
+    check('only the new answer is queued', 0.2 < queued < 0.4, queued)
+    await wait_for(lambda: channel.messages[0].edits)
+    check('the first one shows where it stopped', channel.posts[0] == '🔊 Primeira resposta …', channel.posts)
+    check('counted as an interruption', call.interruptions == 1)
     await call.end('fim')
 
 
 async def test_a_line_posted_whole_is_edited_when_the_bot_is_cut_off():
-    call, vc, rt, channel, _ = make_call()
+    call, vc, rt, channel, _ = make_call(barge_in_ms=80)
     await call.start()
     rt.emit('response.created', response={'id': 'r1'})
     rt.emit('response.audio.delta', delta=answer_audio(3.0))
     rt.emit('response.audio_transcript.done', transcript='Explicação longa')
     rt.emit('response.done', response={'status': 'completed'})
     await wait_for(lambda: channel.posts == ['🔊 Explicação longa'])
-    rt.emit('input_audio_buffer.speech_started', item_id='i3', audio_start_ms=100)
+    talk(vc, BETO, 300)
     await wait_for(lambda: channel.messages[0].edits)
     check('edited to show where it stopped', channel.posts == ['🔊 Explicação longa …'], channel.posts)
     await call.end('fim')
@@ -425,7 +471,9 @@ async def test_voice_cog_stays_out_unless_enabled():
     check('session asks for speech in and out',
           config['modalities'] == ['audio', 'text'] and config['instructions'] == 'instr'
           and config['turn_detection']['type'] == voice_cog.VOICE_TURN_DETECTION
-          and config['input_audio_format'] == config['output_audio_format'] == 'pcm', config)
+          and config['input_audio_format'] == config['output_audio_format'] == 'pcm', str(config))
+    check('the silence tool when it can be used', ('tools' in config) == voice_cog.can_stay_silent())
+    check('tools and web search never together', not ('tools' in config and config.get('enable_search')))
 
 
 async def test_a_failing_cleanup_still_releases_the_call():
@@ -494,7 +542,7 @@ def test_voice_cog_join_checks():
 
 
 async def test_cut_while_its_line_is_being_sent_still_shows():
-    call, vc, rt, channel, _ = make_call()
+    call, vc, rt, channel, _ = make_call(barge_in_ms=80)
     sending = asyncio.Event()
     release = asyncio.Event()
     plain_send = channel.send
@@ -511,7 +559,7 @@ async def test_cut_while_its_line_is_being_sent_still_shows():
     rt.emit('response.audio_transcript.done', transcript='Resposta')
     rt.emit('response.done', response={'status': 'completed'})
     await asyncio.wait_for(sending.wait(), 2)
-    rt.emit('input_audio_buffer.speech_started', item_id='i9', audio_start_ms=100)
+    talk(vc, ANA, 300)
     await wait_for(lambda: call.interruptions == 1)
     release.set()
     await wait_for(lambda: channel.messages and channel.messages[0].edits)
@@ -526,3 +574,140 @@ async def test_the_model_hanging_up_on_a_quiet_call_says_so():
     await rt.close()
     await wait_for(lambda: ended)
     check('honest reason', 'sem conversa' in call.end_reason, call.end_reason)
+
+
+# --- choosing when to answer ---
+
+
+async def test_the_model_can_choose_to_stay_silent():
+    call, vc, rt, channel, _ = make_call()
+    await call.start()
+    rt.emit('response.created', response={'id': 'r1'})
+    rt.emit('response.audio.delta', delta=answer_audio(2.0))
+    rt.emit('response.audio_transcript.done', transcript='Resposta')
+    rt.emit('response.done', response={'status': 'completed'})
+    await wait_for(lambda: channel.posts == ['🔊 Resposta'])
+    rt.emit('input_audio_buffer.committed', item_id='i2')
+    rt.emit('conversation.item.input_audio_transcription.completed', item_id='i2', transcript='Beto, vem cá')
+    rt.emit('response.created', response={'id': 'r2'})
+    rt.emit('response.done', response={'status': 'completed', 'output': [
+        {'id': 'f1', 'type': 'function_call', 'name': VOICE_SILENCE_TOOL_NAME, 'call_id': 'c1', 'arguments': '{}'},
+    ]})
+    await wait_for(lambda: len(channel.posts) == 2)
+    await settle()
+    check('nothing said or posted for it', channel.posts == ['🔊 Resposta', '🎙️ Beto, vem cá'], channel.posts)
+    check('what it was saying goes on', vc.stops == 0 and call.playback.has_audio)
+    check('counted apart', (call.silences, call.turns) == (1, 1), (call.silences, call.turns))
+    await call.end('fim')
+
+
+async def test_with_a_wake_word_an_answer_waits_for_the_name():
+    call, vc, rt, channel, _ = make_call(wake_words=['Quill', 'Kill'])
+    await call.start()
+    rt.emit('input_audio_buffer.committed', item_id='i1')
+    rt.emit('response.created', response={'id': 'r1'})
+    rt.emit('response.audio.delta', delta=answer_audio(0.5))
+    await settle()
+    check('held until the transcript comes', vc.plays == [] and not call.playback.has_audio)
+    rt.emit('conversation.item.input_audio_transcription.completed', item_id='i1', transcript='Ô quíll, que horas são?')
+    await settle()
+    check('called by name: it plays', len(vc.plays) == 1 and call.playback.has_audio)
+    rt.emit('response.audio.delta', delta=answer_audio(0.5))
+    rt.emit('response.audio_transcript.done', transcript='Três da tarde.')
+    rt.emit('response.done', response={'status': 'completed', 'output': [{'id': 'a1', 'type': 'message'}]})
+    await wait_for(lambda: len(channel.posts) == 2)
+    check('posted', channel.posts == ['🎙️ Ô quíll, que horas são?', '🔊 Três da tarde.'], channel.posts)
+    check('the rest of it queued', 0.9 < call.playback.queued_seconds < 1.1, call.playback.queued_seconds)
+    check('kept', rt.deleted == [] and call.turns == 1)
+    await call.end('fim')
+
+
+async def test_with_a_wake_word_other_talk_gets_no_answer():
+    call, vc, rt, channel, _ = make_call(wake_words=['Quill'])
+    await call.start()
+    rt.emit('input_audio_buffer.committed', item_id='i1')
+    rt.emit('response.created', response={'id': 'r1'})
+    rt.emit('response.audio.delta', delta=answer_audio(0.5))
+    rt.emit('conversation.item.input_audio_transcription.completed', item_id='i1', transcript='Beto, bora pro Nether?')
+    await settle()
+    check('cancelled, never played', rt.cancels == 1 and vc.plays == [] and not call.playback.has_audio)
+    rt.emit('response.audio.delta', delta=answer_audio(0.5))  # still in flight
+    rt.emit('response.audio_transcript.done', transcript='Bora!')
+    rt.emit('response.done', response={'status': 'cancelled', 'output': [{'id': 'a1', 'type': 'message'}]})
+    await wait_for(lambda: rt.deleted)
+    check('late audio dropped too', vc.plays == [] and not call.playback.has_audio)
+    check('the answer is taken out of the conversation', rt.deleted == ['a1'], rt.deleted)
+    await wait_for(lambda: channel.posts)
+    await settle()
+    check('only what people said is posted', channel.posts == ['🎙️ Beto, bora pro Nether?'], channel.posts)
+    check('counted', (call.unaddressed, call.turns, call.interruptions) == (1, 0, 0))
+    await call.end('fim')
+
+
+async def test_wake_word_whichever_comes_first():
+    call, vc, rt, channel, _ = make_call(wake_words=['Quill'])
+    await call.start()
+    # The transcript can beat the response...
+    rt.emit('input_audio_buffer.committed', item_id='i1')
+    rt.emit('conversation.item.input_audio_transcription.completed', item_id='i1', transcript='Quill, oi')
+    rt.emit('response.created', response={'id': 'r1'})
+    rt.emit('response.audio.delta', delta=answer_audio(0.3))
+    rt.emit('response.done', response={'status': 'completed'})
+    await settle()
+    check('decided at once', len(vc.plays) == 1)
+    vc.playing = False  # it was heard
+    call.playback.clear()
+    # ...or the whole answer can be ready before the transcript is.
+    rt.emit('input_audio_buffer.committed', item_id='i2')
+    rt.emit('response.created', response={'id': 'r2'})
+    rt.emit('response.audio.delta', delta=answer_audio(0.3))
+    rt.emit('response.audio_transcript.done', transcript='Tudo certo.')
+    rt.emit('response.done', response={'status': 'completed'})
+    await settle()
+    check('held', len(vc.plays) == 1 and call.turns == 1)
+    rt.emit('conversation.item.input_audio_transcription.completed', item_id='i2', transcript='e você, quill?')
+    await wait_for(lambda: '🔊 Tudo certo.' in channel.posts)
+    check('played and counted', len(vc.plays) == 2 and call.turns == 2 and call.interruptions == 0)
+    await call.end('fim')
+
+
+async def test_wake_word_leaves_the_greeting_alone_and_barge_in_drops_a_held_answer():
+    call, vc, rt, _, _ = make_call(wake_words=['Quill'], barge_in_ms=80)
+    await call.start(greeting=voice_greeting('Ana', 'Quill'))
+    check('the greeting tells people the name', 'Quill' in rt.sent[0][1])
+    rt.emit('response.created', response={'id': 'r1'})
+    rt.emit('response.audio.delta', delta=answer_audio(0.3))
+    rt.emit('response.done', response={'status': 'completed'})
+    await settle()
+    check('the greeting is not held', len(vc.plays) == 1)
+    vc.playing = False
+    call.playback.clear()
+    rt.emit('input_audio_buffer.committed', item_id='i1')
+    rt.emit('response.created', response={'id': 'r2'})
+    rt.emit('response.audio.delta', delta=answer_audio(0.3))
+    await settle()
+    talk(vc, BETO, 300)  # people kept talking before its turn was even transcribed
+    await wait_for(lambda: rt.cancels == 1)
+    rt.emit('conversation.item.input_audio_transcription.completed', item_id='i1', transcript='Quill, espera')
+    await settle()
+    check('dropped, never heard', len(vc.plays) == 1 and not call.playback.has_audio and call.interruptions == 0)
+    await call.end('fim')
+
+
+def test_wake_word_matching():
+    check('case and accents', mentions('Ô QUÍLL, me ajuda', ['quill']))
+    check('anywhere in the sentence', mentions('e aí, quill?', ['Quill']))
+    check('whole words only', not mentions('o quilliam chegou', ['quill']))
+    check('any of the spellings', mentions('Kill me conta', ['Quill', 'Kill']))
+    check('phrases', mentions('ei bot, tudo bem', ['ei bot']) and not mentions('eita bot', ['ei bot']))
+    check('nothing to match', not mentions('quill', []) and not mentions('', ['quill']) and not mentions('oi', [' , ']))
+
+
+def test_voice_prompt_choosing_silence():
+    silent = voice_instructions(server='S', channel='c', caller='a', participants=[], now='n',
+                                name='Quill', can_stay_silent=True)
+    check('the tool, and when to use it', VOICE_SILENCE_TOOL_NAME in silent and 'bem curto' not in silent)
+    check('its name', 'Seu nome aqui: Quill.' in silent)
+    plain = voice_instructions(server='S', channel='c', caller='a', participants=[], now='n')
+    check('without the tool it keeps it short', VOICE_SILENCE_TOOL_NAME not in plain and 'bem curto' in plain)
+    check('greeting without a wake word', 'está ouvindo' in voice_greeting('Ana'))
