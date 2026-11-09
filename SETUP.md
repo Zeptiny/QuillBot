@@ -66,7 +66,7 @@ cp .env.example .env
 3. Grant **View Channel**, **Connect**, **Speak**, and **Send Messages** in the voice channel, then restart the bot.
 4. Join a normal voice channel and run `/voice entrar`. The bot announces that channel audio goes to Qwen, then listens and speaks. Use `/voice sair` to stop or `/voice status` to check the session.
 
-The default model is `qwen-audio-3.0-realtime-plus`, with voice `longanqian`. All human participants can talk to it; use headphones and take turns. The bot leaves empty channels and disconnects on failures, after `VOICE_IDLE_TIMEOUT_SECONDS=300` of inactivity, or after `VOICE_MAX_SESSION_SECONDS=1800` total. `VOICE_ENABLED=false` disables the commands. It uses the server's personality, but does not access text tools or memory, or save audio/transcripts. See [voice configuration](README.md#real-time-voice) for all variables and behavior.
+The default model is `qwen-audio-3.0-realtime-plus`, with voice `longanqian`. All human participants can talk to it; use headphones and take turns. The bot leaves empty channels and disconnects on failures, after `VOICE_IDLE_TIMEOUT_SECONDS=150` of inactivity, or after `VOICE_MAX_SESSION_SECONDS=1800` total. `VOICE_ENABLED=false` disables the commands. It uses the server's personality, but does not access text tools or memory, or save audio/transcripts. See [voice configuration](README.md#real-time-voice) for all variables and behavior.
 
 ### Optional — Rate Limiting
 

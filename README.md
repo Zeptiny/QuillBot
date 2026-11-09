@@ -88,7 +88,7 @@ Voice uses Alibaba Cloud's [Token Plan real-time API](https://www.alibabacloud.c
 
 The bot needs **View Channel**, **Connect**, **Speak**, and **Send Messages** in the voice channel. Before listening, it posts a notice in that channel's text chat explaining that participants' audio goes to Qwen. All human speakers share the conversation; bots are ignored. Speak one at a time and use headphones to avoid echo. Stage channels are not supported.
 
-Voice includes the server's `/persona` at session start. Conversation context lives in the Qwen session; the bot does not save audio or transcripts. Text history, persistent memory and tools are not connected to voice. The bot leaves when the channel has no humans, when it is moved or disconnected, on a connection failure, after five minutes of inactivity, or after thirty minutes total. Run `/voice entrar` to start a fresh session. Text conversation budgets do not apply to voice; the duration limits below govern it.
+Voice includes the server's `/persona` at session start. Conversation context lives in the Qwen session; the bot does not save audio or transcripts. Text history, persistent memory and tools are not connected to voice. The bot leaves when the channel has no humans, when it is moved or disconnected, on a connection failure, after two and a half minutes of inactivity (the voice provider closes a session that produces no reply for 180 seconds, so the bot always leaves first), or after thirty minutes total. Run `/voice entrar` to start a fresh session. Text conversation budgets do not apply to voice; the duration limits below govern it.
 
 | Variable | Default | Description |
 |---|---|---|
@@ -97,7 +97,7 @@ Voice includes the server's `/persona` at session start. Conversation context li
 | `QWEN_REALTIME_URL` | `wss://token-plan.ap-southeast-1.maas.aliyuncs.com/api-ws/v1/realtime` | TLS WebSocket endpoint; must match the subscription's region. Set the Beijing Token Plan domain for a Beijing subscription |
 | `QWEN_REALTIME_MODEL` | `qwen-audio-3.0-realtime-plus` | Model query parameter |
 | `QWEN_REALTIME_VOICE` | `longanqian` | Voice supported by the chosen model |
-| `VOICE_IDLE_TIMEOUT_SECONDS` | `300` | Leave after this many seconds without detected speech or generated audio; minimum 10 |
+| `VOICE_IDLE_TIMEOUT_SECONDS` | `150` | Leave after this many seconds without detected speech or generated audio; minimum 10, keep under the provider's 180 s no-reply limit |
 | `VOICE_MAX_SESSION_SECONDS` | `1800` | Maximum session duration; minimum 30 |
 
 The Docker image installs `libopus0`. For a local Linux installation, install the system Opus library (Debian/Ubuntu: `sudo apt-get install libopus0`; Fedora: `sudo dnf install opus`). On macOS use `brew install opus`; discord.py bundles Opus on Windows. Python requirements include PyNaCl, DAVE and voice receive support. The receive extension is pinned because its API is experimental; the audio sink decrypts incoming DAVE frames using discord.py's negotiated session before decoding Opus. Discord 2.7 is constrained because that integration uses its internal connection state.

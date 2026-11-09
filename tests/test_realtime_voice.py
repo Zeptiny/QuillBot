@@ -87,6 +87,45 @@ async def test_error_during_handshake_closes_socket_without_exposing_payload(mon
     assert socket.closed
 
 
+async def test_provider_error_codes_map_to_honest_messages_without_leaking_payload(monkeypatch, caplog):
+    socket = Socket()
+    socket.incoming.put_nowait({'type': 'session.created'})
+    socket.incoming.put_nowait({'type': 'error', 'error': {
+        'code': 'response_idle_timeout', 'message': 'echoed-transcript raw-audio',
+    }})
+    monkeypatch.setattr(realtime_voice, 'connect', AsyncMock(return_value=socket))
+    with caplog.at_level('WARNING'):
+        with pytest.raises(VoiceError) as error:
+            await transport().open()
+    assert 'inatividade' in str(error.value)
+    assert 'echoed-transcript' not in str(error.value)
+    logs = ' '.join(record.getMessage() for record in caplog.records)
+    assert 'response_idle_timeout' in logs
+    assert 'echoed-transcript' not in logs
+    assert socket.closed
+
+
+async def test_unmapped_provider_code_keeps_the_generic_refusal_message(monkeypatch):
+    socket = Socket()
+    socket.incoming.put_nowait({'type': 'error', 'error': {'code': 'bogus_code', 'message': 'secret'}})
+    monkeypatch.setattr(realtime_voice, 'connect', AsyncMock(return_value=socket))
+    with pytest.raises(VoiceError) as error:
+        await transport().open()
+    assert 'recusou' in str(error.value)
+    assert 'secret' not in str(error.value)
+
+
+async def test_provider_error_ends_the_live_session_even_while_the_sender_keeps_streaming():
+    socket = Socket()
+    qwen = transport()
+    qwen._ws = socket
+    conversation = VoiceConversation(voice_client(), qwen, idle_timeout=300, max_duration=1800)
+    socket.incoming.put_nowait({'type': 'error', 'error': {'code': 'response_idle_timeout', 'message': 'x'}})
+    with pytest.raises(VoiceError) as error:
+        await asyncio.wait_for(conversation.run(), 2)
+    assert 'inatividade' in str(error.value)
+
+
 async def test_cancelled_handshake_closes_socket(monkeypatch):
     socket = Socket()
     monkeypatch.setattr(realtime_voice, 'connect', AsyncMock(return_value=socket))

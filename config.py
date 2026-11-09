@@ -70,7 +70,9 @@ QWEN_REALTIME_URL: Final[str] = os.getenv(
 ).strip()
 QWEN_REALTIME_MODEL: Final[str] = os.getenv('QWEN_REALTIME_MODEL', 'qwen-audio-3.0-realtime-plus')
 QWEN_REALTIME_VOICE: Final[str] = os.getenv('QWEN_REALTIME_VOICE', 'longanqian')
-VOICE_IDLE_TIMEOUT_SECONDS: Final[float] = max(10.0, float(os.getenv('VOICE_IDLE_TIMEOUT_SECONDS', '300')))
+# The provider closes any session that goes 180 seconds without generating a
+# response, so the bot's own idle exit must stay under that to leave gracefully.
+VOICE_IDLE_TIMEOUT_SECONDS: Final[float] = max(10.0, float(os.getenv('VOICE_IDLE_TIMEOUT_SECONDS', '150')))
 VOICE_MAX_SESSION_SECONDS: Final[float] = max(30.0, float(os.getenv('VOICE_MAX_SESSION_SECONDS', '1800')))
 
 # --- Merge Gateway vendor priority ---

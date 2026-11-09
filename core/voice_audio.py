@@ -11,7 +11,7 @@ import audioop
 import logging
 import threading
 import time
-from collections import deque
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 
 import davey
@@ -20,10 +20,12 @@ from discord.ext import voice_recv
 
 # The extension logs packet data and transport keys at DEBUG.
 logging.getLogger('discord.ext.voice_recv').setLevel(logging.WARNING)
+logger = logging.getLogger(__name__)
 
 INPUT_FRAME_BYTES = 640  # 20 ms at 16 kHz, mono int16
 OUTPUT_FRAME_BYTES = 3840  # 20 ms at 48 kHz, stereo int16
 OPUS_SILENCE = b'\xf8\xff\xfe'
+STATS_LOG_SECONDS = 15.0
 
 
 @dataclass
@@ -37,9 +39,11 @@ class Speaker:
 class DiscordInput(voice_recv.AudioSink):
     """Receive ordered Opus, decrypt DAVE, decode and mix human speakers.
 
-The pinned voice-recv release only removes RTP transport encryption. Asking
-it for PCM would feed DAVE ciphertext into Opus and kill its receive thread.
-discord.py owns DAVE key negotiation; use its live session for decryption here.
+The pinned voice-recv release only removes RTP transport encryption and keeps
+RTP padding octets in the decrypted data. Asking it for PCM would feed DAVE
+ciphertext into Opus and kill its receive thread. discord.py owns DAVE key
+negotiation; use its live session for decryption here, after removing the
+padding or DAVE authentication fails on every padded packet.
 """
 
     def __init__(self) -> None:
@@ -48,17 +52,40 @@ discord.py owns DAVE key negotiation; use its live session for decryption here.
         self._speakers: dict[int, Speaker] = {}
         self._closed = False
         self._last_activity = 0.0
+        # Privacy-safe diagnostics: counts only, never packet content. The
+        # drop reasons mirror every silent `return` in write() so a live
+        # session shows which stage starves Qwen of audio.
+        self._dropped: dict[str, int] = defaultdict(int)
+        self._speech_packets = 0
+        self._voiced_frames = 0
+        self._read_frames = 0
+        self._last_stats_log = time.monotonic()
 
     @property
     def last_activity(self) -> float:
         with self._lock:
             return self._last_activity
 
+    def stats(self) -> dict[str, int]:
+        """Snapshot of input counters for tests and diagnostics."""
+        with self._lock:
+            return {
+                'speech_packets': self._speech_packets,
+                'voiced_frames': self._voiced_frames,
+                'read_frames': self._read_frames,
+                'dropped_no_user': self._dropped['no_user'],
+                'dropped_dave': self._dropped['dave'],
+                'dropped_dave_missing': self._dropped['dave_missing'],
+                'dropped_opus': self._dropped['opus'],
+            }
+
     def wants_opus(self) -> bool:
         return True
 
     def write(self, user: discord.Member | discord.User | None, data: voice_recv.VoiceData) -> None:
         if user is None or user.bot:
+            if user is None:
+                self._dropped['no_user'] += 1
             return
         with self._lock:
             if self._closed:
@@ -68,6 +95,16 @@ discord.py owns DAVE key negotiation; use its live session for decryption here.
                 speaker = self._speakers[user.id] = Speaker()
             opus = data.opus
             if opus and opus != OPUS_SILENCE:
+                self._speech_packets += 1
+                # voice_recv decrypts the RTP transport layer but leaves the
+                # RTP padding octets attached. DAVE authenticates the inner
+                # frame only, so padding must be stripped before decryption
+                # or every encrypted packet fails auth and audio starves.
+                packet = getattr(data, 'packet', None)
+                if getattr(packet, 'padding', False):
+                    pad = opus[-1]
+                    if 0 < pad <= len(opus):
+                        opus = opus[:-pad]
                 connection = self.voice_client._connection
                 session = connection.dave_session
                 if session is not None:
@@ -76,13 +113,16 @@ discord.py owns DAVE key negotiation; use its live session for decryption here.
                     except (ValueError, RuntimeError):
                         # Key transitions and lost encrypted frames are normal;
                         # never fall back to decoding ciphertext as Opus.
+                        self._dropped['dave'] += 1
                         return
                 elif connection.dave_protocol_version:
+                    self._dropped['dave_missing'] += 1
                     return
             try:
                 pcm = speaker.decoder.decode(opus or None, fec=False)
             except discord.opus.OpusError:
                 # A corrupt packet must not terminate every speaker's audio.
+                self._dropped['opus'] += 1
                 return
             mono = audioop.tomono(pcm, 2, 0.5, 0.5)
             converted, speaker.rate_state = audioop.ratecv(mono, 2, 1, 48000, 16000, speaker.rate_state)
@@ -98,13 +138,31 @@ discord.py owns DAVE key negotiation; use its live session for decryption here.
         """One wall-clock frame, including silence; called every 20 ms."""
         mixed = bytes(INPUT_FRAME_BYTES)
         cutoff = time.monotonic() - 0.2
+        voiced = False
         with self._lock:
             for speaker in self._speakers.values():
                 while speaker.frames and speaker.frames[0][0] < cutoff:
                     speaker.frames.popleft()
                 if speaker.frames:
                     mixed = audioop.add(mixed, speaker.frames.popleft()[1], 2)
+                    voiced = True
+            self._read_frames += 1
+            self._voiced_frames += voiced
         return mixed
+
+    def log_stats_if_due(self) -> None:
+        """Periodic privacy-safe telemetry: counters only, never payloads."""
+        now = time.monotonic()
+        if now - self._last_stats_log < STATS_LOG_SECONDS:
+            return
+        self._last_stats_log = now
+        stats = self.stats()
+        logger.info(
+            'Voice input: %d/%d voiced frames, %d speech packets, dropped no_user=%d dave=%d dave_missing=%d opus=%d',
+            stats['voiced_frames'], stats['read_frames'], stats['speech_packets'],
+            stats['dropped_no_user'], stats['dropped_dave'],
+            stats['dropped_dave_missing'], stats['dropped_opus'],
+        )
 
     def remove_user(self, user_id: int) -> None:
         with self._lock:

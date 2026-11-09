@@ -20,6 +20,16 @@ from core.voice_audio import DiscordInput, DiscordOutput
 # this dedicated transport logger quiet even when the bot uses LOG_LEVEL=DEBUG.
 _ws_logger = logging.getLogger('quillbot.voice.websocket')
 _ws_logger.setLevel(logging.WARNING)
+logger = logging.getLogger(__name__)
+
+# Known provider error codes and honest user-facing translations. Anything
+# else keeps the generic hint, but the code is always logged for diagnosis.
+_PROVIDER_ERRORS = {
+    'response_idle_timeout': (
+        'Ficou tempo demais sem nenhuma fala gerar resposta e o Qwen encerrou a sessão '
+        'por inatividade. Use /voice entrar para iniciar outra.'
+    ),
+}
 
 
 class VoiceError(Exception):
@@ -87,8 +97,14 @@ class QwenRealtime:
         if not isinstance(event, dict) or not isinstance(event.get('type'), str):
             raise VoiceError('O serviço de voz enviou uma resposta inválida.')
         if event['type'] == 'error':
-            # Provider messages can echo request data. Don't log or forward them.
-            raise VoiceError('O Qwen recusou a sessão de voz. Confira a chave, a região, o modelo e a voz configurados.')
+            # Provider messages can echo request data. Log and forward only the
+            # short machine code, never the message payload.
+            error = event.get('error')
+            code = str(error.get('code', ''))[:64] if isinstance(error, dict) else ''
+            logger.warning('Voice provider error (code=%s)', code or 'unknown')
+            raise VoiceError(_PROVIDER_ERRORS.get(code) or (
+                'O Qwen recusou a sessão de voz. Confira a chave, a região, o modelo e a voz configurados.'
+            ))
         return event
 
     async def close(self) -> None:
@@ -147,9 +163,23 @@ class VoiceConversation:
                 asyncio.create_task(self._receive_audio()),
                 asyncio.create_task(self._watchdog()),
             ]
-            done, _ = await asyncio.wait([*tasks, audio_stopped], return_when=asyncio.FIRST_COMPLETED)
-            # Retrieve all completed tasks, including exceptions, in the finally.
-            return next(iter(done)).result()
+            _done, pending = await asyncio.wait([*tasks, audio_stopped], return_when=asyncio.FIRST_COMPLETED)
+            for task in pending:
+                task.cancel()
+            # When the provider closes the socket, sender and receiver fail
+            # together. Collect every outcome so the receiver's VoiceError (the
+            # server's own words) always beats the sender's ConnectionClosed.
+            outcomes = await asyncio.gather(*tasks, audio_stopped, return_exceptions=True)
+            errors = [o for o in outcomes if isinstance(o, BaseException) and not isinstance(o, asyncio.CancelledError)]
+            voice_errors = [o for o in errors if isinstance(o, VoiceError)]
+            if voice_errors:
+                raise voice_errors[0]
+            if errors:
+                raise errors[0]
+            for outcome in outcomes:
+                if isinstance(outcome, str):
+                    return outcome
+            return None
         finally:
             for task in tasks:
                 task.cancel()
@@ -199,6 +229,7 @@ class VoiceConversation:
     async def _watchdog(self) -> str:
         while True:
             await asyncio.sleep(1)
+            self.input.log_stats_if_due()
             now = time.monotonic()
             if not self.voice_client.is_connected():
                 return 'A conexão de voz foi encerrada.'
