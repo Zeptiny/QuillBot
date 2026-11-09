@@ -60,6 +60,7 @@ padding or DAVE authentication fails on every padded packet.
         self._voiced_frames = 0
         self._read_frames = 0
         self._last_stats_log = time.monotonic()
+        self._dave_error_sample: str | None = None
 
     @property
     def last_activity(self) -> float:
@@ -110,10 +111,12 @@ padding or DAVE authentication fails on every padded packet.
                 if session is not None:
                     try:
                         opus = session.decrypt(user.id, davey.MediaType.audio, opus)
-                    except (ValueError, RuntimeError):
+                    except (ValueError, RuntimeError) as error:
                         # Key transitions and lost encrypted frames are normal;
                         # never fall back to decoding ciphertext as Opus.
                         self._dropped['dave'] += 1
+                        if self._dave_error_sample is None:
+                            self._dave_error_sample = type(error).__name__ + ': ' + str(error)[:180]
                         return
                 elif connection.dave_protocol_version:
                     self._dropped['dave_missing'] += 1
@@ -150,6 +153,41 @@ padding or DAVE authentication fails on every padded packet.
             self._voiced_frames += voiced
         return mixed
 
+    def _dave_diag(self) -> str:
+        """Best-effort DAVE session snapshot (ids and counters only, never audio).
+
+        davey keeps its own view of the MLS group; comparing its member list and
+        per-speaker decryption stats against our drop counters distinguishes a
+        missing-key problem from a frame-malformed one.
+        """
+        try:
+            connection = self.voice_client._connection
+            session = connection.dave_session
+            if session is None:
+                return f'dave=off(version={connection.dave_protocol_version})'
+            members = sorted(session.get_user_ids())
+            speakers = []
+            for uid in list(self._speakers):
+                stats = session.get_decryption_stats(uid)
+                if stats is None:
+                    speakers.append(f'{uid}=NO_KEYS_IN_GROUP')
+                else:
+                    speakers.append(
+                        f'{uid}={stats.successes}ok/{stats.failures}fail/{stats.missing_keys}miss'
+                        f'/{stats.invalid_nonces}nonce/{stats.passthroughs}pass'
+                    )
+            enc = session.get_encryption_stats()
+            return (
+                f'dave(v{connection.dave_protocol_version} {session.status.name} ready={session.ready} '
+                f'epoch={session.epoch} members={members} '
+                f'out={enc.successes}/{enc.attempts}enc miss={enc.missing_keys} '
+                f'in[{", ".join(speakers) or "-"}]'
+                + (f' first_dave_error={self._dave_error_sample}' if self._dave_error_sample else '')
+                + ')'
+            )
+        except Exception as error:  # diagnostics must never break audio
+            return f'dave_diag_failed({type(error).__name__})'
+
     def log_stats_if_due(self) -> None:
         """Periodic privacy-safe telemetry: counters only, never payloads."""
         now = time.monotonic()
@@ -158,10 +196,11 @@ padding or DAVE authentication fails on every padded packet.
         self._last_stats_log = now
         stats = self.stats()
         logger.info(
-            'Voice input: %d/%d voiced frames, %d speech packets, dropped no_user=%d dave=%d dave_missing=%d opus=%d',
+            'Voice input: %d/%d voiced frames, %d speech packets, dropped no_user=%d dave=%d '
+            'dave_missing=%d opus=%d | %s',
             stats['voiced_frames'], stats['read_frames'], stats['speech_packets'],
             stats['dropped_no_user'], stats['dropped_dave'],
-            stats['dropped_dave_missing'], stats['dropped_opus'],
+            stats['dropped_dave_missing'], stats['dropped_opus'], self._dave_diag(),
         )
 
     def remove_user(self, user_id: int) -> None:
