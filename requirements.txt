@@ -1,7 +1,12 @@
 aiohttp>=3.11.0
 mcp>=1.10.0,<2
 cachetools>=5.5.0
-discord.py>=2.5.0
+# [voice] adds PyNaCl and davey, for /voz. Capped below 2.8 because voice receive
+# (core/voice_receive.py) builds on discord.py's voice internals: recheck it on upgrade.
+discord.py[voice]>=2.7.0,<2.8
+# davey 0.2 changed how DAVE keys rotate and discord.py 2.7 doesn't follow yet: the bot
+# joins calls but nobody hears it (Rapptz/discord.py#10549, fix pending in #10548).
+davey>=0.1.7,<0.2
 numpy>=1.26.0
 openai>=1.30.0
 Pillow>=10.0.0

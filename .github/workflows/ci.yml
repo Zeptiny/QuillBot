@@ -34,6 +34,10 @@ jobs:
       - name: Install dependencies
         run: python -m pip install -r requirements-dev.txt
 
+      # The voice tests encode and decode real opus frames (they skip without it).
+      - name: Install libopus
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libopus0
+
       - name: Lint
         run: ruff check .
 

@@ -337,6 +337,41 @@ SUMMARY_MAX_DAYS: Final[int] = int(os.getenv('SUMMARY_MAX_DAYS', '7'))
 # Rendered messages per LLM call; longer ranges are summarized map-reduce style.
 SUMMARY_SEGMENT_CHARS: Final[int] = int(os.getenv('SUMMARY_SEGMENT_CHARS', '24000'))
 
+# --- Voice calls (/voz: real-time voice conversation in voice channels) ---
+# Speech-to-speech through Qwen-Audio realtime (Alibaba Cloud Model Studio). Off
+# unless enabled, keyed and pointed at an endpoint; servers also opt in with
+# /config servidor (setting `voice`), since a call's audio goes to that model.
+VOICE_ENABLED: Final[bool] = _flag('VOICE_ENABLED', 'false')
+VOICE_API_KEY: Final[str | None] = os.getenv('VOICE_API_KEY') or None
+# The realtime WebSocket endpoint, without ?model=. Pay-as-you-go keys (sk-…) use
+# the workspace's: wss://{WorkspaceId}.ap-southeast-1.maas.aliyuncs.com/api-ws/v1/realtime
+# Token Plan keys (sk-sp-…): wss://token-plan.ap-southeast-1.maas.aliyuncs.com/api-ws/v1/realtime
+VOICE_REALTIME_URL: Final[str] = os.getenv('VOICE_REALTIME_URL', '').strip()
+VOICE_MODEL: Final[str] = os.getenv('VOICE_MODEL', 'qwen-audio-3.0-realtime-plus').strip()
+# 3.0 models: longanqian, longanlingxin, longanlingxi, longanxiaoxin, longanlufeng (or a cloned voice_id).
+VOICE_VOICE: Final[str] = os.getenv('VOICE_VOICE', 'longanqian').strip()
+# smart_turn_v2 understands turns semantically and copes best with several people in a call;
+# server_vad ends a turn on silence alone.
+VOICE_TURN_DETECTION: Final[str] = os.getenv('VOICE_TURN_DETECTION', 'smart_turn_v2').strip().lower()
+VOICE_WEB_SEARCH: Final[bool] = _flag('VOICE_WEB_SEARCH', 'false')  # the model's built-in web search
+# Someone talking over the bot this long (ms) makes it stop and listen; 0 = it always finishes.
+VOICE_BARGE_IN_MS: Final[int] = max(0, int(os.getenv('VOICE_BARGE_IN_MS', '700')))
+# Comma-separated: when set, the bot only answers a turn whose transcript says one of these
+# (its name, plus the spellings the transcription gives it, e.g. "Quill,Quil,Kill").
+VOICE_WAKE_WORDS: Final[tuple[str, ...]] = tuple(
+    w.strip() for w in os.getenv('VOICE_WAKE_WORDS', '').split(',') if w.strip()
+)
+# Let the model decide to say nothing when people are talking among themselves. It's a
+# tool call, and Qwen-Audio 3.0 can't have tools and web search on together: web search wins.
+VOICE_CAN_STAY_SILENT: Final[bool] = _flag('VOICE_CAN_STAY_SILENT')
+VOICE_TRANSCRIPTS: Final[bool] = _flag('VOICE_TRANSCRIPTS')  # post what was heard and said in the call's chat
+VOICE_MAX_CALLS: Final[int] = max(1, int(os.getenv('VOICE_MAX_CALLS', '1')))  # simultaneous calls, all servers
+VOICE_MAX_MINUTES: Final[float] = float(os.getenv('VOICE_MAX_MINUTES', '30'))
+# Below 3: the model closes a session that went 180 s without answering anything
+# (response_idle_timeout), and leaving first says why.
+VOICE_IDLE_MINUTES: Final[float] = float(os.getenv('VOICE_IDLE_MINUTES', '2.5'))
+VOICE_AVAILABLE: Final[bool] = VOICE_ENABLED and bool(VOICE_API_KEY) and bool(VOICE_REALTIME_URL)
+
 # --- Rate Limiting (per-user) ---
 COOLDOWN_RATE: Final[int] = int(os.getenv('COOLDOWN_RATE', '1'))
 COOLDOWN_PER: Final[float] = float(os.getenv('COOLDOWN_PER', '30'))
@@ -447,5 +482,18 @@ def validate_config() -> None:
         print(
             'WARNING: WEB_SEARCH_ENABLED is true but TAVILY_API_KEY is not set. '
             'Web search will be disabled.',
+            file=sys.stderr,
+        )
+    if VOICE_ENABLED and not VOICE_AVAILABLE:
+        missing = [n for n, v in (('VOICE_API_KEY', VOICE_API_KEY), ('VOICE_REALTIME_URL', VOICE_REALTIME_URL)) if not v]
+        print(
+            f'WARNING: VOICE_ENABLED is true but {", ".join(missing)} is not set. '
+            'Voice calls will be disabled.',
+            file=sys.stderr,
+        )
+    if VOICE_ENABLED and VOICE_WEB_SEARCH and VOICE_CAN_STAY_SILENT:
+        print(
+            'WARNING: VOICE_WEB_SEARCH is on, so the voice model cannot choose to stay silent '
+            '(VOICE_CAN_STAY_SILENT needs a tool, and the model cannot use tools and web search together).',
             file=sys.stderr,
         )

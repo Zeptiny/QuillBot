@@ -97,6 +97,10 @@ Notes:
 - Bodies are captured for **httpx/httpx2-based** services (`openai`, `tavily`); **aiohttp-based** services (Discord REST, GitHub, Modrinth/Hangar/SpigotMC, mclo.gs, spark) log metadata only.
 - Headers are never logged; API keys travel in headers. Sensitive query-string values (`token`, `key`, …) are redacted to `REDACTED`.
 
+### Optional — Voice calls (`/voz`)
+
+Off by default. Set `VOICE_ENABLED=true`, `VOICE_API_KEY` and `VOICE_REALTIME_URL`, install libopus (`apt install libopus0`; the Docker image has it), then turn it on per server with `/config servidor opcao:Conversa por voz valor:sim`. See the README's *Voice Calls* section for every variable.
+
 ### Optional — RAG / Docs
 
 | Variable               | Default              | Description                                              |
@@ -164,6 +168,7 @@ After adding a source, restart the bot or run `/reindex` (admin-only) to index i
 - **Add Reactions** — the 👀 reaction on detected paste links
 - **Use Application Commands** — slash commands
 - **Create Public Threads** and **Send Messages in Threads** — move long or off-topic chats into threads (without them the bot answers in the channel)
+- **Connect** and **Speak** — voice calls (`/voz`), only if enabled
 
 ### Required Intents
 
