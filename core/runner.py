@@ -191,6 +191,7 @@ async def run_turn(ctx: TurnContext) -> TurnResult:
         channel_id=getattr(ctx.channel, 'id', None),
         context_blocks='\n\n'.join(blocks) or None,
         context_image_urls=context_images,
+        previous_author=ctx.history[-1].get('author') if ctx.history else None,
     )
     messages.append(current)
 
