@@ -25,6 +25,7 @@ from config import (
     CONVERSATIONS_GAP_MESSAGES,
 )
 from core import image_store, message_media
+from core.conversations import CONTEXT_ONLY_NOTE
 from core.discord_text import _fmt_dt, format_message_lines
 
 logger = logging.getLogger(__name__)
@@ -276,6 +277,9 @@ async def fetch_recent_channel_context(
     when disabled or without a readable channel. Image attachments are
     persisted and returned separately from the formatted text. ``before``
     excludes the triggering message from the window (mention/follow-up flows).
+    The block opens with a note that it is background: the window rides in
+    the same user message as the question, and without it the model answers
+    the channel's other topics too.
     """
     n = CHANNEL_CONTEXT_MESSAGES if limit is None else limit
     if n <= 0 or channel is None:
@@ -291,7 +295,11 @@ async def fetch_recent_channel_context(
         getattr(channel, 'id', None), len(context.lines), len(context.images),
     )
     return ChannelContext(
-        text=f"<mensagens_recentes_do_canal>\n{context.text}\n</mensagens_recentes_do_canal>",
+        text=(
+            "<mensagens_recentes_do_canal>\n"
+            f"(O que o canal falava antes da mensagem que você vai responder — {CONTEXT_ONLY_NOTE}.)\n"
+            f"{context.text}\n</mensagens_recentes_do_canal>"
+        ),
         lines=context.lines,
         images=context.images,
     )

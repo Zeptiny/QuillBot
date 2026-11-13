@@ -55,6 +55,41 @@ def test_replayed_turns_stay_byte_identical_and_timeless():
     check('conversation block says newer per-turn blocks win', 'vale o da mensagem mais recente' in block)
 
 
+def test_speaker_change_is_marked_in_the_tag():
+    text = build_current_message('e eu?', author=BOB, ts=1.7e9, reply_to=99, previous_author=ALICE)['content']
+    tag = text.split('\n')[-2]
+    check('tag says someone else took over, and from whom',
+          'outra pessoa — antes falava Alice (@alice_h)' in tag, tag)
+    check('reply target still closes the tag', tag.endswith('• ↩ reply_to=99]'), tag)
+    for previous in (BOB, None, {'id': '', 'name': 'x', 'display': 'X'}):
+        same = build_current_message('e eu?', author=BOB, ts=1.7e9, previous_author=previous)['content']
+        check(f'no mark when the previous speaker is {previous}', 'outra pessoa' not in same, same)
+
+
+def test_speaker_changes_survive_replay():
+    sent, turns, previous = [], [], None
+    for i, author in enumerate([ALICE, BOB, BOB, ALICE]):
+        um = build_current_message(f'pergunta {i}', author=author, ts=1.7e9 + i, previous_author=previous)
+        sent.append(um['content'])
+        turns.append(make_turn(f'pergunta {i}', f'resposta {i}', author=author, ts=1.7e9 + i, user_message=um))
+        previous = author
+    users = [m['content'] for m in build_history_messages(turns) if m['role'] == 'user']
+    check('verbatim replay is still exactly what was sent (prefix cache)', users == sent, users)
+    marked = ['outra pessoa' in u for u in users]
+    check('marked only where the speaker changed', marked == [False, True, False, True], marked)
+
+    compact = [m['content'] for m in build_history_messages(turns, trajectory_turns=0) if m['role'] == 'user']
+    marked = ['outra pessoa — antes falava' in u for u in compact]
+    check('compact rendering marks the same turns', marked == [False, True, False, True], compact)
+
+
+def test_conversation_block_points_at_the_current_speaker():
+    block = build_conversation_block([make_turn('q', 'a', author=ALICE, ts=1.7e9)])
+    check('participants are the ones so far', 'Participantes até agora: Alice (@alice_h).' in block, block)
+    check('explains the speaker-change mark', 'outra pessoa — antes falava' in block, block)
+    check('whoever speaks now may be new', 'ainda não participou' in block, block)
+
+
 def _member(uid, name, display):
     return SimpleNamespace(id=uid, name=name, display_name=display, nick=None, global_name=None)
 

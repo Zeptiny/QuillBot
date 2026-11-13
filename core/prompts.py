@@ -26,6 +26,7 @@ from config import (
     WRAPPED_ENABLED,
 )
 from core.chat_threads import UNPROMPTED_HEADER
+from core.conversations import PRIOR_CONTEXT_HEADER
 from core.turn import FOLLOW_HEADER, NAME_HEADER, NO_REPLY_TOKEN
 
 ROLE = (
@@ -57,6 +58,23 @@ MEMORY_INSTRUCTIONS = (
     "o fato mudar e use action=forget quando deixar de valer. Use pinned=true só "
     "para fatos centrais e permanentes.\n"
 ) if MEMORY_ENABLED else ""
+
+# How to read a turn: the channel chatter rides in the same user message as the
+# question, so the model must be told it is background, or it answers all of it.
+CONTEXT_INSTRUCTIONS = (
+    "- Na mensagem que você recebe, o que vem antes da marca [Por Autor (@usuário) • author_id=… • "
+    "data hora] foi preparado para você (blocos <contexto>, <canal>, <memory>, "
+    f"<mensagens_recentes_do_canal> e \"[{PRIOR_CONTEXT_HEADER} …]\"); depois da marca vem o que essa "
+    "pessoa escreveu. É a essa pessoa, e só ao que ela escreveu, que você responde. Se ela respondeu a "
+    "outra mensagem, essa vem logo abaixo da marca como \"[Mensagem respondida — …]\", antes de um ---: "
+    "é o que ela está apontando.\n"
+    "- As mensagens do canal nesses blocos foram escritas para o canal, por outras pessoas ou por você — "
+    "não são pedidos para você. Use-as para entender a mensagem que está respondendo (do que o canal está "
+    "falando, a que \"isso\" ou \"ele\" se referem), mas não responda, comente nem resuma os outros "
+    "assuntos delas, a menos que a pessoa peça.\n"
+    "- Numa conversa que já vinha acontecendo, siga o assunto da mensagem atual: se a pessoa mudou de "
+    "assunto, responda só ao novo, sem voltar aos anteriores.\n"
+)
 
 EPISODE_INSTRUCTIONS = (
     "- Memórias do tipo conversa resumem conversas suas que já terminaram (com quem, "
@@ -172,8 +190,8 @@ SILENCE_INSTRUCTIONS = (
     f"- Mensagens que começam com {UNPROMPTED_HEADER}, {NAME_HEADER} ou {FOLLOW_HEADER} não foram dirigidas "
     "diretamente a você: responda só se falarem com você ou se tiver algo útil a acrescentar; "
     f"caso contrário, {NO_REPLY_TOKEN}.\n"
-    "- Várias mensagens seguidas da mesma pessoa chegam juntas, uma por linha: responda a "
-    "todas de uma vez.\n"
+    "- Várias mensagens seguidas da mesma pessoa chegam juntas abaixo da marca [Por …], uma por "
+    "linha: responda a todas de uma vez. As mensagens do canal que vêm antes da marca não contam.\n"
     "- Se o bloco <canal> trouxer instruções do canal, siga-as.\n"
 )
 
@@ -209,6 +227,7 @@ EMBED_FORMAT = (
 CHAT_SYSTEM_PROMPT = (
     ROLE + "\n\n"
     "<instructions>\n"
+    + CONTEXT_INSTRUCTIONS
     + MEMORY_INSTRUCTIONS
     + EPISODE_INSTRUCTIONS
     + TASK_INSTRUCTIONS
@@ -232,6 +251,7 @@ ASK_SYSTEM_PROMPT = (
     "- Esta conversa começou com /ask: o foco é administração de servidores Minecraft.\n"
     "- Para qualquer pergunta técnica sobre configuração, administração ou otimização de "
     "servidores Minecraft, chame `search_docs` imediatamente.\n"
+    + CONTEXT_INSTRUCTIONS
     + MEMORY_INSTRUCTIONS
     + EPISODE_INSTRUCTIONS
     + TASK_INSTRUCTIONS
