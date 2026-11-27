@@ -135,7 +135,11 @@ class Commands(commands.Cog):
         # Dynamically list all registered slash commands
         cmds = self.bot.tree.get_commands()
         cmd_lines = []
+        # Action GIF commands (/hug, /slap…) share one line in their own field.
+        actions = sorted(c.name for c in cmds if getattr(c, 'extras', {}).get('action'))
         for cmd in sorted(cmds, key=lambda c: c.name):
+            if getattr(cmd, 'extras', {}).get('action'):
+                continue
             params = ''
             if hasattr(cmd, 'parameters') and cmd.parameters:
                 param_parts = []
@@ -148,6 +152,16 @@ class Commands(commands.Cog):
             cmd_lines.append(f'**/{cmd.name}**{params} — {cmd.description}')
 
         embed.description = '\n'.join(cmd_lines)
+        if actions:
+            embed.add_field(
+                name="🎭 Ações",
+                value=(
+                    ' '.join(f'/{name}' for name in actions)
+                    + "\nUm GIF de anime de você fazendo isso com alguém (`usuario`), que pode retribuir. "
+                    "Pode fazer comigo também — e eu posso fazer com você."
+                ),
+                inline=False,
+            )
 
         embed.add_field(
             name="💬 Conversa",

@@ -49,6 +49,7 @@ Built with [discord.py](https://discordpy.readthedocs.io/) + RAG (Retrieval-Augm
 | **Channel Summaries** | `/resumo` and natural-language "o que perdi?" — map-reduce summaries of a channel or thread over any period, with jump links and permission checks |
 | **Monitors** | Standing triggers (channels, authors, mentions of a user, a content regex) that call the bot on matching messages; it answers like a mention, knows a monitor sent it, and may stay silent. Managed with `/monitor` or by asking the bot |
 | **Voice Calls** | `/voz entrar`: the bot joins your voice channel and talks in real time (speech-to-speech with Qwen-Audio realtime) — hears everyone in the call, stops when talked over, optionally writes the conversation in the call's chat. Off unless configured, and each server opts in |
+| **Action GIFs** | `/hug`, `/kiss`, `/slap`, `/lick` and 11 more: an anime GIF of you doing it to someone, who can return it with a button. Done to the bot, it answers in character; asked ("dá um abraço no Bruno"), it does them itself. Counts per pair ("Ana já abraçou Bruno 5 vezes") |
 | **Persistent Memory** | The bot remembers: atomic facts about the server and its members, auto-injected into every conversation, with inline LLM writes, pinning, dedupe, full audit history and admin control. Each memory records who said it — a fact about someone told by someone else is shown as a report ("segundo Fulano") |
 
 All AI responses are in **Brazilian Portuguese**.
@@ -228,6 +229,24 @@ A recap of the server over a period (`semana` = 7 days, default; `mes`; `ano`; o
 - **Data:** messages from the history index; reactions from a `reactions` table recorded live since this version (no backfill), also queryable with `sql_history`
 - Set `WRAPPED_ENABLED=false` to remove the command, the tool and the automatic posts
 
+#### `/hug`, `/kiss`, `/slap`… — Action GIFs
+`/<ação> usuario:@Pessoa` posts an anime GIF of you doing the action to that person (`cogs/actions.py`, `core/action_gifs.py`): `🤗 **Ana** abraçou @Bruno!`, the GIF in an embed, and a footer with the count for that pair and the anime it's from.
+
+| Kind | Commands | Button |
+|---|---|---|
+| Affection | `/hug`, `/kiss`, `/pat`, `/cuddle`, `/highfive`, `/handhold`, `/feed` | Retribuir |
+| Playful | `/lick`, `/poke`, `/bite`, `/bonk`, `/tickle` | Devolver |
+| Rough | `/slap`, `/punch`, `/kick` | Revidar |
+
+- **Doing it back:** the button under the GIF works for its target only, once, for 10 minutes; it posts the same action the other way ("… de volta!"), without a button of its own
+- **GIFs:** [nekos.best](https://nekos.best) first (it also names the anime), then [otakugifs.xyz](https://otakugifs.xyz) (the only one with `lick`); only GIFs on those hosts are posted. Each GIF fetched is remembered (50 per action, `ACTIONS_DB_PATH`), so when both APIs are down an earlier one is reused; with none, the action goes out as text. nekos.best refuses requests without a User-Agent naming the app and a contact: by default the bot's name and invite link, or `ACTIONS_USER_AGENT`
+- **Doing it to the bot:** after the GIF, the bot answers in character, like a mention — a few words, a reaction on the GIF, doing it back with `send_action_gif`, or nothing. It costs the person one turn of their `CHAT_USER_BUDGET` (over it, the GIF stands alone), and replying to the answer continues the conversation. Not in channels where `respond` is `off`; `ACTIONS_BOT_REPLY=false` turns it off
+- **The bot doing it:** the `send_action_gif` tool (chat profile) — when asked ("dá um abraço no Bruno", "bate nele") or when it fits its personality, at most once per answer; the GIF goes out before the answer, with a button for the person to do it back. `ACTIONS_TOOL_ENABLED=false` removes it
+- **Yourself:** affection actions come from the bot instead ("Ninguém merece fazer isso sozinho: **QuillBot** abraçou @Ana!"); the others are refused
+- **Pings:** the target is notified (`ACTIONS_PING_TARGET=false` for none); bots never are. Other bots can be targets, without a button
+- **Limits:** one action per person every `ACTIONS_COOLDOWN_SECONDS` (all commands together); off per channel or server with `/config … actions não`
+- `/help` lists them on one line; `ACTIONS_ENABLED=false` removes the commands and the tool
+
 #### `/config` — Server and channel settings *(Manage Server)*
 | Subcommand | Description |
 |---|---|
@@ -243,6 +262,7 @@ A recap of the server over a period (`semana` = 7 days, default; `mes`; `ano`; o
 | `threads` | channel | `auto`, `always`, `never` |
 | `reply_style` | channel | `auto`, `plain`, `embed` (default `CHAT_REPLY_STYLE`) |
 | `log_detection` | channel | react to log links, `.log`/`.txt` files and Spark links |
+| `actions` | channel | `/hug`, `/slap`… and the bot's own action GIFs (default on) |
 | `instructions` | channel | text the model follows in that channel ("seja direto e técnico", "aqui é papo livre") |
 | `aliases` | server | extra names the bot answers to, comma-separated |
 | `wrapped`, `wrapped_channel` | server | automatic Wrapped: `off`/`weekly`/`monthly` and where |
@@ -458,6 +478,7 @@ QuillBot/
 │   ├── discord_text.py   # Mentions/pings, identity block, canonical message lines, splitting
 │   ├── chat_threads.py   # When conversations move into threads, the open_thread tool, bot-thread detection
 │   ├── message_media.py  # Stickers, GIFs, custom emojis, reactions, the add_reaction tool
+│   ├── action_gifs.py    # Action GIFs: the actions, GIF APIs with fallbacks, counts, wording
 │   ├── image_store.py    # Persisted, re-encoded images for vision
 │   ├── tavily_tools.py   # Tavily web_search / web_extract
 │   ├── local_inference.py# Single-thread executor for local models
@@ -473,6 +494,7 @@ QuillBot/
 │   ├── persona.py        # /persona, the persona_update tool, change log with Revert
 │   ├── wrapped.py        # /wrapped, server_wrapped tool, automatic weekly/monthly recaps
 │   ├── voice.py          # /voz entrar | sair — real-time voice calls
+│   ├── actions.py        # /hug, /kiss, /slap…, the return button, send_action_gif, the bot answering actions
 │   ├── docs_rag.py       # Docs RAG — indexing, search, reranking, /reindex, search_docs/search_plugins tools
 │   ├── history_rag.py    # Server-wide history RAG — backfill, live ingestion, reactions, history tools, Wrapped stats
 │   ├── log_analyzer.py   # Passive log detection, pattern matching, /analyze, file upload to mclo.gs
@@ -493,6 +515,7 @@ QuillBot/
     ├── settings.db        # /config settings
     ├── persona.db         # Personality sections + history
     ├── conversations.db   # Conversations (handles, triggers, episode state)
+    ├── actions.db         # Action counts per pair, recent GIF URLs
     ├── lore.db            # Legacy lore encyclopedia (kept as migration source)
     └── history/          # Per-guild history stores
 ```
@@ -706,6 +729,18 @@ cp .env.example .env   # if available, otherwise create .env manually
 | `WRAPPED_ENABLED` | `true` | `/wrapped`, the `server_wrapped` tool and automatic recaps |
 | `WRAPPED_HOUR` | `10` | Brasília hour automatic recaps are posted (Mondays / the 1st) |
 
+### Action GIFs
+
+| Variable | Default | Description |
+|---|---|---|
+| `ACTIONS_ENABLED` | `true` | `/hug`, `/kiss`, `/slap`… and the `send_action_gif` tool |
+| `ACTIONS_DB_PATH` | `data/actions.db` | Counts per pair and recent GIF URLs |
+| `ACTIONS_PING_TARGET` | `true` | Notify the person on the receiving end |
+| `ACTIONS_COOLDOWN_SECONDS` | `5` | Between two actions of one person (all commands together) |
+| `ACTIONS_BOT_REPLY` | `true` | Doing an action to the bot gets an answer in character (one chat turn) |
+| `ACTIONS_TOOL_ENABLED` | `true` | The bot can do actions itself (`send_action_gif`) |
+| `ACTIONS_USER_AGENT` | bot name + invite link | User-Agent for the GIF APIs. nekos.best asks for `AppName (contact)` — an email, site, repository or bot invite — and refuses requests without one |
+
 ### Voice Calls
 
 `/voz` exists only when `VOICE_ENABLED=true`, both `VOICE_API_KEY` and `VOICE_REALTIME_URL` are set, and libopus is installed (the startup log says which one is missing). Servers then opt in with the `voice` setting.
@@ -800,6 +835,7 @@ ruff check .                   # lint (rules configured in pyproject.toml)
 
 | File | Covers |
 |---|---|
+| `test_actions.py` | Action GIFs: providers in order and fallbacks (recent GIF, then text), refused hosts, counts, wording, the return button (target only, once, back the other way), pings, cooldown and self-actions, the bot answering actions done to it (and returns of its own), the `send_action_gif` tool, the engine's answer starting a conversation |
 | `test_api_logger.py` | Request logging for aiohttp/httpx/httpx2, redaction, body capture, inbound interactions (runs in its own process) |
 | `test_attribution.py` | Author tags on every question, speaker changes marked in the tag (verbatim and compact replay), the conversation block naming who speaks now, byte-identical replay of per-turn blocks, memory block labels and person-memory rules |
 | `test_channel_context_images.py` | Images from automatically fetched channel context |

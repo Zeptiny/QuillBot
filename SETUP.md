@@ -216,6 +216,7 @@ Every message goes through one router (`core/router.py`): passive observers (his
 | `/resumo`   | Summarize what happened in a channel                 | Yes         |
 | `/wrapped`  | Server recap: who talked most, channels, emojis…     | Optional**  |
 | `/config`   | Server and channel settings (Manage Server)          | No          |
+| `/hug`, `/kiss`, `/slap`… | Anime GIF of you doing it to someone (15 actions) | No***  |
 | `/persona`  | The bot's personality on this server (editing needs Manage Server) | No |
 | `/memory`, `/monitor`, `/schedule` | Memories, standing triggers, scheduled tasks | Yes |
 | `/analyze`  | Analyze a server log with AI (mclo.gs, pastebin, or file) | Yes   |
@@ -231,6 +232,7 @@ Every message goes through one router (`core/router.py`): passive observers (his
 
 *`/docs` with a query delegates to RAG search if available, otherwise shows a link.
 **The numbers come from the history index; the AI only writes the intro.
+***The GIFs come from nekos.best and otakugifs.xyz; the AI only answers when the action is done to the bot.
 
 ---
 
@@ -261,6 +263,7 @@ QuillBot/
 │   ├── server_config.py# /config
 │   ├── persona.py      # /persona and the bot's personality per server
 │   ├── wrapped.py      # /wrapped and automatic recaps
+│   ├── actions.py      # /hug, /kiss, /slap… action GIFs
 │   ├── docs_rag.py     # RAG pipeline: indexing, search, /reindex, search_docs tool
 │   ├── log_analyzer.py # Log analysis: pattern matching, /analyze, AI analysis
 │   ├── plugins.py      # External API commands: /plugin, /status, /changelog

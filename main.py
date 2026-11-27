@@ -61,6 +61,7 @@ COGS = [
     'cogs.summary',
     'cogs.wrapped',
     'cogs.voice',
+    'cogs.actions',
 ]
 
 

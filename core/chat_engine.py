@@ -742,6 +742,55 @@ class ChatEngine:
         )
         return True
 
+    async def answer_action(self, message: Any, *, actor: Any, guild: Any, channel: Any, question: str) -> bool:
+        """Answer, in character, an action someone did to the bot (``/hug @bot``).
+
+        *message* is the bot's own post of the action (the GIF): a reaction
+        goes on it and the answer replies to it; replying to the answer
+        continues the conversation. It costs *actor* a turn of their budget —
+        over it, the GIF stands alone. The model may stay silent (a reaction
+        can be the whole answer). Returns whether an answer was sent.
+        """
+        if not self.budget.try_spend(actor.id, getattr(guild, 'id', None)):
+            logger.info('[actions] budget used up for user=%s; no answer to the action', actor.id)
+            return False
+        settings = self.settings_for(guild, channel)
+        created = getattr(message, 'created_at', None) or datetime.datetime.now(datetime.timezone.utc)
+        ctx = TurnContext(
+            bot=self.bot, profile=CHAT, question=question, user=actor, guild=guild, channel=channel,
+            created_at=created, message=message, window_before=message,
+            participant_ids={str(actor.id)}, origin=getattr(message, 'jump_url', None),
+            thread_blocker=chat_threads.ANSWERS_IN_PLACE, channel_settings=settings,
+        )
+        try:
+            async with channel.typing():
+                result = await run_turn(ctx)
+        except Exception:
+            logger.exception('[actions] answering the action %s failed', getattr(message, 'id', None))
+            return False
+        if is_silent(result.answer):
+            return False
+        out = self._outgoing(result, CHAT, settings)
+        try:
+            sent = await deliver(out, guild=guild, reply_to=message, mention_author=False)
+        except discord.HTTPException:
+            logger.exception('[actions] could not send the answer to action %s', getattr(message, 'id', None))
+            return False
+        if not sent:
+            return False
+        turn = make_turn(
+            question, result.answer, author=author_info(actor), ts=created.timestamp(),
+            message_id=message.id, channel_id=getattr(channel, 'id', None),
+            channel_name=getattr(channel, 'name', None), sources=result.sources,
+            user_message=result.user_message, trajectory=result.trajectory,
+            context_images=result.context_image_urls, reply_ids=[m.id for m in sent],
+        )
+        turn['answered_ts'] = time.time()
+        await self._create(
+            sent, turn, user=actor, guild=guild, channel=channel, profile=CHAT, trigger_ids=[message.id],
+        )
+        return True
+
     async def run_task(self, prompt: str, *, guild: Any, channel: Any, owner: Any = None) -> list[Any]:
         """Run a scheduled task's prompt and post the answer in *channel*.
 

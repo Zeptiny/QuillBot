@@ -311,6 +311,22 @@ WRAPPED_ENABLED: Final[bool] = _flag('WRAPPED_ENABLED')
 # Hour (Brasília time) automatic recaps are posted: Mondays (weekly) or the 1st (monthly).
 WRAPPED_HOUR: Final[int] = int(os.getenv('WRAPPED_HOUR', '10'))
 
+# --- Action GIFs (/hug, /kiss, /slap…: an anime GIF of someone doing it to someone) ---
+ACTIONS_ENABLED: Final[bool] = _flag('ACTIONS_ENABLED')
+# Action counts per pair and the GIF URLs seen lately (reused when the GIF APIs are down).
+ACTIONS_DB_PATH: Final[str] = os.getenv('ACTIONS_DB_PATH', 'data/actions.db')
+# Whether the person on the receiving end gets a notification.
+ACTIONS_PING_TARGET: Final[bool] = _flag('ACTIONS_PING_TARGET')
+# Seconds between two action commands of one person.
+ACTIONS_COOLDOWN_SECONDS: Final[float] = max(0.0, float(os.getenv('ACTIONS_COOLDOWN_SECONDS', '5')))
+# Doing an action to the bot gets an answer in character (one chat turn of that person's budget).
+ACTIONS_BOT_REPLY: Final[bool] = _flag('ACTIONS_BOT_REPLY')
+# The send_action_gif tool: the bot hugs, slaps… people itself when asked or when it fits.
+ACTIONS_TOOL_ENABLED: Final[bool] = _flag('ACTIONS_TOOL_ENABLED')
+# User-Agent for the GIF APIs. nekos.best refuses requests without "AppName (contact)"
+# (an email, site, repository or bot invite link); empty uses the bot's name and invite link.
+ACTIONS_USER_AGENT: Final[str] = os.getenv('ACTIONS_USER_AGENT', '').strip()
+
 # --- Scheduler (cron / one-shot delayed tasks) ---
 SCHEDULER_ENABLED: Final[bool] = os.getenv('SCHEDULER_ENABLED', 'true').strip().lower() in ('1', 'true', 'yes')
 SCHEDULER_DB_PATH: Final[str] = os.getenv('SCHEDULER_DB_PATH', 'data/scheduler.db')
