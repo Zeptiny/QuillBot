@@ -68,6 +68,10 @@ SETTINGS: dict[str, Setting] = {s.key: s for s in (
         'Reage a links de log (mclo.gs, pastebin), arquivos .log/.txt e relatórios Spark.',
     ),
     Setting(
+        'actions', 'channel', 'bool', True, 'Comandos de ação (GIFs)',
+        '/hug, /kiss, /slap e outros GIFs de ação neste canal, também quando o bot faz a ação.',
+    ),
+    Setting(
         'instructions', 'channel', 'text', '', 'Instruções do canal',
         'Orientações para o bot neste canal (ex.: "seja direto e técnico", "aqui é papo livre").',
     ),

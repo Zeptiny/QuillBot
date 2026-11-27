@@ -70,6 +70,7 @@ CHAT = Profile(
         'server_wrapped',
         'persona_update',
         'add_reaction',
+        'send_action_gif',
         'open_thread',
     ),
     model=CHAT_MODEL,
