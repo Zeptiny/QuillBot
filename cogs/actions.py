@@ -28,7 +28,9 @@ from config import (
     ACTIONS_COOLDOWN_SECONDS,
     ACTIONS_DB_PATH,
     ACTIONS_ENABLED,
+    ACTIONS_GIFS_DIR,
     ACTIONS_PING_TARGET,
+    ACTIONS_STORE_GIFS,
     ACTIONS_TOOL_ENABLED,
     ACTIONS_USER_AGENT,
 )
@@ -156,6 +158,8 @@ class Actions(commands.Cog):
             self.bot.tree.remove_command(command.name)
         self._commands.clear()
         self.services.tools.unregister(TOOL_NAME)
+        if self.gifs is not None:
+            self.gifs.close()
         if self.session is not None:
             await self.session.close()
 
@@ -172,7 +176,9 @@ class Actions(commands.Cog):
         """The GIF picker, made on first use: the bot only knows its own id once logged in."""
         if self.gifs is None:
             self.session = aiohttp.ClientSession(timeout=_HTTP_TIMEOUT, headers={'User-Agent': self.user_agent()})
-            self.gifs = GifPicker(self.session, self.store)
+            self.gifs = GifPicker(
+                self.session, self.store, files_dir=ACTIONS_GIFS_DIR if ACTIONS_STORE_GIFS else None,
+            )
         return self.gifs
 
     def make_command(self, action: Action) -> app_commands.Command:
@@ -252,6 +258,9 @@ class Actions(commands.Cog):
         kwargs: dict[str, Any] = {'content': content, 'allowed_mentions': self._mentions(target)}
         if embed is not None:
             kwargs['embed'] = embed
+        file = action_gifs.attachment(action, gif)  # a stored copy: no API answered
+        if file is not None:
+            kwargs['file'] = file
         view = None
         if not returned and not getattr(target, 'bot', False):
             view = kwargs['view'] = ReturnView(self, action, actor=actor, target=target)

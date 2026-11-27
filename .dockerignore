@@ -1,0 +1,3 @@
+# Runtime data (databases, vectors, stored action GIFs) is mounted by docker-compose
+# (./data:/app/data); keeping it out of the build context and the image.
+data/

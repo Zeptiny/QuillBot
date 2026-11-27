@@ -313,8 +313,11 @@ WRAPPED_HOUR: Final[int] = int(os.getenv('WRAPPED_HOUR', '10'))
 
 # --- Action GIFs (/hug, /kiss, /slap…: an anime GIF of someone doing it to someone) ---
 ACTIONS_ENABLED: Final[bool] = _flag('ACTIONS_ENABLED')
-# Action counts per pair and the GIF URLs seen lately (reused when the GIF APIs are down).
+# Action counts per pair and every GIF URL the APIs returned.
 ACTIONS_DB_PATH: Final[str] = os.getenv('ACTIONS_DB_PATH', 'data/actions.db')
+# Keep a copy of every distinct GIF, uploaded as an attachment when no GIF API answers.
+ACTIONS_STORE_GIFS: Final[bool] = _flag('ACTIONS_STORE_GIFS')
+ACTIONS_GIFS_DIR: Final[str] = os.getenv('ACTIONS_GIFS_DIR', 'data/action_gifs')
 # Whether the person on the receiving end gets a notification.
 ACTIONS_PING_TARGET: Final[bool] = _flag('ACTIONS_PING_TARGET')
 # Seconds between two action commands of one person.

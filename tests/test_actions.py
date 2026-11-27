@@ -1,6 +1,7 @@
 """Action GIFs: /hug, /slap…, their providers and fallbacks, counts, the return button,
 the bot answering actions done to it, and the send_action_gif tool."""
 
+import os
 from types import SimpleNamespace as NS
 
 import discord
@@ -26,10 +27,22 @@ OTHER_BOT = NS(id=444, name='musica', display_name='Música', bot=True, mention=
 # Fakes
 # ---------------------------------------------------------------------------
 
+GIF_BYTES = b'GIF89a' + b'\x00' * 100
+
+
 class _Resp:
-    def __init__(self, status, data):
+    def __init__(self, status, data, body=b''):
         self.status = status
         self.data = data
+        self.body = body
+        self.content_length = len(body) if body else None
+        self.content = NS(iter_chunked=self._chunks)
+
+    def _chunks(self, size):
+        async def gen():
+            for i in range(0, len(self.body), size):
+                yield self.body[i:i + size]
+        return gen()
 
     async def __aenter__(self):
         if isinstance(self.data, Exception):
@@ -44,13 +57,20 @@ class _Resp:
 
 
 class FakeSession:
-    """``aiohttp.ClientSession.get`` answering per host: (status, json) or an exception."""
+    """``aiohttp.ClientSession.get``: API calls answer per host with (status, json) or an
+    exception; GIF downloads answer from *files* (url -> bytes)."""
 
-    def __init__(self, **by_host):
+    def __init__(self, files=None, **by_host):
         self.by_host = by_host
+        self.files = files or {}
         self.calls = []
+        self.downloads = []
 
-    def get(self, url, params=None):
+    def get(self, url, params=None, timeout=None):
+        if url in self.files:
+            self.downloads.append(url)
+            body = self.files[url]
+            return _Resp(0, body) if isinstance(body, Exception) else _Resp(200, None, body)
         self.calls.append((url, params))
         host = 'otaku' if 'otakugifs' in url else 'nekos'
         status, data = self.by_host.get(host, (500, None))
@@ -131,14 +151,14 @@ class ActionChannel(TextChannel):
         return NS(id=mid, channel=self, guild=self.guild)
 
 
-def make_cog(tmp_path, *, session=None, chat=None):
+def make_cog(tmp_path, *, session=None, chat=None, files_dir=None):
     services = make_services(tmp_path)
     services.chat = chat
     bot = NS(services=services, user=BOT_MEMBER, tree=None)
     cog = actions_mod.Actions(bot)
     cog.store = ActionStore(str(tmp_path / 'actions.db'))
     cog.store.load()
-    cog.gifs = GifPicker(session or FakeSession(nekos=nekos_ok(), otaku=otaku_ok()), cog.store)
+    cog.gifs = GifPicker(session or FakeSession(nekos=nekos_ok(), otaku=otaku_ok()), cog.store, files_dir=files_dir)
     guild = Guild(members=[ASKER, OTHER, BOT_MEMBER, OTHER_BOT])
     guild.me = BOT_MEMBER
     channel = ActionChannel(guild)
@@ -191,18 +211,116 @@ async def test_gifs_from_other_hosts_are_refused(tmp_path):
     check('look-alike host refused', not action_gifs.allowed_url('https://notnekos.best/x.gif'))
 
 
-def test_store_counts_per_pair_and_keeps_recent_gifs(tmp_path):
-    store = ActionStore(str(tmp_path / 'a.db'), recent=3)
+def test_store_counts_per_pair_and_keeps_every_gif(tmp_path):
+    store = ActionStore(str(tmp_path / 'a.db'))
     store.load()
     check('first', store.bump(1, 222, 333, 'hug') == 1)
     check('second', store.bump(1, 222, 333, 'hug') == 2)
     check('other direction apart', store.bump(1, 333, 222, 'hug') == 1)
     check('other action apart', store.bump(1, 222, 333, 'slap') == 1)
     check('other server apart', store.bump(2, 222, 333, 'hug') == 1)
-    for i in range(5):
+    for i in range(80):
         store.remember_gif('hug', Gif(f'https://nekos.best/{i}.gif'))
-    urls = {store.recent_gif('hug').url for _ in range(40)}
-    check('only the newest are kept', urls <= {f'https://nekos.best/{i}.gif' for i in (2, 3, 4)} and urls, urls)
+    store.remember_gif('hug', Gif('https://nekos.best/0.gif', 'K-On!'))
+    urls = {store.recent_gif('hug').url for _ in range(2000)}
+    check('no cap: all 80 kept, once each', len(urls) == 80, len(urls))
+    con = store._connect()
+    anime = con.execute('SELECT anime FROM action_gifs WHERE url=?', ('https://nekos.best/0.gif',)).fetchone()[0]
+    con.close()
+    check('anime filled in later', anime == 'K-On!', anime)
+
+
+async def test_every_distinct_gif_file_is_saved_once(tmp_path):
+    store = ActionStore(str(tmp_path / 'a.db'))
+    store.load()
+    files_dir = str(tmp_path / 'gifs')
+    other = 'https://cdn.otakugifs.xyz/gifs/hug/same.gif'
+    session = FakeSession(files={NEKOS_GIF: GIF_BYTES, other: GIF_BYTES}, nekos=nekos_ok(), otaku=otaku_ok(url=other))
+    picker = GifPicker(session, store, files_dir=files_dir)
+    gif = await picker.pick(ACTIONS['hug'])
+    check('the API GIF is used as is', gif.url == NEKOS_GIF and not gif.path)
+    await picker.drain()
+    check('its file was saved, named by its hash', len(os.listdir(files_dir)) == 1 and session.downloads == [NEKOS_GIF], session.downloads)
+    await picker.pick(ACTIONS['hug'])
+    await picker.drain()
+    check('a GIF already saved is not downloaded again', session.downloads == [NEKOS_GIF], session.downloads)
+    session.by_host['nekos'] = (503, None)
+    await picker.pick(ACTIONS['hug'])
+    await picker.drain()
+    check('a new URL with the same bytes shares the file', session.downloads == [NEKOS_GIF, other] and len(os.listdir(files_dir)) == 1)
+
+
+async def test_failed_download_is_retried_when_served_again(tmp_path):
+    store = ActionStore(str(tmp_path / 'a.db'))
+    store.load()
+    files_dir = str(tmp_path / 'gifs')
+    session = FakeSession(files={NEKOS_GIF: OSError('428')}, nekos=nekos_ok())
+    picker = GifPicker(session, store, files_dir=files_dir)
+    await picker.pick(ACTIONS['hug'])
+    await picker.drain()
+    check('nothing saved yet', store.stored_files('hug') == [])
+    session.files[NEKOS_GIF] = GIF_BYTES
+    await picker.pick(ACTIONS['hug'])
+    await picker.drain()
+    check('saved on the next serve', len(store.stored_files('hug')) == 1 and len(session.downloads) == 2, session.downloads)
+
+
+async def test_apis_down_upload_a_stored_file(tmp_path):
+    cog, guild, channel = make_cog(tmp_path, files_dir=str(tmp_path / 'gifs'),
+                                   session=FakeSession(files={NEKOS_GIF: GIF_BYTES}, nekos=nekos_ok()))
+    await cog.perform(ACTIONS['hug'], actor=ASKER, target=OTHER, guild=guild, channel=channel, send=Sender())
+    await cog.gifs.drain()
+    cog.gifs.session.by_host['nekos'] = (0, OSError('down'))
+    cog.gifs.session.by_host['otaku'] = (0, OSError('down'))
+    send = Sender()
+    await cog.perform(ACTIONS['hug'], actor=ASKER, target=OTHER, guild=guild, channel=channel, send=send)
+    kwargs = send.sent[0].kwargs
+    check('uploaded as an attachment', isinstance(kwargs.get('file'), discord.File) and kwargs['file'].filename == 'hug.gif', kwargs)
+    check('shown in the embed from the attachment', kwargs['embed'].image.url == 'attachment://hug.gif', kwargs['embed'].image.url)
+    check('footer keeps the anime', kwargs['embed'].footer.text.endswith('· Anime: Sword Art Online'), kwargs['embed'].footer.text)
+    kwargs['file'].close()
+
+
+async def test_stored_file_gone_falls_back_to_the_url(tmp_path):
+    store = ActionStore(str(tmp_path / 'a.db'))
+    store.load()
+    files_dir = str(tmp_path / 'gifs')
+    session = FakeSession(files={NEKOS_GIF: GIF_BYTES}, nekos=nekos_ok())
+    picker = GifPicker(session, store, files_dir=files_dir)
+    await picker.pick(ACTIONS['hug'])
+    await picker.drain()
+    for name in os.listdir(files_dir):
+        os.remove(os.path.join(files_dir, name))
+    session.by_host['nekos'] = (503, None)
+    gif = await picker.pick(ACTIONS['hug'])
+    check('the URL instead', gif == Gif(NEKOS_GIF, 'Sword Art Online'), gif)
+    check('marked to download again', store.stored_files('hug') == [])
+
+
+async def test_non_gifs_and_big_files_are_not_stored(tmp_path, monkeypatch):
+    store = ActionStore(str(tmp_path / 'a.db'))
+    store.load()
+    files_dir = str(tmp_path / 'gifs')
+    picker = GifPicker(FakeSession(files={NEKOS_GIF: b'<html>blocked</html>'}, nekos=nekos_ok()), store, files_dir=files_dir)
+    await picker.pick(ACTIONS['hug'])
+    await picker.drain()
+    check('not a GIF', not os.path.exists(files_dir) or not os.listdir(files_dir))
+    monkeypatch.setattr(action_gifs, 'MAX_FILE_BYTES', 50)
+    picker = GifPicker(FakeSession(files={NEKOS_GIF: GIF_BYTES}, nekos=nekos_ok()), store, files_dir=files_dir)
+    await picker.pick(ACTIONS['hug'])
+    await picker.drain()
+    check('over the upload limit', not os.path.exists(files_dir) or not os.listdir(files_dir))
+    check('still recorded as a URL', store.recent_gif('hug').url == NEKOS_GIF)
+
+
+async def test_no_files_without_a_directory(tmp_path):
+    store = ActionStore(str(tmp_path / 'a.db'))
+    store.load()
+    session = FakeSession(files={NEKOS_GIF: GIF_BYTES}, nekos=nekos_ok())
+    picker = GifPicker(session, store)
+    await picker.pick(ACTIONS['hug'])
+    await picker.drain()
+    check('ACTIONS_STORE_GIFS=false downloads nothing', session.downloads == [])
 
 
 # ---------------------------------------------------------------------------
@@ -225,11 +343,15 @@ def test_render_with_and_without_a_gif():
 
 
 def test_every_action_has_a_source_and_a_return_label():
-    check('fifteen actions', len(ACTIONS) == 15, list(ACTIONS))
+    check('twenty-seven actions', len(ACTIONS) == 27, list(ACTIONS))
     for action in ACTIONS.values():
         check(f'{action.key} sources', action.sources and all(p in action_gifs.PROVIDERS for p, _ in action.sources))
     check('labels by kind', (ACTIONS['hug'].return_label, ACTIONS['slap'].return_label, ACTIONS['poke'].return_label)
           == ('Retribuir', 'Revidar', 'Devolver'))
+    check('blowkiss falls back to airkiss', ACTIONS['blowkiss'].sources == (('nekos.best', 'blowkiss'), ('otakugifs', 'airkiss')))
+    names = [a.key for a in ACTIONS.values()]
+    check('valid, distinct command names', len(set(names)) == len(names) and all(n.isascii() and n.islower() and len(n) <= 32 for n in names))
+    check('descriptions fit', all(len(f'{a.emoji} {a.description}') <= 100 for a in ACTIONS.values()))
 
 
 def test_find_member():

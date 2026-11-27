@@ -216,7 +216,7 @@ Every message goes through one router (`core/router.py`): passive observers (his
 | `/resumo`   | Summarize what happened in a channel                 | Yes         |
 | `/wrapped`  | Server recap: who talked most, channels, emojis…     | Optional**  |
 | `/config`   | Server and channel settings (Manage Server)          | No          |
-| `/hug`, `/kiss`, `/slap`… | Anime GIF of you doing it to someone (15 actions) | No***  |
+| `/hug`, `/kiss`, `/slap`… | Anime GIF of you doing it to someone (27 actions) | No***  |
 | `/persona`  | The bot's personality on this server (editing needs Manage Server) | No |
 | `/memory`, `/monitor`, `/schedule` | Memories, standing triggers, scheduled tasks | Yes |
 | `/analyze`  | Analyze a server log with AI (mclo.gs, pastebin, or file) | Yes   |

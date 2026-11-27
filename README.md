@@ -49,7 +49,7 @@ Built with [discord.py](https://discordpy.readthedocs.io/) + RAG (Retrieval-Augm
 | **Channel Summaries** | `/resumo` and natural-language "o que perdi?" — map-reduce summaries of a channel or thread over any period, with jump links and permission checks |
 | **Monitors** | Standing triggers (channels, authors, mentions of a user, a content regex) that call the bot on matching messages; it answers like a mention, knows a monitor sent it, and may stay silent. Managed with `/monitor` or by asking the bot |
 | **Voice Calls** | `/voz entrar`: the bot joins your voice channel and talks in real time (speech-to-speech with Qwen-Audio realtime) — hears everyone in the call, stops when talked over, optionally writes the conversation in the call's chat. Off unless configured, and each server opts in |
-| **Action GIFs** | `/hug`, `/kiss`, `/slap`, `/lick` and 11 more: an anime GIF of you doing it to someone, who can return it with a button. Done to the bot, it answers in character; asked ("dá um abraço no Bruno"), it does them itself. Counts per pair ("Ana já abraçou Bruno 5 vezes") |
+| **Action GIFs** | `/hug`, `/kiss`, `/slap`, `/pat` and 23 more: an anime GIF of you doing it to someone, who can return it with a button. Done to the bot, it answers in character; asked ("dá um abraço no Bruno"), it does them itself. Counts per pair ("Ana já abraçou Bruno 5 vezes") |
 | **Persistent Memory** | The bot remembers: atomic facts about the server and its members, auto-injected into every conversation, with inline LLM writes, pinning, dedupe, full audit history and admin control. Each memory records who said it — a fact about someone told by someone else is shown as a report ("segundo Fulano") |
 
 All AI responses are in **Brazilian Portuguese**.
@@ -234,12 +234,13 @@ A recap of the server over a period (`semana` = 7 days, default; `mes`; `ano`; o
 
 | Kind | Commands | Button |
 |---|---|---|
-| Affection | `/hug`, `/kiss`, `/pat`, `/cuddle`, `/highfive`, `/handhold`, `/feed` | Retribuir |
-| Playful | `/lick`, `/poke`, `/bite`, `/bonk`, `/tickle` | Devolver |
-| Rough | `/slap`, `/punch`, `/kick` | Revidar |
+| Affection | `/hug`, `/kiss`, `/peck`, `/blowkiss`, `/pat` (headpat), `/cuddle`, `/nuzzle`, `/lappillow`, `/handhold`, `/handshake`, `/highfive`, `/brofist`, `/wave`, `/cheers`, `/feed` | Retribuir |
+| Playful | `/wink`, `/stare`, `/lick`, `/poke`, `/pinch`, `/tickle`, `/bite`, `/bonk` | Devolver |
+| Rough | `/slap`, `/punch`, `/kick`, `/yeet` | Revidar |
 
 - **Doing it back:** the button under the GIF works for its target only, once, for 10 minutes; it posts the same action the other way ("… de volta!"), without a button of its own
-- **GIFs:** [nekos.best](https://nekos.best) first (it also names the anime), then [otakugifs.xyz](https://otakugifs.xyz) (the only one with `lick`); only GIFs on those hosts are posted. Each GIF fetched is remembered (50 per action, `ACTIONS_DB_PATH`), so when both APIs are down an earlier one is reused; with none, the action goes out as text. nekos.best refuses requests without a User-Agent naming the app and a contact: by default the bot's name and invite link, or `ACTIONS_USER_AGENT`
+- **GIFs:** each action's sources in order — [nekos.best](https://nekos.best) (it also names the anime) and [otakugifs.xyz](https://otakugifs.xyz) (`blowkiss` falls back to its `airkiss`; `lick`, `nuzzle`, `brofist`, `cheers` and `pinch` exist only there; `peck`, `lappillow`, `handshake`, `highfive`, `feed`, `bonk`, `kick` and `yeet` only on nekos.best). Only GIFs on those hosts are posted. nekos.best refuses requests without a User-Agent naming the app and a contact: by default the bot's name and invite link, or `ACTIONS_USER_AGENT`
+- **When no API answers:** every distinct GIF the APIs return is recorded (`ACTIONS_DB_PATH`, no limit), and its file is downloaded once in the background into `ACTIONS_GIFS_DIR`, named by its SHA-256 so identical GIFs are kept once (two downloads at a time; a failed one is retried the next time that GIF is served; only real GIFs up to 10 MiB, Discord's upload limit). When every source fails, a stored file is uploaded with the message and the embed shows it (`attachment://hug.gif`), so nothing has to be hosted; without files, a stored URL is reused; with neither, the action goes out as text. A GIF averaged about 0.9 MB in testing, so a full set of a few thousand GIFs is a few GB. `ACTIONS_STORE_GIFS=false` keeps only the URLs. nekos.best's terms allow caching its responses for private use only and forbid rehosting, so storing and re-uploading its GIFs is the operator's call
 - **Doing it to the bot:** after the GIF, the bot answers in character, like a mention — a few words, a reaction on the GIF, doing it back with `send_action_gif`, or nothing. It costs the person one turn of their `CHAT_USER_BUDGET` (over it, the GIF stands alone), and replying to the answer continues the conversation. Not in channels where `respond` is `off`; `ACTIONS_BOT_REPLY=false` turns it off
 - **The bot doing it:** the `send_action_gif` tool (chat profile) — when asked ("dá um abraço no Bruno", "bate nele") or when it fits its personality, at most once per answer; the GIF goes out before the answer, with a button for the person to do it back. `ACTIONS_TOOL_ENABLED=false` removes it
 - **Yourself:** affection actions come from the bot instead ("Ninguém merece fazer isso sozinho: **QuillBot** abraçou @Ana!"); the others are refused
@@ -515,7 +516,8 @@ QuillBot/
     ├── settings.db        # /config settings
     ├── persona.db         # Personality sections + history
     ├── conversations.db   # Conversations (handles, triggers, episode state)
-    ├── actions.db         # Action counts per pair, recent GIF URLs
+    ├── actions.db         # Action counts per pair, every GIF URL seen and its stored file
+    ├── action_gifs/       # Stored GIF files (<sha256>.gif), uploaded when no GIF API answers
     ├── lore.db            # Legacy lore encyclopedia (kept as migration source)
     └── history/          # Per-guild history stores
 ```
@@ -734,7 +736,9 @@ cp .env.example .env   # if available, otherwise create .env manually
 | Variable | Default | Description |
 |---|---|---|
 | `ACTIONS_ENABLED` | `true` | `/hug`, `/kiss`, `/slap`… and the `send_action_gif` tool |
-| `ACTIONS_DB_PATH` | `data/actions.db` | Counts per pair and recent GIF URLs |
+| `ACTIONS_DB_PATH` | `data/actions.db` | Counts per pair and every GIF URL seen |
+| `ACTIONS_STORE_GIFS` | `true` | Keep a copy of every distinct GIF, uploaded as an attachment when no GIF API answers |
+| `ACTIONS_GIFS_DIR` | `data/action_gifs` | Where those copies go |
 | `ACTIONS_PING_TARGET` | `true` | Notify the person on the receiving end |
 | `ACTIONS_COOLDOWN_SECONDS` | `5` | Between two actions of one person (all commands together) |
 | `ACTIONS_BOT_REPLY` | `true` | Doing an action to the bot gets an answer in character (one chat turn) |
@@ -815,7 +819,7 @@ Cog load order doesn't matter: the router decides who sees a message, not the or
 docker compose up --build -d
 ```
 
-- Uses `python:3.11-slim`, persists `data/` via volume mount, reads config from `.env`.
+- Uses `python:3.11-slim`, persists `data/` via volume mount, reads config from `.env`. `data/` (databases, stored action GIFs) is in `.dockerignore`, so it never goes into the build or the image.
 
 ---
 
@@ -835,7 +839,7 @@ ruff check .                   # lint (rules configured in pyproject.toml)
 
 | File | Covers |
 |---|---|
-| `test_actions.py` | Action GIFs: providers in order and fallbacks (recent GIF, then text), refused hosts, counts, wording, the return button (target only, once, back the other way), pings, cooldown and self-actions, the bot answering actions done to it (and returns of its own), the `send_action_gif` tool, the engine's answer starting a conversation |
+| `test_actions.py` | Action GIFs: providers in order and fallbacks (stored file uploaded as an attachment, stored URL, text), every distinct GIF kept, files saved once per content and retried after a failed download, non-GIFs and oversized files refused, refused hosts, counts, wording, the return button (target only, once, back the other way), pings, cooldown and self-actions, the bot answering actions done to it (and returns of its own), the `send_action_gif` tool, the engine's answer starting a conversation |
 | `test_api_logger.py` | Request logging for aiohttp/httpx/httpx2, redaction, body capture, inbound interactions (runs in its own process) |
 | `test_attribution.py` | Author tags on every question, speaker changes marked in the tag (verbatim and compact replay), the conversation block naming who speaks now, byte-identical replay of per-turn blocks, memory block labels and person-memory rules |
 | `test_channel_context_images.py` | Images from automatically fetched channel context |
